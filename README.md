@@ -60,6 +60,39 @@ python scripts/validate_schemas.py
 
 검사 항목: ① 모든 `*.schema.json` 이 draft 2020-12 메타스키마로 유효 ② 최상위 `title`·`description` 및 모든 property 의 `description`·`examples` 완비 ③ 공유 enum `$defs` 문서화 ④ `_links.json` 의 source/target 노드가 실재 스키마(또는 허용된 외부 백엔드)를 가리킴.
 
-## 다음 단계 — P2: Adapter
+---
 
-타입 시스템 위에 **백엔드별 Adapter 계층**을 올린다. 각 Adapter 는 `schemas/` 를 단일 출처로 삼아 (1) Notion DB ↔ 스키마 매핑, (2) memory 파일(yaml/md) ↔ 스키마 직렬화, (3) Qdrant 임베딩 동기화를 담당하고, `_links.json` 을 읽어 백엔드 간 전파(예: SUMMARY 생성 → POST 발행 후보 큐잉)를 수행한다. 코드 로직은 P2 에서 시작한다.
+# P2 — Adapter 5 + Smart Router + 의도 기반 도구 10 (완료)
+
+타입 시스템을 **실제로 움직이게** 하는 런타임 계층. 팔란티어 뼈대(Adapter·라우팅·스키마 검증) × SW 3.0 피부(의도 기반 도구·검증 메타).
+
+## P2 산출물
+
+- **공통 인터페이스** `adapters/base.py` — `BackendAdapter` ABC (`search`/`create`/`update`/`health_check`) + 표준 레코드/health 헬퍼.
+- **Adapter 5종** `adapters/`
+  - `notion_adapter.py` — Notion API v1 **실동작**(search/create/update, httpx 주입 가능).
+  - `memory_adapter.py` — 로컬 `memory/`(yaml) **실동작**(profile/decision/ingest CRUD).
+  - `qdrant_adapter.py` / `studio_adapter.py` / `n8n_adapter.py` — health_check 실동작, search/create 는 `NotImplementedError` stub(P2.5/P3/P4).
+- **Smart Router** `core/router.py` — query→백엔드 선택→병렬 search→**RRF(k=60)** 융합. 백엔드 장애·미구현은 격리해 전체 검색을 깨지 않음.
+- **Schema Validator** `core/schema_validator.py` — P1 `schemas/` 로딩(상대 `$ref` → `referencing` Registry 해소) + `validate`/`validate_partial`/`backend_of`. `FormatChecker` 로 `date-time`·`uri` format 까지 실검증(rfc3339/rfc3986-validator).
+- **강건성(적대적 리뷰 반영)** — memory id 경로 탈출 차단(`_safe_id` + base 봉쇄), 도구 예외는 모두 `{errors}` 봉투로 격리(MCP 크래시 방지), RRF 융합키는 `타입::id`(서로 다른 엔티티 오융합 방지), httpx 클라이언트는 lifespan 에서 정리.
+- **의도 기반 도구 10개** `core/tools.py`(로직) + `server.py`(MCP 등록): `search`·`create`·`update`·`get_context`·`status` 실동작, `run_action`·`publish`·`ingest`·`plan`·`check` 중 `check` 는 검증 실동작, 나머지는 P3/P4 stub. 모든 응답은 `{ data, verification:{schema_valid}, provenance:{sources_used} }` 봉투.
+
+## 실행
+
+```powershell
+# 1) 의존성
+pip install -r requirements.txt
+# 2) 시크릿 (.env 는 .gitignore 제외됨)
+copy .env.example .env   # NOTION_TOKEN, DB ID 등 채움
+# 3) MCP 서버 (stdio)
+python server.py
+# 4) 테스트
+python -m pytest -q
+```
+
+> `.env` 없이도 서버는 뜬다 — Notion/Qdrant/Studio/n8n 은 `status` 에서 "미설정/FAIL" 로 표시되고 memory 만 즉시 실동작한다.
+
+## 다음 단계 — P2.5: Qdrant 시딩
+
+`qdrant_adapter` 의 `search`/`create` 를 구현한다. P1 `schemas/notion/resource` ↔ `_links.json` 의 `has_vector(1:1)` 관계대로 RESOURCE 본문을 임베딩해 Qdrant 컬렉션에 적재하고, Router 의 `select_backends` 에 의미유사도 경로(qdrant)를 활성화한다. 이후 RRF 가 키워드(Notion)+의미(Qdrant)+파일(memory)을 진짜 하이브리드로 융합한다.
