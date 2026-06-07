@@ -25,21 +25,16 @@ class SmartRouter:
         """칠 백엔드 이름 목록 결정.
 
         - opts["backends"] 가 주어지면 그대로 사용(존재하는 것만).
-        - 그 외에는 현재 등록된 notion·memory 를 항상 둘 다 선택한다.
-          (RRF 가 둘을 융합하고, 미구현 백엔드는 _safe_search 가 skip 처리.)
-        - qdrant 의미유사도 경로는 search 구현(P2.5) 전까지 비활성.
-        - query 기반 의도 라우팅(키워드/파일/관계 분기)은 P2.5+ 에서 도입 예정
+        - 그 외에는 등록된 notion(키워드)·memory(파일)·qdrant(의미유사도)를 모두 선택.
+          P2.5 부터 qdrant search 가 실동작하므로 3중 RRF 융합이 활성된다.
+          (미구현/장애 백엔드는 _safe_search 가 skip 처리.)
+        - query 기반 의도 라우팅(키워드/파일/관계 분기)은 향후 도입 예정
           — 현재 query 인자는 선택에 사용하지 않는다.
         """
         opts = opts or {}
         if opts.get("backends"):
             return [b for b in opts["backends"] if b in self.adapters]
-        selected = []
-        if "notion" in self.adapters:
-            selected.append("notion")
-        if "memory" in self.adapters:
-            selected.append("memory")
-        return selected
+        return [b for b in ("notion", "memory", "qdrant") if b in self.adapters]
 
     # ── 통합 검색 ───────────────────────────────────────────────
     async def search(self, query: str, opts: dict | None = None) -> dict:

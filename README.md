@@ -93,6 +93,44 @@ python -m pytest -q
 
 > `.env` 없이도 서버는 뜬다 — Notion/Qdrant/Studio/n8n 은 `status` 에서 "미설정/FAIL" 로 표시되고 memory 만 즉시 실동작한다.
 
-## 다음 단계 — P2.5: Qdrant 시딩
+---
 
-`qdrant_adapter` 의 `search`/`create` 를 구현한다. P1 `schemas/notion/resource` ↔ `_links.json` 의 `has_vector(1:1)` 관계대로 RESOURCE 본문을 임베딩해 Qdrant 컬렉션에 적재하고, Router 의 `select_backends` 에 의미유사도 경로(qdrant)를 활성화한다. 이후 RRF 가 키워드(Notion)+의미(Qdrant)+파일(memory)을 진짜 하이브리드로 융합한다.
+# P2.5 — Qdrant 시딩 + ingest 파이프라인 + Headroom 연결 (완료)
+
+"Ship first, infra through shipping" — 서빙(도구)보다 시딩(데이터)이 먼저. Qdrant 에 벡터가 있어야 의미검색이 의미를 가진다.
+
+## P2.5 산출물
+
+- **QdrantAdapter 실동작** `adapters/qdrant_adapter.py` — `create`(벡터+payload upsert), `search`(쿼리 임베딩→top-k 유사도), `health_check`(컬렉션·포인트 수). `point_id = uuid5(resource_url)` 로 **재적재 멱등**. `QDRANT_URL` 없으면 임베디드(`:memory:`) 폴백.
+- **임베딩 추상화** `core/embeddings.py` — `EMBEDDING_BACKEND`: `auto`(local→hash) / `local`(sentence-transformers, 한국어 OK) / `openai`(text-embedding-3-small) / `hash`(의존성 0 결정적 폴백, dim 384=MiniLM 호환). torch 없이도 파이프라인 동작.
+- **시딩 스크립트** `scripts/seed_qdrant.py` — Notion RESOURCE 전체(커서 페이지네이션) → 임베딩 → Qdrant upsert. `--limit N`, 배치 진행률, 실패 스킵. 멱등.
+- **ingest 도구 실동작** `core/tools.py` — `ingest(url)`: 본문 추출(stdlib HTML 파서) → ① Notion RESOURCE ② Qdrant 벡터 ③ memory ingest 로그(`ingested_from` 1:1). 백엔드별 격리.
+- **search 3중 융합** — `select_backends` 에 qdrant 활성화 → **Notion(키워드)+memory(파일)+Qdrant(의미)** 3중 RRF.
+- **인프라** `docker-compose.yml`(Qdrant 6333) + `docs/patterns/env-windows-console-utf8.md`(P1·P2 콘솔 UTF-8 패턴 문서화).
+
+## 시딩 / 검증 결과
+
+- 실 Qdrant(`localhost:6333`) 시딩 멱등 실증: 적재 3건 → 재실행 후에도 3건(중복 0).
+- 실 URL ingest 실증: `https://example.com` → title "Example Domain" 추출, Qdrant+memory 적재(Notion 은 토큰 없으면 격리), `search` 3중 `sources_used=[notion, memory, qdrant]`.
+- 테스트 37 passed (qdrant upsert/search/멱등, ingest 3중 적재·격리, 3소스 RRF 포함).
+
+```powershell
+docker compose up -d                       # Qdrant 기동 (없으면 :memory: 폴백)
+python scripts/seed_qdrant.py --limit 50   # RESOURCE → 벡터 시딩 (멱등)
+```
+
+## Headroom 압축 레이어 (설계서 (a) MCP 병렬)
+
+`headroom` 은 전역 `wrap claude`(proxy 8787) 상태. yohan-mcp 도구 출력에 압축을 자동 적용하려면 MCP 서버를 headroom 에 등록한다.
+
+```powershell
+headroom mcp install        # yohan-mcp MCP 도구 출력에 압축 자동 적용
+```
+
+- 현재 stats 스냅샷: headroom **active**, `compressions: 0` (yohan-mcp 미등록 상태 — search/ingest 같은 큰 출력은 아직 비압축).
+- 검증: `headroom mcp install` 후 `mcp__headroom__headroom_stats` 의 `compressions` 가 증가(0→N)하면 yohan-mcp 출력이 LLM 도달 전 압축됨을 의미.
+- `status` 도구는 `HEADROOM_URL` 설정 시 headroom 헬스 한 줄을 함께 보고한다.
+
+## 다음 단계 — P3: Studio 발행 + publish/run_action
+
+`studio_adapter.publish` 실동작화 — `_links.json` 의 `published_as(1:N)` 관계대로 SUMMARY → 블로그 포스트 발행. `publish`/`run_action` 도구를 stub 에서 실동작으로 올리고, n8n 웹훅(`run_action`)으로 발행·배포 자동화를 연결한다. 이후 RESOURCE→SUMMARY→POST 의 전체 파이프라인이 한 바퀴 돈다.

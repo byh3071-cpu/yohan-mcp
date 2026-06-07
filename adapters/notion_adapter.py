@@ -135,6 +135,33 @@ class NotionAdapter(BackendAdapter):
                 records.append(make_record(rid, type_, self.name, data))
         return records
 
+    async def fetch_all(self, type_: str, limit: int | None = None) -> list[dict]:
+        """DB 전체 페이지를 커서 페이지네이션으로 로드(시딩용). 토큰/DB 없으면 []."""
+        if not self.token:
+            return []
+        db_id = self.db_ids.get(type_)
+        if not db_id:
+            return []
+        client = self._get_client()
+        out: list[dict] = []
+        cursor = None
+        while True:
+            body: dict = {"page_size": 100}
+            if cursor:
+                body["start_cursor"] = cursor
+            resp = await client.post(f"/databases/{db_id}/query", json=body)
+            resp.raise_for_status()
+            j = resp.json()
+            for page in j.get("results", []):
+                out.append(self._from_notion_page(type_, page))
+                if limit and len(out) >= limit:
+                    return out[:limit]
+            if j.get("has_more") and j.get("next_cursor"):
+                cursor = j["next_cursor"]
+            else:
+                break
+        return out
+
     # ── 생성/갱신 ───────────────────────────────────────────────
     async def create(self, type_: str, data: dict) -> dict:
         if not self.token:

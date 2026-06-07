@@ -18,3 +18,7 @@ Thumbs.db
 
 # 도구 캐시
 .serena/
+
+# Qdrant 로컬 스토리지 / memory 런타임 데이터
+.qdrant_storage/
+memory/

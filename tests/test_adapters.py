@@ -80,8 +80,8 @@ async def test_notion_update_mocked():
     await client.aclose()
 
 
-# ── stub 어댑터 health + NotImplemented ─────────────────────────
-@pytest.mark.parametrize("Adapter", [QdrantAdapter, StudioAdapter, N8nAdapter])
+# ── stub 어댑터(studio/n8n) health + NotImplemented ─────────────
+@pytest.mark.parametrize("Adapter", [StudioAdapter, N8nAdapter])
 async def test_stub_health_no_url(Adapter):
     a = Adapter(url="")  # URL 미설정 강제
     h = await a.health_check()
@@ -97,7 +97,7 @@ async def test_stub_health_mocked_ok():
     def handler(request):
         return httpx.Response(200)
     client = httpx.AsyncClient(base_url="http://fake", transport=httpx.MockTransport(handler))
-    a = QdrantAdapter(client=client, url="http://fake")
+    a = StudioAdapter(client=client, url="http://fake")
     h = await a.health_check()
     assert h["ok"] is True
     await client.aclose()

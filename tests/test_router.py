@@ -59,9 +59,21 @@ async def test_rrf_ordering():
 
 def test_select_backends_default_and_opts():
     r = SmartRouter({"notion": FakeAdapter("notion"), "memory": FakeAdapter("memory"), "qdrant": FakeAdapter("qdrant")})
-    assert r.select_backends("q") == ["notion", "memory"]            # qdrant 는 P2.5 전 skip
+    assert r.select_backends("q") == ["notion", "memory", "qdrant"]  # P2.5 부터 qdrant 활성
     assert r.select_backends("q", {"backends": ["memory"]}) == ["memory"]
     assert r.select_backends("q", {"backends": ["nope"]}) == []
+
+
+async def test_search_three_source_rrf():
+    a = FakeAdapter("notion", recs("notion", ["x1", "x2"]))
+    b = FakeAdapter("memory", recs("memory", ["x2"]))
+    c = FakeAdapter("qdrant", recs("qdrant", ["x2", "x3"]))
+    r = SmartRouter({"notion": a, "memory": b, "qdrant": c})
+    out = await r.search("q")
+    assert set(out["sources_used"]) == {"notion", "memory", "qdrant"}
+    by = {x["id"]: x for x in out["results"]}
+    assert set(by["x2"]["sources"]) == {"notion", "memory", "qdrant"}  # 3중 융합
+    assert out["results"][0]["id"] == "x2"  # 최다 출처 → 최상위
 
 
 async def test_search_skips_unimplemented_and_errors():

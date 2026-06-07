@@ -1,0 +1,13 @@
+# yohan-mcp v2 — 로컬 인프라.  기동: docker compose up -d
+# Docker 없으면 QdrantAdapter 가 자동으로 임베디드(:memory:) 모드로 fallback
+# (단, :memory: 는 프로세스 종료 시 휘발 — 영속 시딩은 Qdrant 컨테이너 필요).
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: yohan-qdrant
+    ports:
+      - "6333:6333"   # REST
+      - "6334:6334"   # gRPC
+    volumes:
+      - ./.qdrant_storage:/qdrant/storage
+    restart: unless-stopped

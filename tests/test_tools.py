@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""의도 기반 도구 — search/create/update/status/check 통합테스트."""
+"""의도 기반 도구 — search/create/update/status/check/ingest 통합테스트."""
+import httpx
 import pytest
 
 from adapters.base import BackendAdapter, health, make_record
@@ -8,6 +9,7 @@ from adapters.n8n_adapter import N8nAdapter
 from adapters.notion_adapter import NotionAdapter
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.studio_adapter import StudioAdapter
+from core.embeddings import HashEmbedder
 from core.router import SmartRouter
 from core.schema_validator import SchemaValidator
 from core import tools as T
@@ -187,6 +189,80 @@ def test_schema_format_validation():
         "ingested_at": "2026-06-08T09:30:00+09:00", "source_url": "not a url",
     })
     assert bad_uri is False
+
+
+# ── ingest 3중 적재 (Notion+Qdrant+memory) ─────────────────────
+async def test_tool_ingest_triple(tmp_path, monkeypatch):
+    async def fake_fetch(url, client=None):
+        return ("테스트 제목", "본문 텍스트 어텐션 메커니즘")
+    monkeypatch.setattr(T, "_fetch_url", fake_fetch)
+
+    def handler(request):
+        return httpx.Response(200, json={"id": "pg_1", "properties": {}})
+    nclient = httpx.AsyncClient(base_url="https://api.notion.com/v1", transport=httpx.MockTransport(handler))
+    notion = NotionAdapter(client=nclient, token="t")
+    notion.db_ids = {k: "db" for k in notion.db_ids}
+
+    adapters = {
+        "notion": notion,
+        "memory": MemoryAdapter(base_dir=tmp_path),
+        "qdrant": QdrantAdapter(url=None, embedder=HashEmbedder()),
+    }
+    ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator())
+    env = await T.tool_ingest(ctx, "https://example.com/post")
+    _envelope_shape(env)
+    assert set(env["provenance"]["sources_used"]) == {"notion", "qdrant", "memory"}
+    assert env["verification"]["schema_valid"] is True  # resource 스키마 통과
+    assert env["data"]["resource_id"].startswith("res_")
+
+    # memory ingest 로그가 실제로 저장됐는지
+    found = await adapters["memory"].search("본문", {"type": "ingest"})
+    assert found and found[0]["data"]["target_resource_id"] == env["data"]["resource_id"]
+    # Qdrant 에 벡터 적재됐는지
+    qres = await adapters["qdrant"].search("어텐션", {"top_k": 3})
+    assert qres
+    await nclient.aclose()
+    await adapters["qdrant"].aclose()
+
+
+async def test_tool_ingest_isolates_failure(tmp_path, monkeypatch):
+    """notion 실패(토큰 없음)해도 qdrant+memory 는 적재."""
+    async def fake_fetch(url, client=None):
+        return ("제목", "본문")
+    monkeypatch.setattr(T, "_fetch_url", fake_fetch)
+    adapters = {
+        "notion": NotionAdapter(token=""),
+        "memory": MemoryAdapter(base_dir=tmp_path),
+        "qdrant": QdrantAdapter(url=None, embedder=HashEmbedder()),
+    }
+    ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator())
+    env = await T.tool_ingest(ctx, "https://example.com/x")
+    assert "notion" not in env["provenance"]["sources_used"]
+    assert {"qdrant", "memory"} <= set(env["provenance"]["sources_used"])
+    assert any("notion" in e for e in env["errors"])
+    await adapters["qdrant"].aclose()
+
+
+# ── SSRF / HTML 추출 가드 ───────────────────────────────────────
+@pytest.mark.parametrize("bad", [
+    "http://localhost/x", "http://127.0.0.1/x",
+    "http://169.254.169.254/latest/meta-data/",  # IMDS
+    "file:///etc/passwd", "ftp://x/y", "http://[::1]/",
+])
+async def test_fetch_url_blocks_ssrf(bad):
+    with pytest.raises(ValueError):
+        await T._fetch_url(bad)
+
+
+def test_extract_html_no_title_dup_no_script_leak():
+    title, text = T._extract_html(
+        "<html><head><title>제목</title></head>"
+        "<body><script>var k='SECRET'</script><p>본문 단락</p></body></html>"
+    )
+    assert title == "제목"
+    assert "제목" not in text       # 제목이 본문에 중복되지 않음
+    assert "SECRET" not in text     # script 내용 누출 없음
+    assert "본문 단락" in text
 
 
 # ── stub 도구 ───────────────────────────────────────────────────
