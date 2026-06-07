@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/notion/ai-dict.schema.json",
+  "title": "AI-DICT — AI 사전 항목",
+  "description": "Notion AI 사전 DB 한 행. 용어의 정의·난이도·등재 상태.",
+  "type": "object",
+  "properties": {
+    "term_id": {
+      "description": "용어 고유 ID. AI 사전 DB 한 행을 식별하는 기본키(PK)로, 다른 백엔드에서 이 용어를 참조할 때 사용하는 안정적 식별자다.",
+      "type": "string",
+      "examples": ["dict-0001", "term-transformer"]
+    },
+    "name": {
+      "description": "용어 이름(한글). 사전에 표제어로 노출되는 대표 명칭이며 한글 표기를 기본으로 한다.",
+      "type": "string",
+      "examples": ["트랜스포머", "어텐션 메커니즘"]
+    },
+    "one_line": {
+      "description": "한줄 정의. 용어의 핵심을 한 문장으로 압축한 짧은 설명으로, 목록·미리보기에서 빠르게 의미를 파악하는 데 쓰인다.",
+      "type": "string",
+      "examples": [
+        "어텐션 메커니즘을 기반으로 시퀀스를 병렬 처리하는 딥러닝 신경망 구조.",
+        "입력의 각 요소가 다른 요소에 얼마나 주목할지 가중치로 계산하는 기법."
+      ]
+    },
+    "category": {
+      "description": "카테고리(지식 도메인). 이 용어가 속하는 상위 지식 분류로, 크로스 백엔드 필터링과 라우팅의 기준이 된다.",
+      "$ref": "../_shared-enums.json#/$defs/Domain"
+    },
+    "difficulty": {
+      "description": "학습 난이도. 해당 용어를 이해하는 데 필요한 사전 지식 수준을 나타내며, 학습 경로 추천과 난이도별 정렬에 사용된다.",
+      "$ref": "../_shared-enums.json#/$defs/Difficulty"
+    },
+    "status": {
+      "description": "등재 상태. 사전 항목이 후보 발굴부터 정식 등재까지 거치는 진행 단계를 나타낸다.",
+      "$ref": "../_shared-enums.json#/$defs/DictStatus"
+    },
+    "english": {
+      "description": "영문 표기. 용어의 영어 원어 또는 공식 영문 명칭으로, 한글 표제어와 매핑되어 검색·교차 참조에 활용된다.",
+      "type": "string",
+      "examples": ["Transformer", "Attention Mechanism"]
+    },
+    "related_terms": {
+      "description": "관련 용어 목록. 이 항목과 의미적으로 연관된 다른 사전 용어들의 이름 또는 ID 목록으로, 학습 시 함께 살펴보면 좋은 개념을 연결한다.",
+      "type": "array",
+      "items": { "type": "string" },
+      "examples": [["어텐션 메커니즘", "셀프 어텐션", "인코더-디코더"]]
+    },
+    "updated_at": {
+      "description": "최종 수정 시각. 사전 항목의 정의·상태 등이 마지막으로 갱신된 시점(ISO8601, KST +09:00).",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:30:00+09:00"]
+    }
+  },
+  "required": ["term_id", "name", "one_line", "category", "difficulty", "status"],
+  "additionalProperties": false
+}

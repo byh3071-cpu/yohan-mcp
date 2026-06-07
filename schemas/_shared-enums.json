@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/_shared-enums.json",
+  "title": "공유 Enum 정의",
+  "description": "5개 백엔드(Notion·memory·Qdrant·Studio·n8n)가 공유하는 열거형 모음. 각 스키마는 상대경로 `../_shared-enums.json#/$defs/<이름>` 으로 참조한다. 단일 출처(single source of truth)로서 상태/도메인/난이도 등의 표기를 백엔드 간에 일치시킨다.",
+  "$defs": {
+    "Status": {
+      "title": "공통 상태",
+      "description": "자료·요약·작업 등 대부분의 엔티티가 공유하는 처리 단계 상태.",
+      "type": "string",
+      "enum": ["신규", "처리중", "완료", "보류", "폐기"],
+      "examples": ["신규", "완료"]
+    },
+    "Domain": {
+      "title": "지식 도메인",
+      "description": "자료·요약·트리플·사전 항목이 속하는 상위 지식 분류. 크로스 백엔드 필터링과 라우팅의 기준.",
+      "type": "string",
+      "enum": ["AI", "개발", "비즈니스", "디자인", "마케팅", "생산성", "기타"],
+      "examples": ["AI", "개발"]
+    },
+    "ResourceType": {
+      "title": "자료 유형",
+      "description": "RESOURCE DB 원본 자료의 매체 종류.",
+      "type": "string",
+      "enum": ["아티클", "영상", "논문", "문서", "도구", "대화", "코드", "이미지", "기타"],
+      "examples": ["아티클", "영상"]
+    },
+    "Confidence": {
+      "title": "신뢰도 수치",
+      "description": "추출/요약/트리플의 신뢰 정도를 0~1 실수로 표현. 1에 가까울수록 확신이 높다.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "examples": [0.95, 0.6]
+    },
+    "Difficulty": {
+      "title": "난이도",
+      "description": "AI 사전 용어의 학습 난이도.",
+      "type": "string",
+      "enum": ["입문", "초급", "중급", "고급"],
+      "examples": ["입문", "중급"]
+    },
+    "DictStatus": {
+      "title": "사전 등재 상태",
+      "description": "AI 사전 항목의 등재 진행 단계.",
+      "type": "string",
+      "enum": ["후보", "검토중", "등재", "보류"],
+      "examples": ["후보", "등재"]
+    },
+    "WorkType": {
+      "title": "작업 유형",
+      "description": "EXECUTION LOG 한 줄이 기록하는 작업의 종류.",
+      "type": "string",
+      "enum": ["수집", "요약", "분석", "생성", "배포", "검증", "기타"],
+      "examples": ["요약", "배포"]
+    },
+    "ResultStatus": {
+      "title": "작업 결과",
+      "description": "EXECUTION LOG 작업의 최종 결과 상태.",
+      "type": "string",
+      "enum": ["성공", "실패", "부분성공", "진행중"],
+      "examples": ["성공", "부분성공"]
+    },
+    "DecisionStatus": {
+      "title": "의사결정 상태",
+      "description": "memory/decisions 한 건의 채택 단계.",
+      "type": "string",
+      "enum": ["제안", "승인", "기각", "보류", "재검토"],
+      "examples": ["제안", "승인"]
+    },
+    "PostStatus": {
+      "title": "포스트 상태",
+      "description": "Studio 블로그 포스트의 발행 단계.",
+      "type": "string",
+      "enum": ["초안", "검토", "발행", "보관"],
+      "examples": ["초안", "발행"]
+    },
+    "ProductStatus": {
+      "title": "제품 상태",
+      "description": "Studio 제품의 라이프사이클 단계.",
+      "type": "string",
+      "enum": ["기획", "개발", "출시", "중단"],
+      "examples": ["기획", "출시"]
+    }
+  }
+}

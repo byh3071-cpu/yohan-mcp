@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/studio/product.schema.json",
+  "title": "PRODUCT — 제품",
+  "description": "Yohan Studio 제품 한 건. 제품 메타데이터와 라이프사이클 상태.",
+  "type": "object",
+  "properties": {
+    "product_id": {
+      "description": "제품 고유 ID(PK). Studio 내에서 제품 한 건을 유일하게 식별하는 키이며, 다른 엔티티(포스트·실행 로그 등)에서 이 제품을 참조할 때 외래키로 사용된다.",
+      "type": "string",
+      "examples": ["prod_2026_yohanmcp", "prod_001"]
+    },
+    "name": {
+      "description": "제품명. 사용자에게 노출되는 제품의 공식 이름으로, 마켓플레이스·랜딩 페이지·문서 등에서 일관되게 표기된다.",
+      "type": "string",
+      "examples": ["Yohan MCP", "패턴 사전 SaaS"]
+    },
+    "tagline": {
+      "description": "한 줄 슬로건. 제품의 핵심 가치를 짧고 강렬하게 표현하는 캐치프레이즈로, 히어로 섹션이나 카드 썸네일에 노출된다.",
+      "type": "string",
+      "examples": ["AI 솔로 스튜디오를 위한 통합 MCP", "당신의 지식을 자동으로 자산화"]
+    },
+    "description": {
+      "description": "제품 설명. 제품이 해결하는 문제, 주요 기능, 대상 사용자 등을 풍부하게 서술하는 본문으로, 상세 페이지나 카탈로그에서 제품을 소개하는 데 쓰인다.",
+      "type": "string",
+      "examples": ["Notion·memory·Qdrant·Studio·n8n 5개 백엔드를 하나의 MCP로 묶어 1인 개발자의 지식 파이프라인을 자동화하는 도구.", "수집한 자료를 요약·분류해 재사용 가능한 패턴 사전으로 축적하는 SaaS."]
+    },
+    "status": {
+      "description": "라이프사이클 상태. 제품이 현재 어느 단계(기획/개발/출시/중단)에 있는지를 나타내며, 운영 보드 필터링과 출시 우선순위 결정의 기준이 된다.",
+      "$ref": "../_shared-enums.json#/$defs/ProductStatus"
+    },
+    "price": {
+      "description": "가격(KRW). 제품의 판매 가격을 원화 정수/실수로 표현한다. 무료 제품은 0, 가격 미정 단계에서는 생략할 수 있다.",
+      "type": "number",
+      "examples": [29000, 0]
+    },
+    "url": {
+      "description": "제품 페이지 URL. 제품의 랜딩 페이지·마켓플레이스 리스팅·구매 페이지 등 외부에서 접근 가능한 정식 주소.",
+      "type": "string",
+      "format": "uri",
+      "examples": ["https://yohan-mcp.dev/products/yohan-mcp", "https://store.yohan.studio/pattern-dict"]
+    },
+    "created_at": {
+      "description": "생성 시각. 제품 레코드가 Studio에 처음 등록된 시점을 ISO8601 KST(+09:00)로 기록한다.",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:30:00+09:00"]
+    }
+  },
+  "required": ["product_id", "name", "description", "status", "created_at"],
+  "additionalProperties": false
+}

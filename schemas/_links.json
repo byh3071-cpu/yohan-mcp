@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/_links.json",
+  "title": "크로스 백엔드 관계 맵",
+  "description": "5개 백엔드(Notion·memory·Qdrant·Studio·n8n) 사이의 엔티티 관계 그래프. 각 노드는 `<backend>:<entity>` 형식이며, `notion:*` 는 모든 Notion 엔티티를 가리키는 와일드카드다. 어댑터(P2)는 이 맵을 읽어 백엔드 간 동기화·전파 경로를 결정한다.",
+  "node_format": "<backend>:<entity> — backend ∈ {notion, memory, qdrant, studio, n8n}, entity 는 해당 백엔드의 스키마 이름 또는 '*' (와일드카드)",
+  "cardinality_legend": {
+    "1:1": "source 한 건이 target 한 건과 대응",
+    "1:N": "source 한 건이 target 여러 건을 가짐",
+    "N:N": "다대다 — 양쪽 모두 복수 대응"
+  },
+  "links": [
+    {
+      "source": "notion:resource",
+      "target": "notion:summary",
+      "relation": "summarized_by",
+      "cardinality": "1:N",
+      "description": "원본 자료 한 건은 하나 이상의 요약/인사이트로 정제된다. RESOURCE → SUMMARY."
+    },
+    {
+      "source": "notion:summary",
+      "target": "memory:decision",
+      "relation": "triggers_decision",
+      "cardinality": "1:N",
+      "description": "요약이 의사결정을 촉발한다. SUMMARY 의 인사이트가 memory/decisions 기록으로 이어진다."
+    },
+    {
+      "source": "notion:resource",
+      "target": "qdrant:embedding",
+      "relation": "has_vector",
+      "cardinality": "1:1",
+      "description": "원본 자료 한 건은 Qdrant 벡터 한 개로 임베딩되어 의미 검색에 사용된다."
+    },
+    {
+      "source": "notion:summary",
+      "target": "studio:post",
+      "relation": "published_as",
+      "cardinality": "1:N",
+      "description": "요약이 Studio 블로그 포스트로 발행된다. 하나의 요약이 여러 포스트로 재가공될 수 있다."
+    },
+    {
+      "source": "notion:summary",
+      "target": "notion:ai-dict",
+      "relation": "promoted_to",
+      "cardinality": "1:N",
+      "description": "요약에서 추출된 핵심 용어가 AI 사전 항목으로 승격된다."
+    },
+    {
+      "source": "notion:triple",
+      "target": "notion:*",
+      "relation": "connects",
+      "cardinality": "N:N",
+      "description": "트리플(Subject-Relation-Object)은 임의의 Notion 엔티티들을 서로 연결하는 지식 그래프 엣지다."
+    },
+    {
+      "source": "memory:ingest",
+      "target": "notion:resource",
+      "relation": "ingested_from",
+      "cardinality": "1:1",
+      "description": "수집 원본(ingest) 한 건이 RESOURCE DB 자료 한 건으로 적재된다."
+    }
+  ]
+}

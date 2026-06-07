@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/notion/execution-log.schema.json",
+  "title": "EXECUTION-LOG — 작업 실행 로그",
+  "description": "Notion EXECUTION LOG DB 한 행. 에이전트/사람이 수행한 작업의 기록.",
+  "type": "object",
+  "properties": {
+    "log_id": {
+      "description": "로그 고유 ID. EXECUTION LOG DB 한 행을 유일하게 식별하는 기본키(PK). 다른 백엔드/엔티티가 이 로그를 참조할 때 이 값을 사용한다.",
+      "type": "string",
+      "examples": ["log_20260608_0001", "exec-7f3a9b2c"]
+    },
+    "work_type": {
+      "description": "작업 유형. 이 로그가 기록하는 작업이 어떤 종류인지(수집/요약/분석/생성/배포/검증/기타) 분류한다.",
+      "$ref": "../_shared-enums.json#/$defs/WorkType"
+    },
+    "result": {
+      "description": "작업 결과. 수행한 작업의 최종 상태(성공/실패/부분성공/진행중)를 나타낸다.",
+      "$ref": "../_shared-enums.json#/$defs/ResultStatus"
+    },
+    "content": {
+      "description": "작업 내용 설명. 무엇을 어떻게 수행했는지, 입력과 산출물, 발생한 이슈 등을 자연어로 서술한다.",
+      "type": "string",
+      "examples": [
+        "RESOURCE DB의 신규 아티클 12건을 수집해 요약 큐에 적재함.",
+        "주간 블로그 포스트 초안을 생성하고 검토 단계로 이관함."
+      ]
+    },
+    "related_protocol": {
+      "description": "관련 프로토콜/플로우 이름. 이 작업이 속한 자동화 프로토콜이나 n8n 플로우, 표준 운영 절차의 명칭을 기록한다.",
+      "type": "string",
+      "examples": ["daily-ingest-flow", "weekly-summary-protocol"]
+    },
+    "actor": {
+      "description": "수행 주체. 작업을 실제로 실행한 에이전트명 또는 사람의 이름/식별자를 기록한다.",
+      "type": "string",
+      "examples": ["summarizer-agent", "백요한"]
+    },
+    "started_at": {
+      "description": "시작 시각. 작업이 시작된 시점. ISO8601 KST(+09:00) 표기.",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:30:00+09:00"]
+    },
+    "finished_at": {
+      "description": "종료 시각. 작업이 완료된 시점. 진행중인 작업이면 비어 있을 수 있다. ISO8601 KST(+09:00) 표기.",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:45:00+09:00"]
+    }
+  },
+  "required": ["log_id", "work_type", "result", "content", "started_at"],
+  "additionalProperties": false
+}

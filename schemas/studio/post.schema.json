@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/studio/post.schema.json",
+  "title": "POST — 블로그 포스트",
+  "description": "Yohan Studio 블로그 포스트 한 건. 요약에서 발행된 콘텐츠.",
+  "type": "object",
+  "properties": {
+    "post_id": {
+      "description": "포스트 고유 ID (PK). Yohan Studio 블로그 시스템에서 포스트 한 건을 유일하게 식별하는 기본 키.",
+      "type": "string",
+      "examples": ["post_2026_0608_ai_agents", "post_01HZX9K3Q7"]
+    },
+    "title": {
+      "description": "포스트 제목. 블로그 목록 및 상세 페이지 상단에 노출되는 사람이 읽는 표제.",
+      "type": "string",
+      "examples": ["AI 에이전트로 1인 스튜디오 자동화하기", "노션 MCP 연동 실전 가이드"]
+    },
+    "slug": {
+      "description": "URL 슬러그. 포스트 주소(permalink)에 사용되는 영문 소문자·하이픈 구성의 고유 경로 식별자.",
+      "type": "string",
+      "examples": ["ai-agents-solo-studio-automation", "notion-mcp-integration-guide"]
+    },
+    "body": {
+      "description": "본문. 마크다운 형식으로 작성된 포스트 전체 내용. 제목·코드블록·이미지·링크 등을 포함할 수 있다.",
+      "type": "string",
+      "examples": ["## 들어가며\n\nAI 에이전트는 1인 스튜디오의 반복 작업을 자동화한다.\n\n```ts\nconst agent = createAgent();\n```", "# 개요\n\n노션 MCP 를 연동하면 Dev Log 자동 적재가 가능하다."]
+    },
+    "summary_id": {
+      "description": "원천 요약 참조 (FK). 이 포스트가 발행되기 전 원천이 된 요약을 가리킨다. notion:summary 의 summary_id 참조.",
+      "type": "string",
+      "examples": ["summary_2026_0607_ai_agents", "summary_01HZW8M2P5"]
+    },
+    "status": {
+      "description": "발행 상태. 포스트의 발행 생애주기 단계(초안/검토/발행/보관)를 나타낸다.",
+      "$ref": "../_shared-enums.json#/$defs/PostStatus"
+    },
+    "tags": {
+      "description": "태그. 포스트 분류·검색·필터링에 사용되는 키워드 목록.",
+      "type": "array",
+      "items": { "type": "string" },
+      "examples": [["AI", "자동화", "MCP"], ["노션", "개발"]]
+    },
+    "author": {
+      "description": "작성자. 포스트를 집필한 사람의 이름 또는 식별 표시.",
+      "type": "string",
+      "examples": ["백요한", "Yohan Studio"]
+    },
+    "cover_image": {
+      "description": "커버 이미지 URL. 포스트 상단 및 목록 썸네일에 표시되는 대표 이미지의 주소.",
+      "type": "string",
+      "format": "uri",
+      "examples": ["https://cdn.yohan-mcp.dev/covers/ai-agents.png", "https://cdn.yohan-mcp.dev/covers/notion-mcp.jpg"]
+    },
+    "published_at": {
+      "description": "발행 시각. 포스트가 외부에 공개된 일시. ISO8601 KST(+09:00).",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:30:00+09:00"]
+    }
+  },
+  "required": ["post_id", "title", "slug", "body", "status"],
+  "additionalProperties": false
+}

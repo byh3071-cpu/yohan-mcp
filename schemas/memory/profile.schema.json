@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/memory/profile.schema.json",
+  "title": "PROFILE — 사용자 프로필",
+  "description": "memory/profile.yaml. 사용자(백요한)의 역할·미션·전문성·선호.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "description": "사용자의 이름. 시스템 전반에서 사용자를 지칭하고 출력물의 화자(저자)를 식별하는 데 쓰인다.",
+      "type": "string",
+      "examples": ["백요한", "Yohan Baek"]
+    },
+    "role": {
+      "description": "사용자의 역할 또는 직함. 작업 맥락에서 어떤 관점·권한·책임으로 행동하는지를 규정하며, 응답 톤과 의사결정 기준에 반영된다.",
+      "type": "string",
+      "examples": ["AI 솔로 스튜디오 운영자", "프로덕트 빌더 / 바이브코더"]
+    },
+    "mission": {
+      "description": "사용자의 미션을 한 줄로 압축한 선언문. 장기적 방향성과 우선순위 판단의 기준이 되며, 프로젝트·작업이 이 미션에 부합하는지 가늠하는 잣대로 쓰인다.",
+      "type": "string",
+      "examples": ["AI로 1인 스튜디오를 무한 확장한다", "혼자서도 팀처럼 일하는 자동화 파이프라인을 만든다"]
+    },
+    "expertise": {
+      "description": "사용자가 강점을 가진 전문 분야 목록. 작업 위임·난이도 조정·설명 깊이를 결정할 때 참고하며, 이미 숙련된 영역은 간결하게 다룬다.",
+      "type": "array",
+      "items": { "type": "string" },
+      "examples": [["AI 에이전트 설계", "바이브코딩", "프롬프트 엔지니어링"]]
+    },
+    "preferences": {
+      "description": "작업 수행 시 적용할 사용자 선호 설정의 자유형 키/값 묶음. 언어·응답 스타일·코드 컨벤션·도구 사용 방식 등 임의의 선호를 키-값으로 자유롭게 담는다.",
+      "type": "object",
+      "additionalProperties": true,
+      "examples": [{ "language": "한국어", "response_style": "간결", "os": "Windows 11" }]
+    },
+    "tools": {
+      "description": "사용자가 주력으로 사용하는 도구 목록. 솔루션 제안·예시 코드·워크플로 구성 시 이 도구들을 우선 가정하고 호환되도록 맞춘다.",
+      "type": "array",
+      "items": { "type": "string" },
+      "examples": [["Claude Code", "VSCode", "Notion"]]
+    },
+    "updated_at": {
+      "description": "프로필이 마지막으로 수정된 시각. 프로필 정보의 최신성을 판단하는 기준이며 ISO8601 KST(+09:00)로 표기한다.",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:30:00+09:00"]
+    }
+  },
+  "required": ["name", "role"],
+  "additionalProperties": false
+}

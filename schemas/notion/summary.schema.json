@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/notion/summary.schema.json",
+  "title": "SUMMARY — 요약/인사이트",
+  "description": "Notion SUMMARY DB 한 행. RESOURCE 를 정제한 요약과 핵심 인사이트.",
+  "type": "object",
+  "properties": {
+    "summary_id": {
+      "description": "요약 한 건을 식별하는 고유 ID(기본키). SUMMARY DB 행을 유일하게 가리키며, memory:decision·studio:post·notion:ai-dict 등 하위 엔티티가 이 값을 외래키로 참조한다.",
+      "type": "string",
+      "examples": ["sum_2026-06-08_0001", "sum_a1b2c3d4"]
+    },
+    "resource_id": {
+      "description": "이 요약이 정제한 원본 자료의 식별자(외래키). notion:resource 의 resource_id 를 참조한다. 하나의 RESOURCE 는 여러 SUMMARY 로 요약될 수 있다(1:N).",
+      "type": "string",
+      "examples": ["res_2026-06-07_0042", "res_9f8e7d6c"]
+    },
+    "title": {
+      "description": "요약의 제목. 원본 자료의 핵심 주제를 한눈에 드러내는 짧은 문장 또는 어구로, 목록·검색 결과에서 식별자 역할을 한다.",
+      "type": "string",
+      "examples": ["RAG 파이프라인에서 청크 크기가 검색 품질에 미치는 영향", "트랜스포머 어텐션 메커니즘 핵심 정리"]
+    },
+    "summary": {
+      "description": "요약 본문. 원본 자료의 내용을 정제·압축한 서술형 텍스트로, 맥락 없이도 핵심 논지를 이해할 수 있도록 자족적으로 작성한다.",
+      "type": "string",
+      "examples": ["이 글은 RAG 시스템에서 청크 크기와 오버랩 설정이 검색 정확도와 응답 품질에 미치는 영향을 실험적으로 분석한다. 256~512 토큰 구간에서 재현율과 정밀도의 균형이 가장 좋았으며, 과도하게 큰 청크는 노이즈를 늘려 응답 품질을 떨어뜨렸다.", "어텐션은 쿼리·키·값의 내적으로 토큰 간 관련도를 계산해 가중 평균하는 메커니즘이며, 멀티헤드 구조로 서로 다른 표현 하위공간을 병렬 학습한다."]
+    },
+    "key_insights": {
+      "description": "원본에서 추출한 핵심 인사이트 목록. 각 항목은 의사결정이나 후속 작업으로 이어질 수 있는 독립적이고 실행 가능한 통찰 한 줄이다. 여기서 추출된 용어·결정은 notion:ai-dict 등재나 memory:decision 으로 승격될 수 있다.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "examples": [["청크 크기는 256~512 토큰이 검색 품질의 최적 구간이다", "오버랩 50토큰 이상은 비용 대비 효과가 미미하다"], ["멀티헤드 어텐션은 표현 다양성을 높인다"]]
+    },
+    "domain": {
+      "description": "이 요약이 속하는 상위 지식 도메인. 크로스 백엔드 필터링과 라우팅의 기준이 된다.",
+      "$ref": "../_shared-enums.json#/$defs/Domain"
+    },
+    "status": {
+      "description": "요약의 처리 단계 상태. 신규 생성부터 검토·완료·보류·폐기까지의 워크플로 단계를 나타낸다.",
+      "$ref": "../_shared-enums.json#/$defs/Status"
+    },
+    "confidence": {
+      "description": "요약의 신뢰도를 0~1 실수로 표현. 원본 해석의 정확성과 인사이트의 확실성을 종합한 값으로, 1에 가까울수록 검토 없이 신뢰할 수 있다.",
+      "$ref": "../_shared-enums.json#/$defs/Confidence"
+    },
+    "created_at": {
+      "description": "요약 행이 생성된 시각. ISO8601 한국 표준시(+09:00) 형식.",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:30:00+09:00"]
+    },
+    "notion_page_id": {
+      "description": "이 요약에 대응하는 Notion 페이지의 내부 ID. Notion API 호출·동기화 시 페이지를 직접 가리키는 데 사용한다.",
+      "type": "string",
+      "examples": ["1f2a3b4c-5d6e-7f80-9012-3456789abcde", "abcdef1234567890abcdef1234567890"]
+    }
+  },
+  "required": [
+    "summary_id",
+    "resource_id",
+    "title",
+    "summary",
+    "key_insights",
+    "domain",
+    "status",
+    "created_at"
+  ],
+  "additionalProperties": false
+}

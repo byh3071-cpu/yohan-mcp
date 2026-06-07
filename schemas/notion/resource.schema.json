@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/notion/resource.schema.json",
+  "title": "RESOURCE — 원본 자료",
+  "description": "Notion RESOURCE DB 한 행. 수집된 원본 자료(아티클·영상·논문 등)의 메타데이터와 본문.",
+  "type": "object",
+  "properties": {
+    "resource_id": {
+      "description": "자료 고유 ID(PK). RESOURCE DB 한 행을 유일하게 식별하며, 요약·트리플 등 다른 엔티티가 이 자료를 참조할 때 외래키로 사용된다.",
+      "type": "string",
+      "examples": ["res_2026-0601-0001", "res_a1b2c3d4"]
+    },
+    "title": {
+      "description": "자료의 제목. 원문에 표기된 제목을 그대로 보존하되, 제목이 없는 자료는 핵심 내용을 요약한 임시 제목을 부여한다.",
+      "type": "string",
+      "examples": ["트랜스포머 아키텍처 완전 정복", "RAG 파이프라인 설계 가이드"]
+    },
+    "source_url": {
+      "description": "자료의 원본 URL. 출처를 추적하고 재방문·재수집할 수 있도록 수집 당시의 정규 주소를 보존한다.",
+      "type": "string",
+      "format": "uri",
+      "examples": ["https://arxiv.org/abs/1706.03762", "https://www.youtube.com/watch?v=abcdEFGH123"]
+    },
+    "resource_type": {
+      "description": "자료의 매체 유형. 아티클·영상·논문 등 원본의 형태를 분류하여 수집·요약 파이프라인 라우팅의 기준으로 삼는다.",
+      "$ref": "../_shared-enums.json#/$defs/ResourceType"
+    },
+    "domain": {
+      "description": "자료가 속하는 상위 지식 도메인. 크로스 백엔드 필터링과 라우팅의 기준이 된다.",
+      "$ref": "../_shared-enums.json#/$defs/Domain"
+    },
+    "status": {
+      "description": "자료의 처리 상태. 수집 직후 신규에서 시작해 요약·분석을 거쳐 완료로 진행되며, 중복·무가치 자료는 폐기 처리한다.",
+      "$ref": "../_shared-enums.json#/$defs/Status"
+    },
+    "author": {
+      "description": "자료의 저자 또는 출처 작성자. 개인·기관·채널명 등 원문 작성 주체를 기록하며, 불명확하면 비워 둔다.",
+      "type": "string",
+      "examples": ["Ashish Vaswani 외", "OpenAI 공식 블로그"]
+    },
+    "tags": {
+      "description": "자료를 분류·검색하기 위한 자유 태그 목록. 도메인 enum 으로 표현되지 않는 세부 주제·기술명·키워드를 자유롭게 부여한다.",
+      "type": "array",
+      "items": { "type": "string" },
+      "examples": [["트랜스포머", "어텐션", "NLP"], ["RAG", "벡터DB", "임베딩"]]
+    },
+    "raw_content": {
+      "description": "원본 본문 전체 또는 핵심 발췌 텍스트. 요약·트리플 추출의 입력으로 사용되며, 분량이 큰 경우 핵심 단락만 발췌해 저장한다.",
+      "type": "string",
+      "examples": ["어텐션 메커니즘은 입력 시퀀스의 모든 위치를 동시에 참조하여 장거리 의존성을 학습한다. ...", "본 영상은 RAG 시스템을 4단계(수집·청킹·임베딩·검색)로 나누어 설명한다. ..."]
+    },
+    "captured_at": {
+      "description": "자료를 수집한 시각(ISO8601, KST). 수집 시점 기준 신선도 판단과 시간순 정렬에 사용된다.",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:30:00+09:00"]
+    },
+    "notion_page_id": {
+      "description": "이 자료가 적재된 Notion 페이지의 ID. Notion API 호출 및 페이지 역참조에 사용된다.",
+      "type": "string",
+      "examples": ["1f2e3d4c-5b6a-7980-a1b2-c3d4e5f60718"]
+    }
+  },
+  "required": [
+    "resource_id",
+    "title",
+    "source_url",
+    "resource_type",
+    "domain",
+    "status",
+    "captured_at"
+  ],
+  "additionalProperties": false
+}

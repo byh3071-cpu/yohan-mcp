@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/memory/decision.schema.json",
+  "title": "DECISION — 의사결정 기록",
+  "description": "memory/decisions/ 한 건. 의사결정의 배경·결정·근거·대안.",
+  "type": "object",
+  "properties": {
+    "decision_id": {
+      "description": "의사결정 기록의 고유 식별자(PK). memory/decisions/ 내에서 이 한 건을 유일하게 가리키는 안정적 키이며, 다른 엔티티가 이 결정을 참조할 때 사용한다.",
+      "type": "string",
+      "examples": ["dec_2026_0608_001", "decision-rtk-adoption"]
+    },
+    "title": {
+      "description": "결정을 한눈에 식별할 수 있는 짧은 제목. 무엇을 결정했는지 요약하는 명사구로 작성한다.",
+      "type": "string",
+      "examples": ["RTK 명령 래퍼 전면 도입", "Notion Dev Log를 단일 진실 공급원으로 채택"]
+    },
+    "context": {
+      "description": "결정이 필요해진 배경과 상황. 어떤 문제·제약·요구가 있었는지, 어떤 트리거로 논의가 시작되었는지 등 결정 시점의 맥락을 서술한다.",
+      "type": "string",
+      "examples": [
+        "빌드·테스트 로그가 토큰을 과도하게 소모해 컨텍스트 한도를 자주 초과했다.",
+        "여러 프로젝트의 Dev Log가 분산되어 패턴 사전 추출이 어려웠다."
+      ]
+    },
+    "decision": {
+      "description": "실제로 내린 결정의 내용. 채택하기로 한 방안·정책·구현 방향을 명확하고 단정적으로 기술한다.",
+      "type": "string",
+      "examples": [
+        "모든 CLI 명령을 rtk 프리픽스로 래핑해 토큰 사용량을 줄인다.",
+        "Notion Dev Log DB를 표준 적재 경로로 삼고 로컬 마크다운은 폴백으로만 사용한다."
+      ]
+    },
+    "rationale": {
+      "description": "그 결정을 내린 근거. 기대 효과, 비교 우위, 데이터·경험적 증거 등 결정을 정당화하는 이유를 설명한다.",
+      "type": "string",
+      "examples": [
+        "RTK는 빌드·테스트 출력에서 60~99%의 토큰 절감을 제공해 비용과 컨텍스트 압박을 동시에 완화한다.",
+        "단일 DB 적재가 패턴 사전 자동 추출과 역전파 검증을 가능하게 한다."
+      ]
+    },
+    "alternatives": {
+      "description": "결정에 이르기 전 검토했으나 채택하지 않은 대안 목록. 각 항목은 고려한 방안과 기각 사유를 간결히 담는다.",
+      "type": "array",
+      "items": { "type": "string" },
+      "examples": [
+        [
+          "수동으로 로그를 잘라 붙이기 — 일관성·자동화 부족으로 기각",
+          "출력 자체를 끄기 — 디버깅 정보 손실로 기각"
+        ]
+      ]
+    },
+    "status": {
+      "description": "현재 결정의 상태(제안/승인/기각/보류/재검토). 의사결정 라이프사이클상 어느 단계인지를 나타낸다.",
+      "$ref": "../_shared-enums.json#/$defs/DecisionStatus"
+    },
+    "trigger_summary_id": {
+      "description": "이 결정을 촉발한 원천 요약의 식별자(FK). notion:summary 의 summary_id 를 참조하며, 결정의 출발점이 된 수집·요약 자료를 역추적할 때 사용한다.",
+      "type": "string",
+      "examples": ["sum_2026_0607_042", "summary-rtk-benchmark"]
+    },
+    "decided_at": {
+      "description": "결정이 확정된 시각(ISO8601, KST +09:00). 결정의 시간적 기준점이자 이력 정렬에 사용한다.",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:30:00+09:00"]
+    }
+  },
+  "required": [
+    "decision_id",
+    "title",
+    "context",
+    "decision",
+    "rationale",
+    "status",
+    "decided_at"
+  ],
+  "additionalProperties": false
+}

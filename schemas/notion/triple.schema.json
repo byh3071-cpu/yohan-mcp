@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yohan-mcp.dev/schemas/notion/triple.schema.json",
+  "title": "TRIPLE — 지식 트리플 맵",
+  "description": "Subject-Relation-Object 트리플 한 건. 지식 그래프의 엣지로 임의의 엔티티를 연결한다.",
+  "type": "object",
+  "properties": {
+    "triple_id": {
+      "description": "트리플 고유 ID(기본키). 지식 그래프 내 하나의 엣지를 유일하게 식별하며, 다른 엔티티에서 이 엣지를 참조할 때 사용한다.",
+      "type": "string",
+      "examples": ["triple_8f3a21c0", "triple_2026-06-08-0001"]
+    },
+    "subject": {
+      "description": "트리플의 주어. 관계가 출발하는 엔티티(개념·인물·도구·자료 등)를 가리키는 표현. 지식 그래프에서 엣지의 시작 노드 역할을 한다.",
+      "type": "string",
+      "examples": ["Transformer", "Claude Code"]
+    },
+    "relation": {
+      "description": "주어와 목적어를 잇는 관계 술어. 두 노드 사이의 의미적 연결(예: '~의 일부이다', '~를 사용한다', '~에서 파생되었다')을 동사구 또는 표준 술어로 표현한다.",
+      "type": "string",
+      "examples": ["는 ~에 기반한다", "는 ~를 사용한다"]
+    },
+    "object": {
+      "description": "트리플의 목적어. 관계가 도달하는 엔티티(개념·인물·도구·자료 등)를 가리키는 표현. 지식 그래프에서 엣지의 끝 노드 역할을 한다.",
+      "type": "string",
+      "examples": ["Self-Attention", "Anthropic API"]
+    },
+    "source_id": {
+      "description": "이 트리플이 추출된 출처 엔티티의 ID. 어떤 원본 자료/요약에서 도출되었는지 추적하기 위한 외래키로, notion:resource 의 resource_id 또는 notion:summary 의 summary_id 를 참조한다.",
+      "type": "string",
+      "examples": ["notion:resource:res_01h9", "notion:summary:sum_3kd2"]
+    },
+    "domain": {
+      "description": "이 트리플이 속하는 상위 지식 도메인. 그래프 분할·필터링·라우팅의 기준이 된다.",
+      "$ref": "../_shared-enums.json#/$defs/Domain"
+    },
+    "confidence": {
+      "description": "트리플의 신뢰도(0~1 실수). 추출·검증 결과 이 관계가 사실일 가능성을 나타내며, 1에 가까울수록 확신이 높다.",
+      "$ref": "../_shared-enums.json#/$defs/Confidence"
+    },
+    "created_at": {
+      "description": "이 트리플이 생성(추출·기록)된 시각. ISO8601 KST(+09:00) 형식.",
+      "type": "string",
+      "format": "date-time",
+      "examples": ["2026-06-08T09:30:00+09:00"]
+    }
+  },
+  "required": ["triple_id", "subject", "relation", "object", "source_id", "domain", "created_at"],
+  "additionalProperties": false
+}
