@@ -30,6 +30,8 @@ from adapters.studio_adapter import StudioAdapter
 from core.router import SmartRouter
 from core.schema_validator import SchemaValidator
 from core.links import LinkStore
+from core.approval import ApprovalQueue
+from core import protocols as P
 from core import verify as V
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -180,19 +182,28 @@ class ToolContext:
         router: SmartRouter,
         validator: SchemaValidator,
         links_store: "LinkStore | None" = None,
+        approvals_store: "ApprovalQueue | None" = None,
+        runs_store: "P.RunStore | None" = None,
     ):
         self.adapters = adapters
         self.router = router
         self.validator = validator
-        self.links_store = links_store or self._default_links_store()
+        base = self._memory_base()
+        self.links_store = links_store or (
+            LinkStore(Path(base) / "links.jsonl") if base is not None else LinkStore()
+        )
+        # P4 — 승인큐/실행저널(프로토콜 엔진). memory base 하위로 tmp_path 격리.
+        self.approvals_store = approvals_store or (
+            ApprovalQueue(Path(base) / "approvals.jsonl") if base is not None else ApprovalQueue()
+        )
+        self.runs_store = runs_store or (
+            P.RunStore(Path(base) / "runs.jsonl") if base is not None else P.RunStore()
+        )
 
-    def _default_links_store(self) -> "LinkStore":
-        """memory 어댑터 base 하위에 인스턴스 링크 저장(테스트는 tmp_path 격리)."""
+    def _memory_base(self) -> "Path | None":
+        """memory 어댑터의 base 경로(없으면 None) — 런타임 저장소 격리 기준."""
         mem = self.adapters.get("memory")
-        base = getattr(mem, "base", None)
-        if base is not None:
-            return LinkStore(Path(base) / "links.jsonl")
-        return LinkStore()
+        return getattr(mem, "base", None)
 
     @classmethod
     def from_env(cls) -> "ToolContext":
@@ -338,20 +349,27 @@ def _stub(name: str, phase: str, **payload) -> dict:
     return _envelope({"status": "stub", "tool": name, "phase": phase, **payload}, None, [])
 
 
-# P3 실동작 프로토콜 + P4 등록만
-_REAL_PROTOCOLS = {"publish_summary", "summary_to_post"}
+# P3 단발 발행 프로토콜(하위호환 유지) + P4 멀티스텝 엔진 프로토콜
+_SINGLE_PROTOCOLS = {"publish_summary", "summary_to_post"}
 _REGISTERED_PROTOCOLS = sorted(
-    _REAL_PROTOCOLS | {"ingest", "ingest_summarize_publish", "resource_to_decision"}
+    _SINGLE_PROTOCOLS | set(P.list_protocols()) | {"ingest"}
 )
 
 
 async def tool_run_action(ctx: ToolContext, action: str, params: dict | None = None) -> dict:
-    """크로스 백엔드 프로토콜 실행 (P3).
+    """크로스 백엔드 프로토콜 실행 (P4 — Protocol Engine 위임, 자율성 L2).
 
-    범위 = 최소 1개 프로토콜 실동작(summary→publish, ingest). 나머지는 등록만(P4).
+    - 멀티스텝 프로토콜(ingest_summarize_publish 등)은 Protocol Engine 으로 위임.
+      게이트(되돌리기 어려운 step 직전)를 만나면 **pending 봉투(run_id)** 를 반환하고 정지.
+      이어서 `approve(run_id, 'approve'|'reject')` 로 재개/취소한다.
+    - 단발 발행(publish_summary/summary_to_post)·ingest 는 P3 호환 경로 유지.
     """
     params = params or {}
-    if action in _REAL_PROTOCOLS:
+    # P4 — 멀티스텝 프로토콜은 엔진이 순차 실행 + 게이트 처리
+    if action in P.PROTOCOLS:
+        return await P.run_protocol(ctx, action, params)
+    # P3 호환 — 단발 SUMMARY→발행
+    if action in _SINGLE_PROTOCOLS:
         inner = await tool_publish(ctx, params.get("summary"))
         data = {
             "protocol": action,
@@ -370,8 +388,57 @@ async def tool_run_action(ctx: ToolContext, action: str, params: dict | None = N
     if action == "ingest":
         return await tool_ingest(ctx, params.get("url", ""))
     return _stub(
-        "run_action", "등록만(P3 범위 외, P4 예정)",
+        "run_action", "미등록 프로토콜",
         action=action, known_protocols=_REGISTERED_PROTOCOLS,
+    )
+
+
+async def tool_approve(ctx: ToolContext, run_id: str, decision: str, note: str | None = None) -> dict:
+    """승인 게이트 결정 (P4) — 대기 중 프로토콜을 재개(approve) 또는 종료(reject).
+
+    멱등: 이미 종결(완료/거부/중단)된 run 은 저장된 최종 봉투를 그대로 돌려준다(중복 처리 무시).
+    """
+    journal = ctx.runs_store.latest(run_id)
+    if journal is None:
+        return _envelope(
+            {"status": "unknown_run", "run_id": run_id}, None, [],
+            errors=[f"알 수 없는 run_id: {run_id}"],
+        )
+    st = journal.get("status")
+    if st in ("done", "rejected", "aborted"):  # 멱등 — 종결된 run 재처리 무시
+        env = dict(journal.get("envelope") or {})
+        env["idempotent_replay"] = True
+        return env
+    if st != "pending":
+        return _envelope(
+            {"status": "not_pending", "run_id": run_id, "run_status": st}, None, [],
+            errors=[f"승인 대기 상태가 아님(run_status={st})"],
+        )
+
+    res = ctx.approvals_store.resolve(run_id, decision, note)
+    if res.get("status") == "invalid":
+        return _envelope(
+            {"status": "invalid_decision", "run_id": run_id}, None, [],
+            errors=[res.get("note")],
+        )
+
+    payload = ctx.approvals_store.payload_for(run_id) or {}
+    protocol = payload.get("protocol") or journal.get("protocol")
+    step_index = payload.get("step_index", journal.get("next_index", 0))
+
+    if decision == "reject":
+        reasoning = ((payload.get("context") or {}).get("_reasoning")) or []
+        env = P.rejected_envelope(run_id, protocol, step_index, reasoning, note)
+        ctx.runs_store.save({
+            "run_id": run_id, "protocol": protocol, "status": "rejected",
+            "next_index": step_index, "context": payload.get("context") or {}, "envelope": env,
+        })
+        return env
+
+    # approve → 게이트 통과 후 다음 step 부터 재개
+    return await P.run_protocol(
+        ctx, protocol, payload.get("params") or {},
+        run_id=run_id, resume=True, approved_index=step_index,
     )
 
 
@@ -486,8 +553,41 @@ async def tool_ingest(ctx: ToolContext, source: str, data: dict | None = None) -
 
 
 async def tool_plan(ctx: ToolContext, goal: str, opts: dict | None = None) -> dict:
-    """목표→실행계획 수립 (P4 예정)."""
-    return _stub("plan", "P4 예정", goal=goal)
+    """목표 → 적합 프로토콜 추천 + step 미리보기 (P4, dry plan — 실행 안 함).
+
+    키워드 채점으로 등록 프로토콜을 정렬하고, 최상위 프로토콜의 step 체인을 미리 보여준다.
+    실제 실행은 `run_action(protocol, params)` — plan 자체는 어떤 도구도 호출하지 않는다.
+    """
+    scored = P.recommend(goal)
+    candidates = [
+        {
+            "protocol": name,
+            "score": score,
+            "desc": P.PROTOCOLS[name]["desc"],
+            "steps": P.preview(name),
+        }
+        for name, score in scored
+    ]
+    # 최고점이 0 이면(키워드 미스) 추천은 비우되 후보 목록은 제공
+    best_name, best_score = scored[0] if scored else (None, 0)
+    recommended = best_name if best_score > 0 else None
+    data = {
+        "goal": goal,
+        "recommended": recommended,
+        "steps": P.preview(recommended) if recommended else [],
+        "gates": [s["index"] for s in P.preview(recommended) if s["gate"]] if recommended else [],
+        "candidates": candidates,
+        "dry_run": True,
+        "note": "미리보기만 — 실행은 run_action(protocol, params). 게이트가 있으면 approve 로 진행.",
+    }
+    return _envelope(
+        data, None, [],
+        reasoning_steps=[
+            f"목표 '{goal}' 키워드 채점",
+            f"추천: {recommended or '(명확한 매칭 없음 — 후보 참고)'}",
+            "dry plan — 도구 미실행",
+        ],
+    )
 
 
 async def tool_check(ctx: ToolContext, type_: str, data: dict | None = None) -> dict:

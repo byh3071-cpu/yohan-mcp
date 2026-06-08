@@ -71,8 +71,26 @@ async def status() -> dict:
 
 @mcp.tool()
 async def run_action(action: str, params: dict | None = None) -> dict:
-    """크로스 백엔드 프로토콜 실행 (P3: publish_summary/ingest 실동작, 나머지 등록만)."""
+    """프로토콜(순차 step 체인) 실행 (P4 — 자율성 L2, Protocol Engine 위임).
+
+    멀티스텝 프로토콜(ingest_summarize_publish·resource_to_decision 등)을 순차 실행한다.
+    되돌리기 어려운 step(외부 발행 등) 직전의 **승인 게이트**에 도달하면 실행을 멈추고
+    `run_id` 가 담긴 pending 봉투를 반환한다 → `approve(run_id, 'approve'|'reject')` 로 진행/취소.
+    publish_summary/summary_to_post·ingest 는 P3 단발 경로로 호환 유지. n8n·외부 큐 미사용.
+    """
     return await T.tool_run_action(ctx, action, params)
+
+
+@mcp.tool()
+async def approve(run_id: str, decision: str, note: str | None = None) -> dict:
+    """승인 게이트 결정 (P4 — 자율성 L2).
+
+    run_action 이 게이트에서 멈춰 반환한 `run_id` 에 대해 사람이 결정한다.
+    - decision='approve' → 게이트 다음 step 부터 재개(발행 등 완주).
+    - decision='reject'  → 게이트 step 미실행 + 종료 봉투(사유 note).
+    멱등: 이미 종결된 run 의 재호출은 무시되고 저장된 최종 봉투를 돌려준다.
+    """
+    return await T.tool_approve(ctx, run_id, decision, note)
 
 
 @mcp.tool()
@@ -92,7 +110,7 @@ async def ingest(source: str, data: dict | None = None) -> dict:
 
 @mcp.tool()
 async def plan(goal: str, opts: dict | None = None) -> dict:
-    """목표→실행계획 수립 (P4 예정 stub)."""
+    """목표→적합 프로토콜 추천 + step 미리보기 (P4, dry plan). 실행은 run_action 으로."""
     return await T.tool_plan(ctx, goal, opts)
 
 

@@ -78,8 +78,11 @@ async def test_run_action_publish_summary_protocol(tmp_path):
     assert ctx.links_store.find(relation="published_as")
 
 
-async def test_run_action_unknown_is_registered_only(tmp_path):
+async def test_run_action_unknown_is_stub(tmp_path):
+    """미등록 프로토콜만 stub — P4 에서 ingest_summarize_publish 는 실동작(엔진 위임)."""
     ctx = _ctx(tmp_path)
-    env = await T.tool_run_action(ctx, "ingest_summarize_publish")
+    env = await T.tool_run_action(ctx, "definitely_unknown_proto")
     assert env["data"]["status"] == "stub"
-    assert "publish_summary" in env["data"]["known_protocols"]
+    # 등록 목록에 P3 단발 + P4 멀티스텝 프로토콜이 함께 안내됨
+    known = env["data"]["known_protocols"]
+    assert "publish_summary" in known and "ingest_summarize_publish" in known

@@ -165,6 +165,68 @@ python scripts/seed_qdrant.py --rebuild --demo
 
 > ollama 가 Docker/WSL 컨테이너로 떠 있을 때 호스트 포트포워딩이 일시적으로 끊기면(`Server disconnected`) 임베더는 hash 로 폴백한다. 컨테이너를 재기동(`docker restart ollama`)하면 복구되며, 위 명령으로 1024차원 재시딩이 가능하다.
 
-## 다음 단계 — P4: n8n 자동화 + plan
+---
 
-`n8n_adapter` 실동작(웹훅 트리거) + `run_action` 의 나머지 프로토콜(ingest→summarize→publish 전자동 체인) + `plan(goal)` 실동작. RESOURCE→SUMMARY→POST→배포 가 사람 개입 없이 한 바퀴 돈다.
+# P4 — Protocol Engine + 승인큐 (자율성 L1→L2, n8n 없음) (완료)
+
+P3 까지 도구는 **단발 실행(L1)** 이었다. P4 는 여러 타입 도구를 **프로토콜 = 순차 step 체인**으로 묶어 자동 실행하되, 외부 발행처럼 **되돌리기 어려운 step 직전에 사람 승인 게이트(L2)** 를 둔다. 오케스트레이션은 yohan-mcp 내부 **Protocol Engine** 이 담당하고, 구동은 Claude Code / VHK CLI 가 한다. **n8n·외부 스케줄러·외부 큐 의존성 없음** — 큐는 로컬 JSONL. 무인 always-on 자동화는 **P5+ 별도 트랙**(데이터 플레인 이전 포함)으로 분리한다.
+
+## 자율성 레벨
+
+| 레벨 | 의미 | yohan-mcp |
+| --- | --- | --- |
+| **L1** | 단발 도구 실행 — 사람이 매 호출을 지시 | P2~P3 도구(search/create/publish/ingest…) |
+| **L2** | 프로토콜 체인 자동 실행 + **되돌리기 어려운 step 직전 사람 승인 게이트** | **P4 — run_action → [GATE] → approve** |
+| L3+ | 무인 always-on(스케줄/트리거 기반 데이터 플레인) | **P5 별도 트랙(미착수)** |
+
+## 등록 프로토콜
+
+엔진 프로토콜(멀티스텝, `core/protocols.py`):
+
+| 프로토콜 | step 체인 | 게이트 |
+| --- | --- | --- |
+| `ingest_summarize_publish` | `ingest(url)` → `create(summary 초안)` → **[GATE]** → `publish(summary)` | 발행 직전 |
+| `resource_to_decision` | `search(q)` → `get_context(q)` → `create(decision 초안)` | 없음(가역적) |
+
+P3 호환 단발 경로도 유지: `publish_summary`·`summary_to_post`(SUMMARY→발행), `ingest`(수집).
+
+> step = `{tool, params?, map?, build?, gate?, as?, optional?}`. `map` 은 이전 step 출력을 이번 step 파라미터로 잇고(예: `draft.input.data` → `publish.summary`), `build` 는 LLM 없이 결정적으로 초안을 합성한다(`summary_from_ingest`·`decision_from_context`). 모든 step 결과는 P3 표준 검증 봉투로 누적되고(`provenance.reasoning_steps`), 멱등·재개를 위해 `memory/runs.jsonl` 저널에 스냅샷을 남긴다.
+
+## 승인 흐름 (L2 게이트)
+
+```
+run_action(ingest_summarize_publish, {url})
+        │
+        ▼
+   ingest(url) ──► create(summary 초안)          # 자동 실행 (가역적)
+        │
+        ▼
+   [ GATE: publish 직전 ]  ──► 승인큐 적재(memory/approvals.jsonl)
+        │                        + pending 봉투 반환(run_id) → 정지
+        │
+   ┌────┴───────────────────────────────────────┐
+   │ approve(run_id, "approve")                  │  approve(run_id, "reject", note)
+   ▼                                             ▼
+ publish(summary) 완주 → completed 봉투     게이트 step 미실행 → rejected 봉투(사유)
+ (드라이런이면 '발행 보류'로 완주)           (발행 안 됨)
+```
+
+- **pending 봉투**: `{status:"pending_approval", run_id, protocol, step_index, awaiting_tool, note}` — `run_id` 로 재개.
+- **멱등**: 같은 `run_id` 재실행 시 완료 step 건너뜀(저장된 봉투 replay). 같은 게이트 중복 승인/거부 무시. 승인큐 `(run_id, step_index)` 중복 적재 안 함.
+- **부분결과**: 한 step 실패(`data=None`)면 체인 중단 + `{status:"aborted", failed_step_index, failed_tool, completed_steps}` 봉투로 **중단 지점 명시**.
+- **조회**: `approval.ApprovalQueue.list_pending()` 으로 대기 게이트 목록.
+
+## 도구 (P4 신규/갱신)
+
+- `run_action(protocol, params)` — Protocol Engine 위임. 게이트 만나면 pending 봉투(run_id) 반환.
+- `approve(run_id, decision, note?)` — **신설**. `approve` 면 다음 step 부터 재개, `reject` 면 종료 봉투.
+- `plan(goal)` — 목표 문자열 → 적합 프로토콜 추천 + step 미리보기(**dry plan, 실행 안 함**). 실행은 `run_action`.
+
+## 검증 결과
+
+- 테스트 **그린**(회귀 0, 새 외부 의존성 0). 신규: `test_protocols`(체인 성공/중단/부분결과/멱등), `test_approval`(pending→approve→재개·reject 종료·멱등), `test_plan`(추천+dry preview), `test_run_action_gate`(게이트 pending 반환).
+- 실증: `run_action(ingest_summarize_publish, {url})` → 게이트에서 pending(run_id) 반환·정지 → `approve` 시 publish 완주(드라이런 '발행 보류') / `reject` 시 발행 안 됨.
+
+## 다음 단계 — P5: 무인 always-on(별도 트랙)
+
+스케줄/트리거 기반 데이터 플레인(이전 포함)으로 사람 개입 없는 상시 자동화를 **분리 트랙**에서 다룬다. P4 의 L2 게이트는 그 전 단계의 안전장치다. (n8n 채택 여부도 이 트랙에서 결정 — 현재 코어는 외부 의존성 0.)

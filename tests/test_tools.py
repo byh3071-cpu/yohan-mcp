@@ -265,13 +265,11 @@ def test_extract_html_no_title_dup_no_script_leak():
     assert "본문 단락" in text
 
 
-# ── 남은 stub 도구 (plan=P4, run_action 미등록 프로토콜) ──────────
-async def test_stub_tools(tmp_path):
+# ── 미등록 프로토콜 stub (plan 은 P4 실동작 → test_plan.py) ──────
+async def test_run_action_unknown_stub(tmp_path):
     ctx = _ctx_with_memory(tmp_path)
-    for coro in [T.tool_run_action(ctx, "unknown_proto"), T.tool_plan(ctx, "g")]:
-        env = await coro
-        _envelope_shape(env)
-        assert env["data"]["status"] == "stub"
-    # 미등록 프로토콜은 등록된 프로토콜 목록을 안내
     env = await T.tool_run_action(ctx, "unknown_proto")
+    _envelope_shape(env)
+    assert env["data"]["status"] == "stub"
+    # 미등록 프로토콜은 등록된 프로토콜 목록을 안내
     assert "publish_summary" in env["data"]["known_protocols"]
