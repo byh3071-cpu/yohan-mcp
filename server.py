@@ -94,6 +94,28 @@ async def approve(run_id: str, decision: str, note: str | None = None) -> dict:
 
 
 @mcp.tool()
+async def run_trigger(trigger_id: str, params: dict | None = None) -> dict:
+    """트리거 실행 (P5 — 자율성 L3). triggers.json 정의를 읽어 트리거 정책으로 프로토콜 실행.
+
+    게이트에서 정책이 자동승인하면 무인 완주, 한도 초과/위험 행위면 승인큐로 폴백한다.
+    실제 cron/웹훅 구동(데이터 플레인)은 P5-B(배포)에서 이 진입점을 호출 — 호스트 미정.
+    """
+    return await T.tool_run_trigger(ctx, trigger_id, params)
+
+
+@mcp.tool()
+async def list_triggers() -> dict:
+    """등록된 트리거 카탈로그 조회 (P5, 읽기 전용)."""
+    return await T.tool_list_triggers(ctx)
+
+
+@mcp.tool()
+async def policy() -> dict:
+    """현재 정책(자동승인/always_gate/일일한도) + 오늘 자동발행 수 조회 (P5, 읽기 전용)."""
+    return await T.tool_get_policy(ctx)
+
+
+@mcp.tool()
 async def publish(summary: dict | str) -> dict:
     """SUMMARY → Studio 블로그 POST 발행. STUDIO_API_URL/KEY 없으면 드라이런(발행 보류).
 

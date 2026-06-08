@@ -302,9 +302,12 @@ async def run_protocol(
     run_id: str | None = None,
     resume: bool = False,
     approved_index: int | None = None,
+    policy=None,
 ) -> dict:
-    """프로토콜 순차 실행. gate 도달 시 승인큐 적재 + pending 봉투 반환.
+    """프로토콜 순차 실행. gate 도달 시 **정책 평가**로 자동승인/사람폴백을 결정한다(P5).
 
+    - policy(또는 ctx.policy)가 자동승인하면 게이트를 통과해 그대로 진행(봉투에 policy_rule).
+    - 한도 초과/always_gate/매칭 없음이면 P4 승인큐로 폴백(pending 봉투, run_id).
     멱등: 같은 run_id 가 이미 done/pending/aborted/rejected 면 저장된 봉투를 그대로 돌려준다
     (완료 step 재실행 없음). resume=True 면 게이트 승인 후 저장된 컨텍스트로 재개한다.
     """
@@ -344,40 +347,57 @@ async def run_protocol(
     for i in range(start, len(steps)):
         step = steps[i]
         tool = step["tool"]
+        call_params = _resolve_params(step, context, params)
 
-        # ── L2 게이트: 실행 전 정지(단, 방금 승인된 게이트는 통과) ──
+        # ── 게이트(P5): 정책 평가 → 자동승인 통과 or 사람 승인 폴백 ──
         if step.get("gate") and not (resume and i == approved_index):
-            payload = {
-                "protocol": name, "params": params, "step_index": i,
-                "step": {"tool": tool, "desc": step.get("desc")},
-                "context": {**context, "_reasoning": reasoning},
-                "preview": _build_summary_preview(step, context, params),
-            }
-            ctx.approvals_store.enqueue(run_id, name, i, payload)
-            sources, _ = _collect(context)
-            env = V.make_envelope(
-                {
-                    "status": "pending_approval",
-                    "run_id": run_id,
-                    "protocol": name,
-                    "step_index": i,
-                    "awaiting_tool": tool,
-                    "awaiting_desc": step.get("desc"),
-                    "note": f"approve('{run_id}', 'approve'|'reject') 로 진행/취소",
-                },
-                sources_used=sources, schema_valid=None,
-                reasoning_steps=reasoning + [f"GATE step{i} ({tool}) 도달 — 승인 대기"],
-                run_id=run_id, pending=True,
-            )
-            ctx.runs_store.save({
-                "run_id": run_id, "protocol": name, "status": "pending",
-                "next_index": i, "context": {**context, "_reasoning": reasoning},
-                "envelope": env,
-            })
-            return env
+            facts = _gate_facts(ctx, name, i, step, call_params)
+            facts["run_id"] = run_id
+            engine = policy if policy is not None else getattr(ctx, "policy", None)
+            decision = engine.decide(facts) if engine is not None else {
+                "auto_approve": False, "rule": None, "reason": "정책 엔진 없음"}
+
+            if decision.get("auto_approve"):
+                # 정책 자동승인 — 게이트 통과(아래 일반 실행 경로로 진행)
+                context.setdefault("_policy_decisions", []).append({**decision, "step_index": i})
+                reasoning.append(
+                    f"GATE step{i} ({tool}) — 정책 자동승인(rule={decision.get('rule')}): {decision.get('reason')}")
+            else:
+                # 한도 초과/always_gate/매칭 없음 → P4 승인큐로 폴백(pending)
+                payload = {
+                    "protocol": name, "params": params, "step_index": i,
+                    "step": {"tool": tool, "desc": step.get("desc")},
+                    "context": {**context, "_reasoning": reasoning},
+                    "preview": _build_summary_preview(step, context, params),
+                    "policy_decision": decision,
+                }
+                ctx.approvals_store.enqueue(run_id, name, i, payload)
+                sources, _ = _collect(context)
+                env = V.make_envelope(
+                    {
+                        "status": "pending_approval",
+                        "run_id": run_id,
+                        "protocol": name,
+                        "step_index": i,
+                        "awaiting_tool": tool,
+                        "awaiting_desc": step.get("desc"),
+                        "policy_decision": decision,
+                        "note": f"approve('{run_id}', 'approve'|'reject') 로 진행/취소",
+                    },
+                    sources_used=sources, schema_valid=None,
+                    reasoning_steps=reasoning + [
+                        f"GATE step{i} ({tool}) — 정책 폴백(rule={decision.get('rule')}): "
+                        f"{decision.get('reason')} → 사람 승인 대기"],
+                    run_id=run_id, pending=True,
+                )
+                ctx.runs_store.save({
+                    "run_id": run_id, "protocol": name, "status": "pending",
+                    "next_index": i, "context": {**context, "_reasoning": reasoning},
+                    "envelope": env,
+                })
+                return env
 
         # ── step 실행 ──
-        call_params = _resolve_params(step, context, params)
         try:
             step_env = await _dispatch(ctx, tool, call_params)
         except Exception as exc:  # 디스패치/도구 자체 예외 격리 → 부분결과 봉투
@@ -426,6 +446,31 @@ def _build_summary_preview(step: dict, context: dict, params: dict) -> dict:
     return preview
 
 
+def _gate_facts(ctx, name: str, i: int, step: dict, call_params: dict) -> dict:
+    """게이트 step 의 정책 판단 근거 수집(부작용 없음 — publish 는 변환·검증만 미리 수행).
+
+    publish: studio.can_publish 로 외부 실발행/드라이런 구분 + 발행될 POST 의 품질점수 산출.
+    """
+    facts = {
+        "protocol": name, "step_index": i, "tool": step["tool"],
+        "dry_run": True, "external_publish": False, "quality_score": None,
+    }
+    if step["tool"] == "publish":
+        studio = ctx.adapters.get("studio")
+        can_pub = bool(getattr(studio, "can_publish", False))
+        facts["external_publish"] = can_pub
+        facts["dry_run"] = not can_pub
+        summary = call_params.get("summary")
+        if isinstance(summary, dict) and studio is not None:
+            try:  # SUMMARY→POST 변환(발행 안 함) 후 품질점수만 측정
+                post = studio.summary_to_post(summary)
+                ver = V.verify_entity("post", post, ctx.validator, ctx._links())
+                facts["quality_score"] = ver.get("quality_score")
+            except Exception:
+                facts["quality_score"] = None
+    return facts
+
+
 def _abort(ctx, run_id, name, i, tool, reasoning, context, errors) -> dict:
     """한 step 실패 → 부분결과 봉투(중단 지점 명시) + 저널에 aborted 기록."""
     sources, summaries = _collect(context)
@@ -472,6 +517,13 @@ def _final_envelope(run_id, name, context, reasoning) -> dict:
         for k in ("published", "dry_run", "published_as", "detail"):
             if k in last_env:
                 extra[k] = last_env[k]
+    # P5 — 정책 자동승인으로 통과한 게이트가 있으면 봉투에 표시(policy_rule)
+    decisions = context.get("_policy_decisions") or []
+    if decisions:
+        data["auto_approved"] = True
+        data["policy_rule"] = decisions[-1].get("rule")
+        extra["auto_approved"] = True
+        extra["policy"] = decisions
     return V.make_envelope(
         data, sources_used=sources, schema_valid=None,
         reasoning_steps=reasoning + [f"프로토콜 '{name}' 완주"],

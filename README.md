@@ -227,6 +227,70 @@ run_action(ingest_summarize_publish, {url})
 - 테스트 **그린**(회귀 0, 새 외부 의존성 0). 신규: `test_protocols`(체인 성공/중단/부분결과/멱등), `test_approval`(pending→approve→재개·reject 종료·멱등), `test_plan`(추천+dry preview), `test_run_action_gate`(게이트 pending 반환).
 - 실증: `run_action(ingest_summarize_publish, {url})` → 게이트에서 pending(run_id) 반환·정지 → `approve` 시 publish 완주(드라이런 '발행 보류') / `reject` 시 발행 안 됨.
 
-## 다음 단계 — P5: 무인 always-on(별도 트랙)
+---
 
-스케줄/트리거 기반 데이터 플레인(이전 포함)으로 사람 개입 없는 상시 자동화를 **분리 트랙**에서 다룬다. P4 의 L2 게이트는 그 전 단계의 안전장치다. (n8n 채택 여부도 이 트랙에서 결정 — 현재 코어는 외부 의존성 0.)
+# P5 — 정책 엔진 + 스케줄러 추상화 (자율성 L2→L3 코드) (완료)
+
+P4 의 "매번 사람 승인(L2)" 을 **정책 기반 자동 승인(L3 코드)** 으로 확장한다. 정책 한도 내 = 자동 진행, 한도 초과/위험 행위 = P4 승인큐로 폴백(사람 호출). + 스케줄/트리거 추상화로 "깨우는 신호" 를 코드에서 받을 준비를 한다(**실제 구동=P5-B 배포, 호스트 미정**). 호스트·외부 스케줄러·외부 큐 의존성 **0** — PC 에서 전부 테스트된다.
+
+## 자율성 레벨 (갱신)
+
+| 레벨 | 의미 | yohan-mcp |
+| --- | --- | --- |
+| L1 | 단발 도구 실행 | P2~P3 |
+| L2 | 프로토콜 체인 + 사람 승인 게이트 | P4 |
+| **L3(코드)** | **정책 기반 자동 승인** — 한도 내 무인 진행, 초과 시 사람 폴백 | **P5(이번)** |
+| L3(구동) | 스케줄/웹훅 상시 트리거(데이터 플레인) | **P5-B(배포, 호스트 미정)** |
+
+## 정책 규칙 (`core/policy.py`)
+
+`Policy = {auto_approve_when[], always_gate[], max_actions_per_run, max_publishes_per_day}`.
+
+| 분류 | 규칙 | 의미 |
+| --- | --- | --- |
+| `auto_approve_when` | `dry_run_high_quality` | 드라이런 + 품질점수 ≥5 → 자동 진행(가역적이라 안전) |
+| `always_gate` | `external_publish` | 외부 실발행(URL+KEY 존재) → **절대 자동 금지**, 무조건 사람 승인 |
+| `always_gate` | `is_publish` | (엄격 프리셋) 모든 발행을 사람 승인 |
+| 한도 | `max_publishes_per_day` | 일일 자동발행 초과 → 자동승인 거부 → 폴백 |
+| 한도 | `max_actions_per_run` | 런당 액션 초과 → 폴백 |
+
+**기본 정책은 보수적(opt-in)** — `auto_approve_when=[]`(자동승인 없음 = P4 동등). 무인 자동화는 트리거(`triggers.json`의 `policy`)나 호출자가 **명시 채택**할 때만 켜진다. 권장 프리셋 `RECOMMENDED_AUTO_POLICY`(드라이런 고품질 자동) 제공. 모든 자동 결정은 `memory/policy_log.jsonl` 에 **감사 로그**(run_id/규칙/근거/facts)로 남고, 일일 카운터는 그 로그를 fold 해 산출(외부 의존성 0, 멱등).
+
+## auto_approve vs always_gate 흐름
+
+```
+run_action(protocol, params[, policy])
+        │  …게이트 step(예: publish) 직전…
+        ▼
+  ┌─────────────────── 정책 평가(facts: dry_run, quality_score, external_publish) ───────────────────┐
+  │ 1) always_gate 매칭?  ──예──►  사람 승인큐 폴백(pending) ── approve ─► 진행 / reject ─► 종료     │
+  │ 2) 한도 초과?         ──예──►  사람 승인큐 폴백(pending)                                          │
+  │ 3) auto_approve 매칭? ──예──►  자동 통과 → 게이트 step 실행 → 완주(봉투에 auto_approved+policy_rule) │
+  │ 4) 그 외             ─────►  기본 사람 승인큐 폴백(pending)                                       │
+  └────────────────────────────────────────────────────────────────────────────────────────────────┘
+        모든 결정 → policy_log.jsonl 감사 기록
+```
+
+## 스케줄러 추상화 (`core/scheduler.py`)
+
+`Trigger = {id, kind:"cron"|"webhook"|"manual", protocol, params, policy?, schedule?}` — `triggers.json`(스키마 불변, 리포 커밋). 실행 이력은 `memory/trigger_runs.jsonl`(gitignore).
+
+- `run_trigger(trigger_id, params?)` — 트리거 정의를 읽어 **트리거 정책을 적용**해 `run_action` 호출(정책 경유). 게이트에서 자동승인이면 무인 완주, 아니면 승인큐 폴백.
+- `list_triggers()` — 등록 트리거 카탈로그(읽기 전용).
+- `policy()` — 현재 정책 + 오늘 자동발행 수 조회(읽기 전용).
+
+> **실제 cron 타이머·웹훅 수신 = P5-B(배포)** 에서 이 진입점(`run_trigger`)을 호출해 주입한다. **호스트는 아직 미정** — 코어는 호스트·외부 스케줄러·외부 큐 의존성 0 으로, 진입점/등록/조회만 제공한다.
+
+## 도구 (P5 신규)
+
+- `run_trigger(trigger_id, params?)` — 트리거 진입점(정책 경유 프로토콜 실행).
+- `list_triggers()` / `policy()` — 트리거 카탈로그 / 정책 스냅샷 조회(읽기 전용).
+
+## 검증 결과
+
+- 테스트 **그린**(회귀 0, 새 외부 의존성 0). 신규: `test_policy`(auto_approve 통과 / 일일한도 초과 폴백 / always_gate 강제 게이트 / 감사로그), `test_scheduler`(트리거 등록·조회 / run_trigger 정책 경유).
+- 실증: 드라이런 고품질 → `auto_approved=true, policy_rule="dry_run_high_quality"` 무인 완주 / 외부 실발행·일일한도 초과 → 승인큐 폴백(pending) / 모든 결정 `policy_log.jsonl` 감사 기록.
+
+## 다음 단계 — P5-B: 구동(데이터 플레인, 호스트 미정)
+
+cron 타이머·웹훅 수신기를 붙여 `run_trigger` 를 상시 호출하는 **배포 트랙**(별도). 호스트(로컬 데몬 / 클라우드 / 워커)와 외부 스케줄러 채택 여부를 그때 결정한다. P5 의 정책 엔진이 그 무인 자동화의 안전장치다.

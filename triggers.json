@@ -1,0 +1,49 @@
+{
+  "$comment": "P5 트리거 정의(스키마 불변, 리포 커밋). kind=cron|webhook|manual. 실제 구동(cron 타이머/웹훅 수신)은 P5-B(배포)에서 이 진입점을 호출 — 호스트 미정. 런타임 실행 이력은 memory/trigger_runs.jsonl.",
+  "triggers": [
+    {
+      "id": "morning_publish",
+      "kind": "cron",
+      "schedule": "57 8 * * *",
+      "protocol": "ingest_summarize_publish",
+      "params": { "url": "https://example.com/today" },
+      "policy": {
+        "auto_approve_when": ["dry_run_high_quality"],
+        "always_gate": ["external_publish"],
+        "max_publishes_per_day": 5
+      },
+      "desc": "매일 아침 수집→요약→발행. 드라이런 고품질만 자동, 외부 실발행은 사람 승인."
+    },
+    {
+      "id": "auto_publish_demo",
+      "kind": "manual",
+      "protocol": "ingest_summarize_publish",
+      "params": { "url": "https://example.com/demo" },
+      "policy": {
+        "auto_approve_when": ["dry_run_high_quality"],
+        "always_gate": ["external_publish"],
+        "max_publishes_per_day": 20
+      },
+      "desc": "수동 트리거 — 정책 자동승인 경로 데모(드라이런 고품질 → 무인 완주)."
+    },
+    {
+      "id": "strict_publish",
+      "kind": "webhook",
+      "protocol": "ingest_summarize_publish",
+      "params": { "url": "https://example.com/hook" },
+      "policy": {
+        "auto_approve_when": [],
+        "always_gate": ["is_publish"],
+        "max_publishes_per_day": 0
+      },
+      "desc": "웹훅 트리거 — 모든 발행을 무조건 사람 승인(엄격). always_gate 데모."
+    },
+    {
+      "id": "draft_decision",
+      "kind": "manual",
+      "protocol": "resource_to_decision",
+      "params": { "query": "이번 주 의사결정 후보" },
+      "desc": "수동 트리거 — 검색→컨텍스트→DECISION 초안(게이트 없음, 가역)."
+    }
+  ]
+}

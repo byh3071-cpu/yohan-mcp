@@ -31,7 +31,9 @@ from core.router import SmartRouter
 from core.schema_validator import SchemaValidator
 from core.links import LinkStore
 from core.approval import ApprovalQueue
+from core.policy import PolicyEngine
 from core import protocols as P
+from core import scheduler as S
 from core import verify as V
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -184,6 +186,8 @@ class ToolContext:
         links_store: "LinkStore | None" = None,
         approvals_store: "ApprovalQueue | None" = None,
         runs_store: "P.RunStore | None" = None,
+        policy: "PolicyEngine | None" = None,
+        scheduler: "S.Scheduler | None" = None,
     ):
         self.adapters = adapters
         self.router = router
@@ -198,6 +202,13 @@ class ToolContext:
         )
         self.runs_store = runs_store or (
             P.RunStore(Path(base) / "runs.jsonl") if base is not None else P.RunStore()
+        )
+        # P5 — 정책 엔진(감사 로그) + 스케줄러(트리거). 정책 자동승인/사람 폴백.
+        self.policy = policy or PolicyEngine(
+            log_path=(Path(base) / "policy_log.jsonl") if base is not None else None
+        )
+        self.scheduler = scheduler or S.Scheduler(
+            runlog_path=(Path(base) / "trigger_runs.jsonl") if base is not None else None
         )
 
     def _memory_base(self) -> "Path | None":
@@ -356,18 +367,19 @@ _REGISTERED_PROTOCOLS = sorted(
 )
 
 
-async def tool_run_action(ctx: ToolContext, action: str, params: dict | None = None) -> dict:
-    """크로스 백엔드 프로토콜 실행 (P4 — Protocol Engine 위임, 자율성 L2).
+async def tool_run_action(ctx: ToolContext, action: str, params: dict | None = None, policy=None) -> dict:
+    """크로스 백엔드 프로토콜 실행 (P4 엔진 + P5 정책).
 
     - 멀티스텝 프로토콜(ingest_summarize_publish 등)은 Protocol Engine 으로 위임.
-      게이트(되돌리기 어려운 step 직전)를 만나면 **pending 봉투(run_id)** 를 반환하고 정지.
+      게이트에서 **정책 평가** → 자동승인이면 통과(완주), 아니면 P4 승인큐로 폴백(pending 봉투).
       이어서 `approve(run_id, 'approve'|'reject')` 로 재개/취소한다.
     - 단발 발행(publish_summary/summary_to_post)·ingest 는 P3 호환 경로 유지.
+    - policy 미지정 시 ctx.policy(기본 정책) 적용. 트리거는 자체 정책을 주입한다(P5 스케줄러).
     """
     params = params or {}
-    # P4 — 멀티스텝 프로토콜은 엔진이 순차 실행 + 게이트 처리
+    # P4/P5 — 멀티스텝 프로토콜은 엔진이 순차 실행 + 게이트(정책) 처리
     if action in P.PROTOCOLS:
-        return await P.run_protocol(ctx, action, params)
+        return await P.run_protocol(ctx, action, params, policy=policy)
     # P3 호환 — 단발 SUMMARY→발행
     if action in _SINGLE_PROTOCOLS:
         inner = await tool_publish(ctx, params.get("summary"))
@@ -439,6 +451,31 @@ async def tool_approve(ctx: ToolContext, run_id: str, decision: str, note: str |
     return await P.run_protocol(
         ctx, protocol, payload.get("params") or {},
         run_id=run_id, resume=True, approved_index=step_index,
+    )
+
+
+# ── P5 — 스케줄러/정책 도구 ─────────────────────────────────────
+async def tool_run_trigger(ctx: ToolContext, trigger_id: str, params: dict | None = None) -> dict:
+    """트리거 진입점 (P5) — 트리거 정의를 읽어 정책을 적용해 프로토콜 실행.
+
+    트리거의 policy 로 게이트를 평가한다(자동승인/사람 폴백). 실제 cron/웹훅 구동은 P5-B(배포).
+    """
+    return await S.run_trigger(ctx, trigger_id, params)
+
+
+async def tool_list_triggers(ctx: ToolContext) -> dict:
+    """등록된 트리거 카탈로그 (P5, 읽기 전용)."""
+    return S.list_triggers(ctx)
+
+
+async def tool_get_policy(ctx: ToolContext) -> dict:
+    """현재 정책 + 오늘 자동발행 수 조회 (P5, 읽기 전용)."""
+    snap = ctx.policy.snapshot()
+    return _envelope(
+        {"policy": snap["policy"], "publishes_today": snap["publishes_today"],
+         "rules_available": snap["rules_available"]},
+        None, [],
+        reasoning_steps=["정책 스냅샷 조회(읽기 전용)"],
     )
 
 
