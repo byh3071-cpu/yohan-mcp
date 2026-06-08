@@ -29,18 +29,19 @@ from adapters.qdrant_adapter import QdrantAdapter
 from adapters.studio_adapter import StudioAdapter
 from core.router import SmartRouter
 from core.schema_validator import SchemaValidator
+from core.links import LinkStore
+from core import verify as V
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def _envelope(data, schema_valid, sources_used, **extra) -> dict:
-    env = {
-        "data": data,
-        "verification": {"schema_valid": schema_valid},
-        "provenance": {"sources_used": sources_used},
-    }
-    env.update(extra)
-    return env
+    """중립(집계/조회) 봉투 — Verifiability Engine 의 표준 봉투로 위임.
+
+    엔티티 도구(create/update/publish/ingest/check)는 type_/validator 를 넘겨
+    풀 verification(6항목 점수 등)을 계산한다.
+    """
+    return V.make_envelope(data, sources_used=sources_used, schema_valid=schema_valid, **extra)
 
 
 KST = timezone(timedelta(hours=9))
@@ -171,12 +172,27 @@ async def _headroom_health() -> dict | None:
 
 
 class ToolContext:
-    """도구가 의존하는 어댑터·라우터·검증기 묶음."""
+    """도구가 의존하는 어댑터·라우터·검증기·링크저장소 묶음."""
 
-    def __init__(self, adapters: dict[str, BackendAdapter], router: SmartRouter, validator: SchemaValidator):
+    def __init__(
+        self,
+        adapters: dict[str, BackendAdapter],
+        router: SmartRouter,
+        validator: SchemaValidator,
+        links_store: "LinkStore | None" = None,
+    ):
         self.adapters = adapters
         self.router = router
         self.validator = validator
+        self.links_store = links_store or self._default_links_store()
+
+    def _default_links_store(self) -> "LinkStore":
+        """memory 어댑터 base 하위에 인스턴스 링크 저장(테스트는 tmp_path 격리)."""
+        mem = self.adapters.get("memory")
+        base = getattr(mem, "base", None)
+        if base is not None:
+            return LinkStore(Path(base) / "links.jsonl")
+        return LinkStore()
 
     @classmethod
     def from_env(cls) -> "ToolContext":
@@ -231,7 +247,12 @@ async def tool_create(ctx: ToolContext, type_: str, data: dict) -> dict:
         return _envelope(None, True, [], errors=[f"{type_} 라우팅 대상 백엔드 없음"])
     try:
         rec = await ctx.adapters[backend].create(_short_type(type_), data)
-        return _envelope(rec, True, [backend])
+        return V.make_envelope(
+            rec, sources_used=[backend], type_=type_, validator=ctx.validator,
+            schema_links=ctx._links(), entity=data,
+            diff={"before": None, "after": data},
+            reasoning_steps=[f"{type_} 스키마 검증 통과", f"{backend} 백엔드로 생성"],
+        )
     except NotImplementedError as exc:
         # stub 백엔드(studio/n8n/qdrant) — created:False 로 생성 안 됨을 명시
         return _envelope({"status": "stub", "created": False, "note": str(exc)}, True, [backend])
@@ -256,7 +277,14 @@ async def tool_update(ctx: ToolContext, id_: str, data: dict, type_: str | None 
     for name in [b for b in order if b in ctx.adapters]:
         try:
             rec = await ctx.adapters[name].update(id_, data, type_=type_)
-            return _envelope(rec, schema_valid, [name])
+            return V.make_envelope(
+                rec, sources_used=[name], schema_valid=schema_valid,
+                type_=type_, validator=ctx.validator if type_ else None,
+                schema_links=ctx._links() if type_ else None,
+                entity=rec.get("data") if isinstance(rec, dict) else None,
+                diff={"before": None, "after": data},
+                reasoning_steps=[f"id={id_} → {name} 백엔드 부분 갱신"],
+            )
         except (FileNotFoundError, NotImplementedError) as exc:
             last_err = f"{name}: {exc}"
         except Exception as exc:  # httpx/ValueError(경로차단 포함) 등 백엔드 장애 격리
@@ -310,17 +338,99 @@ def _stub(name: str, phase: str, **payload) -> dict:
     return _envelope({"status": "stub", "tool": name, "phase": phase, **payload}, None, [])
 
 
+# P3 실동작 프로토콜 + P4 등록만
+_REAL_PROTOCOLS = {"publish_summary", "summary_to_post"}
+_REGISTERED_PROTOCOLS = sorted(
+    _REAL_PROTOCOLS | {"ingest", "ingest_summarize_publish", "resource_to_decision"}
+)
+
+
 async def tool_run_action(ctx: ToolContext, action: str, params: dict | None = None) -> dict:
-    """n8n 워크플로 실행 (P4 예정)."""
-    return _stub("run_action", "P4 예정", action=action, params=params or {})
+    """크로스 백엔드 프로토콜 실행 (P3).
+
+    범위 = 최소 1개 프로토콜 실동작(summary→publish, ingest). 나머지는 등록만(P4).
+    """
+    params = params or {}
+    if action in _REAL_PROTOCOLS:
+        inner = await tool_publish(ctx, params.get("summary"))
+        data = {
+            "protocol": action,
+            "post": inner.get("data"),
+            "published": inner.get("published"),
+            "dry_run": inner.get("dry_run"),
+            "published_as": inner.get("published_as"),
+            "post_verification": inner.get("verification"),
+        }
+        return V.make_envelope(
+            data, sources_used=inner["provenance"]["sources_used"],
+            schema_valid=inner["verification"]["schema_valid"],
+            reasoning_steps=["프로토콜: summary → publish", *inner["provenance"].get("reasoning_steps", [])],
+            errors=inner.get("errors"),
+        )
+    if action == "ingest":
+        return await tool_ingest(ctx, params.get("url", ""))
+    return _stub(
+        "run_action", "등록만(P3 범위 외, P4 예정)",
+        action=action, known_protocols=_REGISTERED_PROTOCOLS,
+    )
 
 
-async def tool_publish(ctx: ToolContext, type_: str, data: dict | None = None) -> dict:
-    """Studio 발행 (P3 예정). 입력 스키마는 가능하면 검증."""
-    schema_valid = None
-    if data is not None:
-        schema_valid, _ = ctx.validator.validate(type_, data)
-    return _envelope({"status": "stub", "tool": "publish", "phase": "P3 예정"}, schema_valid, [])
+async def _resolve_summary(ctx: ToolContext, summary) -> dict | None:
+    """publish 입력 해소 — dict 면 그대로, 문자열이면 summary_id 로 노션에서 로드 시도."""
+    if isinstance(summary, dict):
+        return summary
+    sid = str(summary or "").strip()
+    if not sid:
+        return None
+    notion = ctx.adapters.get("notion")
+    if notion is not None:
+        try:
+            for rec in await notion.search(sid, {"type": "summary"}):
+                d = rec.get("data", {})
+                if d.get("summary_id") == sid or rec.get("id") == sid:
+                    return d
+        except Exception:
+            pass
+    return None
+
+
+async def tool_publish(ctx: ToolContext, summary, data: dict | None = None) -> dict:
+    """SUMMARY → Studio POST 발행(실/드라이런) + published_as 인스턴스 링크 기록 (P3).
+
+    summary: SUMMARY dict 또는 summary_id 문자열(노션에서 로드 시도).
+    data: 하위호환 — 주어지면 이를 SUMMARY 로 본다.
+    """
+    studio = ctx.adapters.get("studio")
+    if studio is None:
+        return _envelope(None, None, [], errors=["studio 어댑터 없음"])
+    summary_dict = await _resolve_summary(ctx, data if data is not None else summary)
+    if summary_dict is None:
+        return _envelope(None, False, [], errors=[f"요약 로드 실패: {summary!r}"])
+    try:
+        result = await studio.publish(summary_dict)
+    except Exception as exc:
+        return _envelope(None, None, ["studio"], errors=[f"studio.publish 실패: {type(exc).__name__}: {exc}"])
+
+    post = result["post"]
+    sid = summary_dict.get("summary_id")
+    pid = post.get("post_id")
+    link = None
+    if sid and pid:
+        link = ctx.links_store.record(
+            f"notion:summary:{sid}", f"studio:post:{pid}", "published_as", dry_run=result["dry_run"],
+        )
+    steps = [
+        f"SUMMARY({sid or '미상'}) → POST 변환",
+        "Studio 실발행 완료" if result["published"] else "드라이런 — 발행 보류",
+    ]
+    if link:
+        steps.append(f"published_as 기록: {link['source']} → {link['target']}")
+    return V.make_envelope(
+        post, sources_used=["studio"], type_="post", validator=ctx.validator,
+        schema_links=ctx._links(), entity=post, reasoning_steps=steps,
+        published=result["published"], dry_run=result["dry_run"],
+        detail=result["detail"], published_as=link,
+    )
 
 
 async def tool_ingest(ctx: ToolContext, source: str, data: dict | None = None) -> dict:
@@ -365,9 +475,13 @@ async def tool_ingest(ctx: ToolContext, source: str, data: dict | None = None) -
             errors.append(f"{name}: {type(exc).__name__}: {exc}")
 
     schema_valid, verrs = ctx.validator.validate("resource", resource)
-    return _envelope(
+    return V.make_envelope(
         {"resource_id": rid, "ingest_id": iid, "title": resource["title"], "stored": stored},
-        schema_valid, sources, errors=errors + verrs,
+        sources_used=sources, schema_valid=schema_valid,
+        type_="resource", validator=ctx.validator, schema_links=ctx._links(),
+        entity=resource,
+        reasoning_steps=[f"본문 추출 {len(body)}자", "Notion·Qdrant·memory 3중 적재"],
+        errors=errors + verrs,
     )
 
 
@@ -377,11 +491,22 @@ async def tool_plan(ctx: ToolContext, goal: str, opts: dict | None = None) -> di
 
 
 async def tool_check(ctx: ToolContext, type_: str, data: dict | None = None) -> dict:
-    """데이터 검증 점검 — 스키마 검증은 P2 에서도 동작."""
+    """데이터 검증 점검 — Verifiability Engine 으로 6항목 품질 점수까지 반환(P3).
+
+    data 없으면 알려진 타입 목록. data 있으면 스키마 검증 + 6항목 체크리스트/점수.
+    """
     if data is None:
         return _envelope({"known_types": ctx.validator.known_types()}, True, [])
     valid, errors = ctx.validator.validate(type_, data)
-    return _envelope({"type": type_, "valid": valid}, valid, [], errors=errors)
+    checklist = V.quality_checklist(type_, data, ctx.validator)
+    return V.make_envelope(
+        {"type": type_, "valid": valid, "quality_checklist": checklist},
+        sources_used=[], schema_valid=valid,
+        type_=type_, validator=ctx.validator, schema_links=ctx._links(),
+        entity=data,
+        reasoning_steps=[f"{type_} 스키마 검증", "6항목 품질 체크리스트 평가"],
+        errors=errors,
+    )
 
 
 def _short_type(type_: str) -> str:

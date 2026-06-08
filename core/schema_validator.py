@@ -66,6 +66,19 @@ class SchemaValidator:
     def known_types(self) -> list[str]:
         return sorted(self._schemas.keys())
 
+    def schema_for(self, type_: str) -> dict | None:
+        """타입 → 원본 스키마 dict(없으면 None). Verifiability 엔진의 품질검사용."""
+        key = self._resolve_key(type_)
+        return self._schemas.get(key) if key else None
+
+    def shared_enums(self) -> dict[str, list]:
+        """_shared-enums.json 의 $defs 중 enum 을 {이름: [허용값]} 으로 반환(verify 용)."""
+        path = self.dir / "_shared-enums.json"
+        if not path.exists():
+            return {}
+        defs = json.loads(path.read_text(encoding="utf-8")).get("$defs", {})
+        return {name: spec["enum"] for name, spec in defs.items() if isinstance(spec, dict) and "enum" in spec}
+
     def backend_of(self, type_: str) -> str | None:
         """타입 → 백엔드 이름. create/update 자동 라우팅에 사용."""
         key = self._resolve_key(type_)

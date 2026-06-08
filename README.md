@@ -131,6 +131,40 @@ headroom mcp install        # yohan-mcp MCP 도구 출력에 압축 자동 적�
 - 검증: `headroom mcp install` 후 `mcp__headroom__headroom_stats` 의 `compressions` 가 증가(0→N)하면 yohan-mcp 출력이 LLM 도달 전 압축됨을 의미.
 - `status` 도구는 `HEADROOM_URL` 설정 시 headroom 헬스 한 줄을 함께 보고한다.
 
-## 다음 단계 — P3: Studio 발행 + publish/run_action
+---
 
-`studio_adapter.publish` 실동작화 — `_links.json` 의 `published_as(1:N)` 관계대로 SUMMARY → 블로그 포스트 발행. `publish`/`run_action` 도구를 stub 에서 실동작으로 올리고, n8n 웹훅(`run_action`)으로 발행·배포 자동화를 연결한다. 이후 RESOURCE→SUMMARY→POST 의 전체 파이프라인이 한 바퀴 돈다.
+# P3 — Studio 발행 + MCP Resources/Prompts + Verifiability Engine (완료)
+
+SW 3.0 "피부" 완성. ① Studio 발행 실동작 ② 에이전트가 스키마/few-shot 을 읽는 MCP Resources·Prompts ③ 모든 응답에 검증 메타를 동봉하는 Verifiability Engine.
+
+## P3 산출물
+
+- **임베딩 ollama 실모델 전환** `core/embeddings.py` — `OllamaEmbedder`(REST `/api/embed`, 기본 `bge-m3` dim 1024, 다국어/한국어 강함). env `EMBED_BACKEND`(구명칭 `EMBEDDING_BACKEND` 호환): `auto`(ollama→local→hash)·`ollama`·`local`·`openai`·`hash`. ollama 다운/모델 미설치면 **hash(384) graceful 폴백**. 차원 변경 대응 위해 `seed_qdrant.py --rebuild`(컬렉션 삭제→재생성) + `--demo`(Notion 없이 내장 RESOURCE 적재) 추가.
+- **StudioAdapter 실동작** `adapters/studio_adapter.py` — `summary_to_post`(SUMMARY→POST, `post.schema` 정합, 한글 제목도 ASCII 슬러그) + `publish`. `STUDIO_API_URL`+`STUDIO_API_KEY` 둘 다 있으면 실발행(`POST /posts`), 없으면 **드라이런**(변환 결과 + "발행 보류" 플래그). 실엔드포인트는 `_PUBLISH_PATH` TODO 로 표시(코드 변경 없이 `.env` 만 채우면 전환).
+- **publish/run_action 도구 실동작** `core/tools.py` — `publish(summary)`: SUMMARY→발행 + **인스턴스 링크 기록**. `run_action(publish_summary|ingest, ...)` 최소 1개 크로스 백엔드 프로토콜 실동작(나머지 등록만, P4).
+- **인스턴스 링크 저장소** `core/links.py` — `published_as` 같은 **개별** 관계는 런타임 JSONL(`memory/links.jsonl`)에 적재. 스키마 타입수준 `_links.json` 은 **불변**(오염 금지).
+- **MCP Resources** `server.py` — `resource://schemas/{backend}/{entity}`(스키마 원문+examples), `resource://schemas/_links`(관계맵), `resource://schemas/_index`(타입 색인), `resource://status/current`(5개 백엔드 실시간 상태).
+- **MCP Prompts(few-shot)** — `create-summary`·`run-ingest`·`cross-search`. P1 `examples` 를 재활용한 기대 출력 예시 포함.
+- **Verifiability Engine** `core/verify.py` — 모든 도구 응답을 표준 봉투로 확장:
+  `{data, diff{before,after}, verification{schema_valid, rulebook_pass, cross_links_intact, contradiction_detected, quality_score 0~6}, provenance{sources_used, reasoning_steps}}`.
+  품질 체크리스트 6항목(schema_valid·required_present·enums_valid·provenance_present·timestamps_valid·content_nonempty). `check` 도구가 엔진을 직접 호출해 6항목 점수를 반환. P2 최소형 봉투의 상위호환(기존 키 보존).
+
+## 검증 결과
+
+- 테스트 **81 passed** (임베딩 ollama mock/폴백, Verifiability 6항목·룰북·크로스링크·모순, Studio 변환/발행 드라이런·실, publish→published_as 링크기록·schema 불오염, run_action 프로토콜, Resources/Prompts 노출 포함).
+- OllamaEmbedder 실서버 실증: `bge-m3` dim **1024**, L2 정규화, 배치 임베딩 OK.
+- `seed_qdrant.py --rebuild --demo` 로 컬렉션 재생성 + 내장 RESOURCE 3건 적재 실증(멱등).
+
+```powershell
+# ollama 임베딩 모델 준비 (한 번)
+ollama pull bge-m3
+# .env: EMBED_BACKEND=ollama, EMBEDDING_MODEL=bge-m3, QDRANT_URL=http://localhost:6333
+# 차원이 바뀌므로 컬렉션 재생성하며 재시딩 (Notion 없으면 --demo)
+python scripts/seed_qdrant.py --rebuild --demo
+```
+
+> ollama 가 Docker/WSL 컨테이너로 떠 있을 때 호스트 포트포워딩이 일시적으로 끊기면(`Server disconnected`) 임베더는 hash 로 폴백한다. 컨테이너를 재기동(`docker restart ollama`)하면 복구되며, 위 명령으로 1024차원 재시딩이 가능하다.
+
+## 다음 단계 — P4: n8n 자동화 + plan
+
+`n8n_adapter` 실동작(웹훅 트리거) + `run_action` 의 나머지 프로토콜(ingest→summarize→publish 전자동 체인) + `plan(goal)` 실동작. RESOURCE→SUMMARY→POST→배포 가 사람 개입 없이 한 바퀴 돈다.

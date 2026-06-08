@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
-"""yohan-mcp v2 — 임베딩 추상화 (P2.5).
+"""yohan-mcp v2 — 임베딩 추상화 (P2.5 → P3).
 
-백엔드 선택은 env EMBEDDING_BACKEND: auto(기본)|local|openai|hash.
+백엔드 선택은 env EMBED_BACKEND(또는 구명칭 EMBEDDING_BACKEND): auto(기본)|ollama|local|openai|hash.
+- ollama : 로컬 ollama 서버(localhost:11434) 실모델 (P3 기본, 한국어 OK, 비용 0, GPU/CPU)
 - local  : sentence-transformers (한국어 OK, 비용 0, torch 필요)
 - openai : text-embedding-3-small (OPENAI_API_KEY 필요)
 - hash   : 의존성 0 결정적 폴백 (의미품질 낮음, 파이프라인/테스트/오프라인용)
-- auto   : local 시도 → 실패 시 hash
+- auto   : ollama 시도 → local → hash (인프라 우선순위)
 
 모든 임베더는 `.name`, `.dim`, `.embed(texts) -> list[list[float]]` 제공.
-hash 의 기본 dim 은 384 라 paraphrase-multilingual-MiniLM-L12-v2 와 같아
-나중에 모델만 교체해도 컬렉션 차원이 유지된다.
+ollama 가 죽었거나 모델 미설치면 hash(dim 384)로 graceful 폴백한다(P3 교훈).
+차원이 바뀌면 Qdrant 컬렉션을 재생성해야 한다(seed_qdrant --rebuild).
 """
 from __future__ import annotations
 
@@ -91,17 +92,77 @@ class OpenAIEmbedder:
         return [d["embedding"] for d in resp.json()["data"]]
 
 
+class OllamaEmbedder:
+    """로컬 ollama 서버 임베딩 (REST /api/embed, 모델 기본 bge-m3).
+
+    - url   : env OLLAMA_URL (기본 http://localhost:11434)
+    - model : env EMBEDDING_MODEL (기본 bge-m3, dim 1024)
+    dim 은 생성자에서 1건 임베딩으로 실측한다 → 모델 교체에 자동 적응.
+    모델 미설치/서버 다운이면 생성자에서 예외 → get_embedder 가 hash 로 폴백.
+    embed 은 동기 호출(qdrant_adapter 가 asyncio.to_thread 로 감쌈).
+    """
+
+    name = "ollama"
+
+    def __init__(self, model_name: str | None = None, url: str | None = None, client=None) -> None:
+        import httpx  # lazy
+
+        self.model_name = model_name or os.getenv("EMBEDDING_MODEL", "bge-m3")
+        self.url = (url if url is not None else os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip("/")
+        # 첫 호출은 모델 로딩이 끼어 느릴 수 있어 타임아웃을 넉넉히
+        self._client = client or httpx.Client(base_url=self.url, timeout=60.0)
+        # dim 실측 — 모델 미설치면 여기서 예외가 나 폴백을 유도한다
+        self.dim = len(self._embed_batch(["dim probe"])[0])
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """ollama /api/embed (배치 input 지원). 실패 시 명확한 예외."""
+        resp = self._client.post("/api/embed", json={"model": self.model_name, "input": list(texts)})
+        resp.raise_for_status()
+        body = resp.json()
+        if "error" in body:
+            raise RuntimeError(f"ollama embed 오류: {body['error']}")
+        vecs = body.get("embeddings")
+        if not vecs:
+            raise RuntimeError(f"ollama embed 응답에 embeddings 없음: keys={list(body)}")
+        return [_l2_normalize(v) for v in vecs]
+
+    def embed(self, texts) -> list[list[float]]:
+        items = list(texts)
+        if not items:
+            return []
+        return self._embed_batch(items)
+
+
+def _l2_normalize(vec: list[float]) -> list[float]:
+    """COSINE 거리는 크기에 불변이지만, hash 임베더와 일관되게 단위벡터로 정규화."""
+    norm = math.sqrt(sum(float(v) * float(v) for v in vec))
+    if norm == 0.0:
+        return [float(v) for v in vec]
+    return [float(v) / norm for v in vec]
+
+
 def get_embedder():
-    """env 에 따라 임베더 생성. 기본 auto → local 실패 시 hash 폴백."""
-    backend = os.getenv("EMBEDDING_BACKEND", "auto").lower()
+    """env 에 따라 임베더 생성. 기본 auto → ollama→local→hash 순 폴백.
+
+    EMBED_BACKEND(신) 우선, 없으면 EMBEDDING_BACKEND(구) 호환.
+    명시 백엔드(ollama 포함)도 실패 시 hash 로 graceful 폴백한다.
+    """
+    backend = (os.getenv("EMBED_BACKEND") or os.getenv("EMBEDDING_BACKEND") or "auto").lower()
     if backend == "hash":
         return HashEmbedder()
     if backend == "openai":
         return OpenAIEmbedder()
     if backend == "local":
         return LocalEmbedder()
-    # auto
-    try:
-        return LocalEmbedder()
-    except Exception:
-        return HashEmbedder()
+    if backend == "ollama":
+        try:
+            return OllamaEmbedder()
+        except Exception:
+            return HashEmbedder()  # 모델 미설치/서버 다운 → graceful
+    # auto: 인프라 우선순위 ollama → local → hash
+    for ctor in (OllamaEmbedder, LocalEmbedder):
+        try:
+            return ctor()
+        except Exception:
+            continue
+    return HashEmbedder()

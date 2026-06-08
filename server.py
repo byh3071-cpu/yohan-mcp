@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 from contextlib import asynccontextmanager
 
@@ -70,14 +71,17 @@ async def status() -> dict:
 
 @mcp.tool()
 async def run_action(action: str, params: dict | None = None) -> dict:
-    """n8n 워크플로 실행 (P4 예정 stub)."""
+    """크로스 백엔드 프로토콜 실행 (P3: publish_summary/ingest 실동작, 나머지 등록만)."""
     return await T.tool_run_action(ctx, action, params)
 
 
 @mcp.tool()
-async def publish(type: str, data: dict | None = None) -> dict:
-    """Studio 발행 (P3 예정 stub, 입력 스키마 검증)."""
-    return await T.tool_publish(ctx, type, data)
+async def publish(summary: dict | str) -> dict:
+    """SUMMARY → Studio 블로그 POST 발행. STUDIO_API_URL/KEY 없으면 드라이런(발행 보류).
+
+    summary 는 SUMMARY dict 또는 summary_id 문자열(노션 로드). published_as 인스턴스 링크 기록.
+    """
+    return await T.tool_publish(ctx, summary)
 
 
 @mcp.tool()
@@ -94,8 +98,105 @@ async def plan(goal: str, opts: dict | None = None) -> dict:
 
 @mcp.tool()
 async def check(type: str, data: dict | None = None) -> dict:
-    """데이터를 P1 스키마로 검증(P2 실동작). data 없으면 알려진 타입 목록."""
+    """데이터를 P1 스키마로 검증 + 6항목 품질점수(P3 Verifiability). data 없으면 알려진 타입 목록."""
     return await T.tool_check(ctx, type, data)
+
+
+# ── MCP Resources (에이전트가 읽는 타입/관계/상태) ─────────────────
+_SCHEMAS_DIR = ctx.validator.dir
+
+
+def _example_of(type_: str) -> dict:
+    """P1 스키마 property examples[0] 를 모아 스키마 정합 예시 1건 구성(few-shot 재활용)."""
+    schema = ctx.validator.schema_for(type_) or {}
+    out: dict = {}
+    for field in schema.get("required", list(schema.get("properties", {}).keys())):
+        spec = schema.get("properties", {}).get(field, {})
+        ex = spec.get("examples")
+        if ex:
+            out[field] = ex[0]
+    return out
+
+
+def _safe_segment(seg: str) -> str:
+    """리소스 경로 세그먼트 봉쇄 — 경로 구분자/'..'/널 거부(임의 파일 읽기 차단)."""
+    if not seg or seg in (".", "..") or any(c in seg for c in "/\\:\x00"):
+        raise ValueError(f"잘못된 스키마 경로 세그먼트: {seg!r}")
+    return seg
+
+
+@mcp.resource("resource://schemas/{backend}/{entity}", mime_type="application/json")
+def schema_resource(backend: str, entity: str) -> str:
+    """단일 엔티티 스키마(description/examples 포함) 원문 — 에이전트가 읽고 데이터 생성."""
+    path = _SCHEMAS_DIR / _safe_segment(backend) / f"{_safe_segment(entity)}.schema.json"
+    # 이중 방어: resolve 후 schemas 디렉토리 하위인지 재확인
+    if not path.resolve().is_relative_to(_SCHEMAS_DIR.resolve()):
+        raise ValueError(f"schemas 디렉토리 탈출 차단: {backend}/{entity}")
+    if not path.exists():
+        raise ValueError(f"스키마 없음: {backend}/{entity}")
+    return path.read_text(encoding="utf-8")
+
+
+@mcp.resource("resource://schemas/_links", mime_type="application/json")
+def links_resource() -> str:
+    """크로스 백엔드 관계 맵 전체(_links.json) — 타입 수준 관계 그래프."""
+    return (_SCHEMAS_DIR / "_links.json").read_text(encoding="utf-8")
+
+
+@mcp.resource("resource://schemas/_index", mime_type="application/json")
+def schema_index_resource() -> str:
+    """알려진 스키마 타입 목록(backend:entity) — 어떤 스키마를 읽을 수 있는지 색인."""
+    return json.dumps({"known_types": ctx.validator.known_types()}, ensure_ascii=False, indent=2)
+
+
+@mcp.resource("resource://status/current", mime_type="application/json")
+async def status_resource() -> str:
+    """5개 백엔드 실시간 상태(status 도구 결과) — 라이브 헬스 스냅샷."""
+    env = await T.tool_status(ctx)
+    return json.dumps(env["data"], ensure_ascii=False, indent=2)
+
+
+# ── MCP Prompts (few-shot 설계서) ──────────────────────────────────
+@mcp.prompt(name="create-summary")
+def create_summary_prompt(resource_title: str = "", resource_text: str = "") -> str:
+    """원본 자료 → SUMMARY 생성 few-shot. P1 summary 스키마/examples 재활용."""
+    example = _example_of("summary")
+    return (
+        "당신은 yohan-mcp 의 요약 에이전트다. 아래 원본 자료를 읽고 "
+        "notion:summary 스키마에 정합하는 SUMMARY 한 건을 만들어 `create(type='summary', data=...)` 로 저장하라.\n"
+        "규칙: key_insights 는 실행가능한 통찰 1줄씩, domain 은 공유 enum, confidence 0~1, "
+        "resource_id 로 원본을 추적(summarized_by 1:N).\n\n"
+        f"[원본 제목]\n{resource_title or '(제목 입력)'}\n\n"
+        f"[원본 본문]\n{resource_text or '(본문 입력)'}\n\n"
+        f"[기대 출력 예시 — 스키마 정합]\n{json.dumps(example, ensure_ascii=False, indent=2)}"
+    )
+
+
+@mcp.prompt(name="run-ingest")
+def run_ingest_prompt(url: str = "") -> str:
+    """URL 수집 few-shot — ingest 도구로 Notion+Qdrant+memory 3중 적재 유도."""
+    example = _example_of("resource")
+    return (
+        "당신은 yohan-mcp 의 수집 에이전트다. 주어진 URL 을 `ingest(source=<url>)` 로 호출해 "
+        "본문을 추출하고 Notion RESOURCE + Qdrant 벡터 + memory ingest 로그로 3중 적재하라.\n"
+        "ingest 는 SSRF 가드/멱등(SoT Key)을 보장한다. 적재 후 resource_id 로 후속 요약을 잇는다.\n\n"
+        f"[수집 대상 URL]\n{url or 'https://example.com/article'}\n\n"
+        f"[적재될 RESOURCE 형태 예시]\n{json.dumps(example, ensure_ascii=False, indent=2)}"
+    )
+
+
+@mcp.prompt(name="cross-search")
+def cross_search_prompt(query: str = "") -> str:
+    """크로스 백엔드 통합검색 few-shot — search/get_context 로 RRF 융합 + 관계 traversal."""
+    return (
+        "당신은 yohan-mcp 의 검색 에이전트다. 질의를 `search(query=...)` 로 호출하면 "
+        "Notion(키워드)+memory(파일)+Qdrant(의미)를 병렬 조회해 RRF(k=60)로 융합한다. "
+        "관계까지 필요하면 `get_context(query=...)` 로 _links 관계를 함께 받아라.\n"
+        "결과의 verification(검증 메타)·provenance(sources_used)를 근거로 답하라.\n\n"
+        f"[질의]\n{query or '어텐션 메커니즘 청크 크기'}\n\n"
+        "[기대 행동]\n1) search 호출 → 상위 결과 확인 2) 필요시 get_context 로 관계 확장 "
+        "3) sources_used/verification 을 인용해 응답"
+    )
 
 
 if __name__ == "__main__":

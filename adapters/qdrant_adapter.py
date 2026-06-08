@@ -74,6 +74,15 @@ class QdrantAdapter(BackendAdapter):
         except Exception:
             return None
 
+    async def drop_collection(self) -> bool:
+        """컬렉션 삭제(존재 시). 임베더 차원 변경(예: hash384→ollama1024) 후 재생성용."""
+        client = self._get_client()
+        existed = await client.collection_exists(self.collection)
+        if existed:
+            await client.delete_collection(self.collection)
+        self._ensured = False
+        return existed
+
     async def ensure_collection(self) -> None:
         client = self._get_client()
         if self._ensured:
