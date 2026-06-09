@@ -33,36 +33,43 @@ def test_slug_ascii_even_for_korean_title():
     assert post["slug"] and all(c.islower() or c.isdigit() or c == "-" for c in post["slug"])
 
 
-async def test_publish_dry_run_when_no_credentials():
+async def test_publish_dry_run_when_no_repo():
+    # (P6) STUDIO_REPO_PATH 없음 → 드라이런(파일 미작성, MDX 전문 + 타겟 경로 반환)
     a = StudioAdapter(url="", api_key="")
     res = await a.publish(SUMMARY)
     assert res["dry_run"] is True and res["published"] is False
-    assert "보류" in res["detail"]
+    assert res["mode"] == "dry_run"
     assert res["post"]["status"] == "초안"
+    assert res["mdx"].startswith("---")              # frontmatter 포함 MDX 전문
+    assert "published: false" in res["mdx"]           # 초안 = 미노출
+    assert res["target_path"].endswith(".mdx")
+    assert res["frontmatter_valid"] is True
     ok, errs = VALIDATOR.validate("post", res["post"])
     assert ok, errs
 
 
-async def test_publish_real_when_credentials_set():
-    captured = {}
-
-    def handler(request):
-        captured["path"] = request.url.path
-        captured["body"] = json.loads(request.content)
-        captured["auth"] = request.headers.get("authorization")
-        return httpx.Response(200, json={"id": "post_remote_123"})
-
-    client = httpx.AsyncClient(base_url="https://studio.example.com",
-                               headers={"Authorization": "Bearer k"},
-                               transport=httpx.MockTransport(handler))
-    a = StudioAdapter(client=client, url="https://studio.example.com", api_key="k")
-    res = await a.publish(SUMMARY)
+async def test_publish_file_mode_writes_when_approved(tmp_path):
+    # (P6) file 모드 + 승인 → 실제 {slug}.mdx 파일 쓰기(published: true)
+    a = StudioAdapter(repo_path=str(tmp_path), mode="file",
+                      journal_path=tmp_path / "pub.jsonl")
+    res = await a.publish(SUMMARY, approved=True)
     assert res["dry_run"] is False and res["published"] is True
-    assert captured["path"].endswith("/posts")
+    target = tmp_path / "src" / "content" / "blog" / f"{res['slug']}.mdx"
+    assert target.exists()
+    body = target.read_text(encoding="utf-8")
+    assert body.startswith("---") and "published: true" in body
     assert res["post"]["status"] == "발행"
-    assert res["post"]["post_id"] == "post_remote_123"  # API id 로 보정
-    assert "published_at" in res["post"]
-    await client.aclose()
+
+
+async def test_publish_file_mode_blocked_without_approval(tmp_path):
+    # (P6) always_gate — file 모드라도 미승인이면 실파일 안 씀(드라이런 폴백)
+    a = StudioAdapter(repo_path=str(tmp_path), mode="file",
+                      journal_path=tmp_path / "pub.jsonl")
+    res = await a.publish(SUMMARY, approved=False)
+    assert res["dry_run"] is True and res["published"] is False
+    assert "미승인" in res["detail"] or "always_gate" in res["detail"]
+    blog = tmp_path / "src" / "content" / "blog"
+    assert not blog.exists() or not list(blog.glob("*.mdx"))   # 실파일 없음
 
 
 async def test_create_post_dry_run_and_real():

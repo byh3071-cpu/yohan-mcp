@@ -115,14 +115,31 @@ async def test_tool_create_missing_required(tmp_path):
     assert env["verification"]["schema_valid"] is False
 
 
-async def test_tool_create_notion_failure_enveloped(tmp_path):
-    """notion 라우팅 + 토큰 미설정 → 예외 대신 errors 봉투(장애 격리)."""
+async def test_tool_create_notion_dry_run_fallback(tmp_path):
+    """(P6) notion 토큰 미설정 + 유효 데이터 → None/예외 대신 드라이런 폴백(실생성 보류).
+
+    표준봉투의 data(생성될 레코드 ref)·verification 를 채우되 dry_run:true 로 표식한다.
+    """
     ctx = _ctx_with_memory(tmp_path)  # notion token=""
     env = await T.tool_create(ctx, "summary", VALID_SUMMARY)  # 유효 데이터 → 어댑터 도달
     _envelope_shape(env)
-    assert env["data"] is None
-    assert env["errors"]  # RuntimeError 가 봉투로 흡수됨
-    assert env["provenance"]["sources_used"] == []
+    assert env["data"] is not None                 # 생성될 레코드 ref 채워짐(ok)
+    assert env["data"]["id"] == "s1" and env["data"]["backend"] == "notion"
+    assert env.get("dry_run") is True
+    assert env["verification"]["schema_valid"] is True
+    assert env["verification"]["cross_links_intact"] is True   # resource_id FK 무결
+    assert env["provenance"]["sources_used"] == ["notion"]
+
+
+async def test_tool_create_idempotent_replay(tmp_path):
+    """(P6) 같은 SoT Key(type:pk) 재생성 → CreateStore fold+replay(중복 생성 방지)."""
+    ctx = _ctx_with_memory(tmp_path)
+    first = await T.tool_create(ctx, "summary", VALID_SUMMARY)
+    second = await T.tool_create(ctx, "summary", VALID_SUMMARY)
+    assert first["data"]["id"] == second["data"]["id"]
+    assert second.get("idempotent_replay") is True
+    # 멱등 — 두 번째는 새로 적재하지 않고 저장 봉투 replay
+    assert first.get("idempotent_replay") is None
 
 
 # ── update (부분 검증 + 라우팅) ─────────────────────────────────

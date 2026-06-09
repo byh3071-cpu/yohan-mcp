@@ -54,6 +54,11 @@ class NotionAdapter(BackendAdapter):
         self._owns_client = client is None  # 자가 생성분만 aclose 대상
         self.db_ids = {t: os.getenv(env) for t, env in _DB_ENV.items()}
 
+    @property
+    def can_create(self) -> bool:
+        """실생성 가능 여부 — 토큰이 있어야 한다(없으면 tool_create 가 드라이런 폴백)."""
+        return bool(self.token)
+
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(

@@ -398,11 +398,17 @@ async def run_protocol(
                 return env
 
         # ── step 실행 ──
+        # 게이트 step 이 여기 도달했다면 게이트를 통과한 것(자동승인 or 사람승인).
+        # always_gate 준수: publish 실발행은 이 승인 표식이 있을 때만 실제로 쓴다(tool_publish 가 읽음).
+        prev_approved = getattr(ctx, "_publish_approved", False)
+        ctx._publish_approved = bool(step.get("gate"))
         try:
             step_env = await _dispatch(ctx, tool, call_params)
         except Exception as exc:  # 디스패치/도구 자체 예외 격리 → 부분결과 봉투
             return _abort(ctx, run_id, name, i, tool, reasoning, context,
                           [f"step{i} {tool} 예외: {type(exc).__name__}: {exc}"])
+        finally:
+            ctx._publish_approved = prev_approved
 
         context[step.get("as", tool)] = {"input": call_params, "output": step_env}
         ok = step_env.get("data") is not None

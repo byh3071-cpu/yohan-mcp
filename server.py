@@ -117,9 +117,11 @@ async def policy() -> dict:
 
 @mcp.tool()
 async def publish(summary: dict | str) -> dict:
-    """SUMMARY → Studio 블로그 POST 발행. STUDIO_API_URL/KEY 없으면 드라이런(발행 보류).
+    """SUMMARY → Studio 블로그 MDX 발행(src/content/blog/{slug}.mdx).
 
-    summary 는 SUMMARY dict 또는 summary_id 문자열(노션 로드). published_as 인스턴스 링크 기록.
+    STUDIO_REPO_PATH 미설정 or STUDIO_PUBLISH_MODE=dry_run 이면 드라이런(파일 미작성).
+    file/pr 모드는 always_gate — 승인 통과 시에만 실제 쓰기. published_as 인스턴스 링크 기록.
+    summary 는 SUMMARY dict 또는 summary_id 문자열(노션 로드).
     """
     return await T.tool_publish(ctx, summary)
 

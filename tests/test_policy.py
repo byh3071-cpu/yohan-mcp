@@ -100,7 +100,10 @@ async def test_run_action_auto_approve_completes(tmp_path, monkeypatch):
 async def test_run_action_external_publish_always_gate(tmp_path, monkeypatch):
     """DoD2 — 외부 실발행 step → always_gate → 무조건 승인큐 폴백."""
     monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
-    ctx = _ctx(tmp_path, studio=StudioAdapter(url="http://studio.local", api_key="K"))
+    # (P6) 외부 실발행 능력 = STUDIO_REPO_PATH + mode=file → can_publish True
+    studio = StudioAdapter(repo_path=str(tmp_path / "studio_repo"), mode="file",
+                           journal_path=tmp_path / "pub.jsonl")
+    ctx = _ctx(tmp_path, studio=studio)
     pol = PolicyEngine(RECOMMENDED_AUTO_POLICY, log=ctx.policy.log)
     env = await T.tool_run_action(ctx, "ingest_summarize_publish",
                                   {"url": "https://example.com/b"}, policy=pol)

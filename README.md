@@ -140,7 +140,7 @@ SW 3.0 "피부" 완성. ① Studio 발행 실동작 ② 에이전트가 스키�
 ## P3 산출물
 
 - **임베딩 ollama 실모델 전환** `core/embeddings.py` — `OllamaEmbedder`(REST `/api/embed`, 기본 `bge-m3` dim 1024, 다국어/한국어 강함). env `EMBED_BACKEND`(구명칭 `EMBEDDING_BACKEND` 호환): `auto`(ollama→local→hash)·`ollama`·`local`·`openai`·`hash`. ollama 다운/모델 미설치면 **hash(384) graceful 폴백**. 차원 변경 대응 위해 `seed_qdrant.py --rebuild`(컬렉션 삭제→재생성) + `--demo`(Notion 없이 내장 RESOURCE 적재) 추가.
-- **StudioAdapter 실동작** `adapters/studio_adapter.py` — `summary_to_post`(SUMMARY→POST, `post.schema` 정합, 한글 제목도 ASCII 슬러그) + `publish`. `STUDIO_API_URL`+`STUDIO_API_KEY` 둘 다 있으면 실발행(`POST /posts`), 없으면 **드라이런**(변환 결과 + "발행 보류" 플래그). 실엔드포인트는 `_PUBLISH_PATH` TODO 로 표시(코드 변경 없이 `.env` 만 채우면 전환).
+- **StudioAdapter 실동작** `adapters/studio_adapter.py` — `summary_to_post`(SUMMARY→POST, `post.schema` 정합, 한글 제목도 ASCII 슬러그) + `publish`. (P6) 발행 = yohan-studio 레포 `src/content/blog/{slug}.mdx` 파일 쓰기(HTTP `POST /posts` 폐기). `STUDIO_PUBLISH_MODE` = `dry_run`(기본, 파일 미작성·MDX 전문+diff 반환) | `file`(파일 쓰기) | `pr`(브랜치+PR). file/pr 은 **always_gate** — 승인 통과 시에만 실제 쓰기. 멱등: `data/studio_published.jsonl`(slug+content-hash).
 - **publish/run_action 도구 실동작** `core/tools.py` — `publish(summary)`: SUMMARY→발행 + **인스턴스 링크 기록**. `run_action(publish_summary|ingest, ...)` 최소 1개 크로스 백엔드 프로토콜 실동작(나머지 등록만, P4).
 - **인스턴스 링크 저장소** `core/links.py` — `published_as` 같은 **개별** 관계는 런타임 JSONL(`memory/links.jsonl`)에 적재. 스키마 타입수준 `_links.json` 은 **불변**(오염 금지).
 - **MCP Resources** `server.py` — `resource://schemas/{backend}/{entity}`(스키마 원문+examples), `resource://schemas/_links`(관계맵), `resource://schemas/_index`(타입 색인), `resource://status/current`(5개 백엔드 실시간 상태).

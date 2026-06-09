@@ -21,7 +21,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from adapters.base import BackendAdapter
+from adapters.base import BackendAdapter, make_record
 from adapters.memory_adapter import MemoryAdapter
 from adapters.n8n_adapter import N8nAdapter
 from adapters.notion_adapter import NotionAdapter
@@ -175,6 +175,57 @@ async def _headroom_health() -> dict | None:
         return {"ok": False, "detail": f"headroom 연결 실패: {type(exc).__name__}: {exc}"}
 
 
+def _backend_can_create(adapter) -> bool:
+    """어댑터가 실생성 가능한지(미설정이면 tool_create 가 드라이런 폴백).
+
+    `can_create` 속성이 없으면(memory 처럼 항상 가능) True 로 본다.
+    """
+    cc = getattr(adapter, "can_create", None)
+    return True if cc is None else bool(cc)
+
+
+class CreateStore:
+    """create 멱등 저널 — append-only JSONL(`<memory>/created.jsonl`).
+
+    한 줄 = 한 생성 스냅샷 {key, envelope, ts}. 같은 key(=type:pk) 재생성 시
+    저장된 봉투를 fold(마지막 우선)해 그대로 돌려준다 — 중복 생성 방지(외부 브로커 0).
+    """
+
+    def __init__(self, path: "str | os.PathLike | None" = None) -> None:
+        if path is not None:
+            self.path = Path(path)
+        else:
+            base = Path(os.getenv("MEMORY_DIR", ROOT / "memory"))
+            self.path = base / "created.jsonl"
+
+    def _all(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        out: list[dict] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    def get(self, key: str) -> dict | None:
+        found = None
+        for ev in self._all():
+            if ev.get("key") == key:
+                found = ev.get("envelope")
+        return found
+
+    def put(self, key: str, envelope: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"key": key, "envelope": envelope, "ts": _now_iso()}
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 class ToolContext:
     """도구가 의존하는 어댑터·라우터·검증기·링크저장소 묶음."""
 
@@ -188,6 +239,7 @@ class ToolContext:
         runs_store: "P.RunStore | None" = None,
         policy: "PolicyEngine | None" = None,
         scheduler: "S.Scheduler | None" = None,
+        create_store: "CreateStore | None" = None,
     ):
         self.adapters = adapters
         self.router = router
@@ -202,6 +254,10 @@ class ToolContext:
         )
         self.runs_store = runs_store or (
             P.RunStore(Path(base) / "runs.jsonl") if base is not None else P.RunStore()
+        )
+        # P6 — create 멱등 저널(같은 SoT Key 재생성 중복 방지)
+        self.create_store = create_store or (
+            CreateStore(Path(base) / "created.jsonl") if base is not None else CreateStore()
         )
         # P5 — 정책 엔진(감사 로그) + 스케줄러(트리거). 정책 자동승인/사람 폴백.
         self.policy = policy or PolicyEngine(
@@ -260,23 +316,60 @@ async def tool_search(ctx: ToolContext, query: str, opts: dict | None = None) ->
 
 
 async def tool_create(ctx: ToolContext, type_: str, data: dict) -> dict:
-    """타입 보고 백엔드 자동선택 + 스키마 검증 후 생성."""
+    """타입 보고 백엔드 자동선택 + 스키마 검증 후 생성([실호출]/[드라이런] 분기).
+
+    백엔드가 실생성 불가(예: NOTION_TOKEN 미설정)면 **드라이런으로 폴백**한다 —
+    표준봉투의 data(생성될 레코드 ref)·verification·provenance 를 모두 채우되 dry_run:true 로 표식.
+    멱등: 같은 SoT Key(type:pk) 재생성 시 CreateStore fold+replay 로 중복 생성하지 않는다.
+    """
     valid, errors = ctx.validator.validate(type_, data)
     if not valid:
         return _envelope(None, False, [], errors=errors)
     backend = ctx.validator.backend_of(type_)
     if backend is None or backend not in ctx.adapters:
         return _envelope(None, True, [], errors=[f"{type_} 라우팅 대상 백엔드 없음"])
+    adapter = ctx.adapters[backend]
+    short = _short_type(type_)
+
+    # SoT Key — 노드 PK 로 멱등 키 구성(없으면 멱등 비활성)
+    pk_field = V.NODE_PK.get(f"{backend}:{short}")
+    pk = str(data[pk_field]) if pk_field and data.get(pk_field) is not None else None
+    key = f"{type_}:{pk}" if pk else None
+    if key:
+        cached = ctx.create_store.get(key)
+        if cached is not None:  # 이미 생성됨 — 저장 봉투 그대로(중복 생성 방지)
+            env = dict(cached)
+            env["idempotent_replay"] = True
+            return env
+
+    def _emit(env: dict) -> dict:
+        if key:
+            ctx.create_store.put(key, env)
+        return env
+
+    # ── 드라이런 분기 — 백엔드 미설정 시 graceful 폴백(예외로 죽지 않음) ──
+    if not _backend_can_create(adapter):
+        rec = make_record(pk or short, short, backend, data)
+        return _emit(V.make_envelope(
+            rec, sources_used=[backend], type_=type_, validator=ctx.validator,
+            schema_links=ctx._links(), entity=data,
+            diff={"before": None, "after": data},
+            reasoning_steps=[f"{type_} 스키마 검증 통과",
+                             f"{backend} 미설정 — 드라이런(실생성 보류, .env 채우면 실생성 전환)"],
+            dry_run=True,
+        ))
+
+    # ── 실호출 분기 ──
     try:
-        rec = await ctx.adapters[backend].create(_short_type(type_), data)
-        return V.make_envelope(
+        rec = await adapter.create(short, data)
+        return _emit(V.make_envelope(
             rec, sources_used=[backend], type_=type_, validator=ctx.validator,
             schema_links=ctx._links(), entity=data,
             diff={"before": None, "after": data},
             reasoning_steps=[f"{type_} 스키마 검증 통과", f"{backend} 백엔드로 생성"],
-        )
+        ))
     except NotImplementedError as exc:
-        # stub 백엔드(studio/n8n/qdrant) — created:False 로 생성 안 됨을 명시
+        # stub 백엔드(n8n 등) — created:False 로 생성 안 됨을 명시
         return _envelope({"status": "stub", "created": False, "note": str(exc)}, True, [backend])
     except Exception as exc:  # 백엔드 장애(ValueError/RuntimeError/httpx 등) 격리 → 봉투
         return _envelope(None, True, [], errors=[f"{backend}: {type(exc).__name__}: {exc}"])
@@ -510,8 +603,10 @@ async def tool_publish(ctx: ToolContext, summary, data: dict | None = None) -> d
     summary_dict = await _resolve_summary(ctx, data if data is not None else summary)
     if summary_dict is None:
         return _envelope(None, False, [], errors=[f"요약 로드 실패: {summary!r}"])
+    # always_gate — 실발행(file/pr)은 명시적 승인 통과 시에만. 프로토콜 게이트가 ctx 에 표식.
+    approved = bool(getattr(ctx, "_publish_approved", False))
     try:
-        result = await studio.publish(summary_dict)
+        result = await studio.publish(summary_dict, approved=approved)
     except Exception as exc:
         return _envelope(None, None, ["studio"], errors=[f"studio.publish 실패: {type(exc).__name__}: {exc}"])
 
@@ -523,17 +618,30 @@ async def tool_publish(ctx: ToolContext, summary, data: dict | None = None) -> d
         link = ctx.links_store.record(
             f"notion:summary:{sid}", f"studio:post:{pid}", "published_as", dry_run=result["dry_run"],
         )
-    steps = [
-        f"SUMMARY({sid or '미상'}) → POST 변환",
-        "Studio 실발행 완료" if result["published"] else "드라이런 — 발행 보류",
-    ]
+    if result.get("already_published"):
+        head = f"이미 발행됨(멱등 no-op): {result.get('slug')}.mdx"
+    elif result["published"]:
+        head = f"Studio MDX 실발행 완료: {result.get('target_path')}"
+    else:
+        head = f"드라이런 — 파일 미작성({result.get('detail')})"
+    steps = [f"SUMMARY({sid or '미상'}) → POST → MDX 렌더(frontmatter {len(result.get('frontmatter') or {})}필드)", head]
     if link:
         steps.append(f"published_as 기록: {link['source']} → {link['target']}")
+    # provenance — 원본 SUMMARY 추적(cross-link)
+    sources = ["studio"] + ([f"notion:summary:{sid}"] if sid else [])
+    # MDX 발행 신호를 봉투 extra 로 노출(data=post/verification 은 불변 유지)
+    extra = {k: result[k] for k in (
+        "mode", "slug", "target_path", "mdx", "frontmatter_valid",
+        "diff", "already_published", "contradiction",
+    ) if k in result}
+    if result.get("pr") is not None:
+        extra["pr"] = result["pr"]
     return V.make_envelope(
-        post, sources_used=["studio"], type_="post", validator=ctx.validator,
+        post, sources_used=sources, type_="post", validator=ctx.validator,
         schema_links=ctx._links(), entity=post, reasoning_steps=steps,
         published=result["published"], dry_run=result["dry_run"],
         detail=result["detail"], published_as=link,
+        errors=result.get("errors"), **extra,
     )
 
 
