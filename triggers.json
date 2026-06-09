@@ -1,9 +1,29 @@
 {
-  "$comment": "P5 트리거 정의(스키마 불변, 리포 커밋). kind=cron|webhook|manual. 실제 구동(cron 타이머/웹훅 수신)은 P5-B(배포)에서 이 진입점을 호출 — 호스트 미정. 런타임 실행 이력은 memory/trigger_runs.jsonl.",
+  "$comment": "P7 트리거 정의(스키마 불변, 리포 커밋). type=interval|daily|webhook|manual(legacy kind 호환). cron 풀파서 없음 — every_sec/at(HH:MM)/cron부분집합 'M H * * *'. 실발화는 TriggerEngine(core/triggers.py): cron계열 tick + webhook HMAC. 무인이어도 publish 는 always_gate(require_approval) 유지. 상태/이력/락은 data/(gitignore).",
   "triggers": [
+    {
+      "id": "hourly_ingest",
+      "type": "interval",
+      "enabled": true,
+      "schedule": { "every_sec": 3600 },
+      "target": { "chain": "ingest_summarize", "params": { "url": "https://example.com/feed" } },
+      "params": { "url": "https://example.com/feed" },
+      "desc": "매시간 수집→요약(발행 없음, 무인 자동). always_gate 비대상(내부 작업)."
+    },
+    {
+      "id": "nightly_full_loop",
+      "type": "daily",
+      "enabled": true,
+      "schedule": { "at": "02:30", "tz": "Asia/Seoul" },
+      "target": { "chain": "full_loop", "params": { "url": "https://example.com/nightly" } },
+      "params": { "url": "https://example.com/nightly" },
+      "policy": { "publish_mode": "dry_run", "require_approval": true },
+      "desc": "매일 02:30 수집→요약→발행 진입. 발행은 require_approval — 승인 큐 폴백까지만(무인 실발행 금지)."
+    },
     {
       "id": "morning_publish",
       "kind": "cron",
+      "enabled": true,
       "schedule": "57 8 * * *",
       "protocol": "ingest_summarize_publish",
       "params": { "url": "https://example.com/today" },
@@ -12,11 +32,12 @@
         "always_gate": ["external_publish"],
         "max_publishes_per_day": 5
       },
-      "desc": "매일 아침 수집→요약→발행. 드라이런 고품질만 자동, 외부 실발행은 사람 승인."
+      "desc": "(legacy) 매일 아침 수집→요약→발행. 드라이런 고품질만 자동, 외부 실발행은 사람 승인."
     },
     {
       "id": "auto_publish_demo",
       "kind": "manual",
+      "enabled": true,
       "protocol": "ingest_summarize_publish",
       "params": { "url": "https://example.com/demo" },
       "policy": {
@@ -29,6 +50,9 @@
     {
       "id": "strict_publish",
       "kind": "webhook",
+      "type": "webhook",
+      "enabled": true,
+      "event": { "name": "publish_request" },
       "protocol": "ingest_summarize_publish",
       "params": { "url": "https://example.com/hook" },
       "policy": {
@@ -36,11 +60,12 @@
         "always_gate": ["is_publish"],
         "max_publishes_per_day": 0
       },
-      "desc": "웹훅 트리거 — 모든 발행을 무조건 사람 승인(엄격). always_gate 데모."
+      "desc": "웹훅 트리거(event=publish_request) — 모든 발행 무조건 사람 승인. HMAC 검증 후 발화."
     },
     {
       "id": "draft_decision",
       "kind": "manual",
+      "enabled": true,
       "protocol": "resource_to_decision",
       "params": { "query": "이번 주 의사결정 후보" },
       "desc": "수동 트리거 — 검색→컨텍스트→DECISION 초안(게이트 없음, 가역)."

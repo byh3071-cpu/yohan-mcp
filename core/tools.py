@@ -561,6 +561,38 @@ async def tool_list_triggers(ctx: ToolContext) -> dict:
     return S.list_triggers(ctx)
 
 
+def _trigger_engine(ctx: ToolContext):
+    """트리거 실발화 엔진(P7) — 상태/이력/락은 memory base 하위로 격리."""
+    from core import triggers as TR  # 지연 임포트: tools ↔ triggers 순환 방지
+    base = ctx._memory_base()
+    data_dir = (Path(base) / "triggerdata") if base is not None else None
+    return TR.TriggerEngine(ctx, data_dir=data_dir)
+
+
+async def tool_fire_due(ctx: ToolContext) -> dict:
+    """due 트리거 실발화 (P7) — cron 계열(interval/daily) tick 1회.
+
+    멱등/single-flight/watermark/실패격리 모두 엔진이 처리. publish 는 always_gate 유지.
+    """
+    eng = _trigger_engine(ctx)
+    results = await eng.tick()
+    fired = [{
+        "trigger_id": (r.get("data") or {}).get("trigger_id") or (r.get("data") or {}).get("run_id"),
+        "status": (r.get("data") or {}).get("status"),
+        "dry_run": r.get("dry_run"),
+    } for r in results]
+    return _envelope(
+        {"fired": fired, "count": len(fired)}, None, [],
+        reasoning_steps=[f"due 트리거 {len(fired)}건 발화(tick)"],
+    )
+
+
+async def tool_handle_webhook(ctx: ToolContext, body, signature: str | None) -> dict:
+    """웹훅 수신 처리 (P7) — HMAC 검증 후 매핑 트리거 발화(검증 실패는 발화 안 함)."""
+    eng = _trigger_engine(ctx)
+    return await eng.handle_webhook(body, signature)
+
+
 async def tool_get_policy(ctx: ToolContext) -> dict:
     """현재 정책 + 오늘 자동발행 수 조회 (P5, 읽기 전용)."""
     snap = ctx.policy.snapshot()

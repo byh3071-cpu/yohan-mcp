@@ -110,6 +110,25 @@ async def list_triggers() -> dict:
 
 
 @mcp.tool()
+async def fire_due_triggers() -> dict:
+    """due 트리거 실발화 (P7 — 무인 구동). interval/daily 트리거 중 발화 시점 도달분을 1회 tick.
+
+    멱등(run_key)·single-flight 락·watermark 증분·실패 격리 적용. 외부 실발행(publish)은
+    트리거 정책의 always_gate 를 유지한다(require_approval 이면 승인 큐 폴백까지만).
+    """
+    return await T.tool_fire_due(ctx)
+
+
+@mcp.tool()
+async def webhook(body: str, signature: str | None = None) -> dict:
+    """웹훅 수신 처리 (P7). 요청 본문 + HMAC-SHA256 서명(.env WEBHOOK_SECRET)을 검증해 매핑 트리거 발화.
+
+    서명 누락/불일치는 발화하지 않는다(401). 동일 event_id 재전송은 멱등 1회만.
+    """
+    return await T.tool_handle_webhook(ctx, body, signature)
+
+
+@mcp.tool()
 async def policy() -> dict:
     """현재 정책(자동승인/always_gate/일일한도) + 오늘 자동발행 수 조회 (P5, 읽기 전용)."""
     return await T.tool_get_policy(ctx)
