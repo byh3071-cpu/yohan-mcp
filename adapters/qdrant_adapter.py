@@ -19,6 +19,8 @@ from adapters.base import BackendAdapter, _Timer, health, make_record
 from core.embeddings import get_embedder
 
 COLLECTION = "yohan_resources"
+# 관제탑(yohan-control-tower)이 적재하는 읽기전용 4컬렉션 — get_context 검색 대상(bge-m3 1024d 동일 모델).
+CONTROL_TOWER_COLLECTIONS = ["knowledge_base", "system_rules", "semantic_cache", "execution_history"]
 _URL_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # RFC 4122 URL 네임스페이스
 
 
@@ -28,6 +30,15 @@ class QdrantAdapter(BackendAdapter):
     def __init__(self, client=None, url: str | None = None, collection: str | None = None, embedder=None) -> None:
         self.url = url if url is not None else os.getenv("QDRANT_URL")
         self.collection = collection or os.getenv("QDRANT_COLLECTION", COLLECTION)
+        # 검색 대상 = 쓰기 컬렉션(레거시 호환) + 관제탑 4컬렉션. env QDRANT_SEARCH_COLLECTIONS 로 override.
+        sc = os.getenv("QDRANT_SEARCH_COLLECTIONS")
+        extra = [c.strip() for c in sc.split(",") if c.strip()] if sc else list(CONTROL_TOWER_COLLECTIONS)
+        seen: set[str] = set()
+        self.search_collections: list[str] = []
+        for c in [self.collection, *extra]:
+            if c and c not in seen:
+                seen.add(c)
+                self.search_collections.append(c)
         self._client = client
         self._owns_client = client is None
         self._embedder = embedder
@@ -67,9 +78,9 @@ class QdrantAdapter(BackendAdapter):
         # 임베딩(동기 CPU/네트워크)을 스레드로 보내 이벤트루프 블로킹 방지
         return await asyncio.to_thread(self.embedder.embed, list(texts))
 
-    async def _collection_dim(self, client) -> int | None:
+    async def _collection_dim(self, client, coll: str | None = None) -> int | None:
         try:
-            info = await client.get_collection(self.collection)
+            info = await client.get_collection(coll or self.collection)
             return int(info.config.params.vectors.size)
         except Exception:
             return None
@@ -133,38 +144,60 @@ class QdrantAdapter(BackendAdapter):
     async def search(self, query: str, opts: dict | None = None) -> list[dict]:
         opts = opts or {}
         top_k = int(opts.get("top_k", 5))
-        await self.ensure_collection()
+        await self.ensure_collection()  # 쓰기 컬렉션 보장(레거시 경로 호환)
         client = self._get_client()
         vec = (await self._embed([query or ""]))[0]
-        res = await client.query_points(self.collection, query=vec, limit=top_k, with_payload=True)
-        records = []
-        for p in res.points:
-            payload = p.payload or {}
-            rid = str(payload.get("resource_id") or payload.get("source_url") or p.id)
-            records.append(make_record(rid, "resource", self.name, payload, score=float(p.score)))
-        return records
+        records: list[dict] = []
+        for coll in self.search_collections:
+            try:
+                res = await client.query_points(coll, query=vec, limit=top_k, with_payload=True)
+            except Exception:
+                continue  # 미존재/차원불일치 컬렉션은 건너뛰고 계속(검색 전체 중단 방지)
+            for p in res.points:
+                payload = p.payload or {}
+                rid = str(
+                    payload.get("notion_page_id")
+                    or payload.get("resource_id")
+                    or payload.get("source_url")
+                    or p.id
+                )
+                # 관제탑 데이터는 source_db 로 타입 표기(정확). 레거시(yohan_resources)는 resource.
+                rtype = str(payload.get("source_db") or "resource")
+                records.append(make_record(rid, rtype, self.name, payload, score=float(p.score)))
+        # 컬렉션 간 병합 — score 내림차순이 곧 RRF 입력 순위(base.py 계약)
+        records.sort(key=lambda r: r.get("score") or 0.0, reverse=True)
+        return records[:top_k]
 
     # ── health ──────────────────────────────────────────────────
     async def health_check(self) -> dict:
         with _Timer() as t:
             try:
                 client = self._get_client()
-                if not await client.collection_exists(self.collection):
-                    return health(False, t.elapsed_ms, f"컬렉션 '{self.collection}' 없음 — 시딩 필요")
-                cnt = (await client.count(self.collection)).count
-                cdim = await self._collection_dim(client)
+                counts: dict[str, int] = {}
+                dims: set[int] = set()
+                for coll in self.search_collections:
+                    if await client.collection_exists(coll):
+                        counts[coll] = (await client.count(coll)).count
+                        d = await self._collection_dim(client, coll)
+                        if d is not None:
+                            dims.add(d)
             except Exception as exc:
                 return health(False, t.elapsed_ms, f"Qdrant 연결 실패: {type(exc).__name__}: {exc}")
             mode = self.url or ":memory:"
+            if not counts:
+                return health(False, t.elapsed_ms, f"Qdrant [{mode}] 검색 컬렉션 없음 — 시딩 필요 ({', '.join(self.search_collections)})")
+            total = sum(counts.values())
+            present = ", ".join(f"{k}={v}" for k, v in counts.items())
             # 임베더 정보는 별도 try — 임베더 미초기화가 'Qdrant 연결 실패'로 오인되지 않게
             try:
                 edim = self.embedder.dim
-                if cdim is not None and edim != cdim:
-                    return health(False, t.elapsed_ms, f"Qdrant [{mode}] '{self.collection}' {cnt} points — 차원 불일치 collection={cdim} != embed={edim}, 재시딩 필요")
+                bad = sorted(d for d in dims if d != edim)
+                if bad:
+                    return health(False, t.elapsed_ms, f"Qdrant [{mode}] 차원 불일치 collection={sorted(dims)} != embed={edim} — bge-m3 pull/재시딩 필요 ({present})")
                 embed_info = f", embed={self.embedder.name}/{edim}"
             except Exception as exc:
                 embed_info = f", 임베더 미초기화({type(exc).__name__})"
-            return health(True, t.elapsed_ms, f"Qdrant OK [{mode}] — '{self.collection}' {cnt} points (dim={cdim}{embed_info})")
+            return health(True, t.elapsed_ms, f"Qdrant OK [{mode}] — {total} points ({present}{embed_info})")
 
     async def aclose(self) -> None:
         if self._owns_client and self._client is not None:
