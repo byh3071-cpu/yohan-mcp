@@ -304,7 +304,11 @@ async def tool_search(ctx: ToolContext, query: str, opts: dict | None = None) ->
     # 검색은 조회이므로 부분검증(required 미강제) — 제공된 필드 타입 정합만 본다
     valids = []
     for r in results:
-        ok, _ = ctx.validator.validate_partial(r.get("type", ""), r.get("data", {}))
+        t = r.get("type", "")
+        # 스키마 없는 타입(관제탑 벡터청크 등)은 검증 대상 아님 — schema_valid 오염 방지(MAJOR-3).
+        if ctx.validator.schema_for(t) is None:
+            continue
+        ok, _ = ctx.validator.validate_partial(t, r.get("data", {}))
         valids.append(ok)
     schema_valid = all(valids) if valids else True
     return _envelope(

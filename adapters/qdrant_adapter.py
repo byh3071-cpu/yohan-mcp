@@ -144,7 +144,7 @@ class QdrantAdapter(BackendAdapter):
     async def search(self, query: str, opts: dict | None = None) -> list[dict]:
         opts = opts or {}
         top_k = int(opts.get("top_k", 5))
-        await self.ensure_collection()  # 쓰기 컬렉션 보장(레거시 경로 호환)
+        # 읽기 경로에서는 컬렉션을 생성하지 않는다(ensure_collection 부작용 제거 — MAJOR-1).
         client = self._get_client()
         vec = (await self._embed([query or ""]))[0]
         records: list[dict] = []
@@ -152,7 +152,11 @@ class QdrantAdapter(BackendAdapter):
             try:
                 res = await client.query_points(coll, query=vec, limit=top_k, with_payload=True)
             except Exception:
-                continue  # 미존재/차원불일치 컬렉션은 건너뛰고 계속(검색 전체 중단 방지)
+                # 컬렉션 미존재/차원불일치(bge-m3 미설치 등) — 건너뛰고 계속.
+                # 진단은 health_check(status 도구)가 '차원 불일치 … bge-m3 pull 필요'로 표면화.
+                continue
+            # 레거시(yohan_resources)=resource, 관제탑 컬렉션=컬렉션명(스키마 없는 벡터청크 — 검증 제외).
+            rtype = "resource" if coll == self.collection else coll
             for p in res.points:
                 payload = p.payload or {}
                 rid = str(
@@ -161,11 +165,10 @@ class QdrantAdapter(BackendAdapter):
                     or payload.get("source_url")
                     or p.id
                 )
-                # 관제탑 데이터는 source_db 로 타입 표기(정확). 레거시(yohan_resources)는 resource.
-                rtype = str(payload.get("source_db") or "resource")
-                records.append(make_record(rid, rtype, self.name, payload, score=float(p.score)))
-        # 컬렉션 간 병합 — score 내림차순이 곧 RRF 입력 순위(base.py 계약)
-        records.sort(key=lambda r: r.get("score") or 0.0, reverse=True)
+                score = float(p.score) if p.score is not None else None  # None-safe(BLOCKER-1)
+                records.append(make_record(rid, rtype, self.name, payload, score=score))
+        # 컬렉션 간 병합 — score 내림차순이 곧 RRF 입력 순위(base.py 계약). None 은 맨 뒤.
+        records.sort(key=lambda r: r["score"] if r["score"] is not None else float("-inf"), reverse=True)
         return records[:top_k]
 
     # ── health ──────────────────────────────────────────────────
