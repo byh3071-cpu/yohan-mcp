@@ -31,6 +31,7 @@ from pathlib import Path
 import httpx
 
 from adapters.base import BackendAdapter, _Timer, health, make_record
+from core.paths import resolve_mcp_runtime_dir
 
 ROOT = Path(__file__).resolve().parent.parent
 _PHASE = "P6"
@@ -78,7 +79,7 @@ class StudioPublishJournal:
         if path is not None:
             self.path = Path(path)
         else:
-            base = Path(os.getenv("MEMORY_DIR", ROOT / "memory"))
+            base = resolve_mcp_runtime_dir()
             self.path = base / "studio_published.jsonl"
 
     def all(self) -> list[dict]:

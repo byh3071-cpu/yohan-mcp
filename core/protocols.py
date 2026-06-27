@@ -36,7 +36,7 @@ from pathlib import Path
 from core import verify as V
 from core.approval import ApprovalQueue
 
-ROOT = Path(__file__).resolve().parent.parent
+from core.paths import resolve_mcp_runtime_dir
 _KST = timezone(timedelta(hours=9))
 
 
@@ -56,7 +56,7 @@ class RunStore:
         if path is not None:
             self.path = Path(path)
         else:
-            base = Path(os.getenv("MEMORY_DIR", ROOT / "memory"))
+            base = resolve_mcp_runtime_dir()
             self.path = base / "runs.jsonl"
 
     def save(self, state: dict) -> dict:
