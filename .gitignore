@@ -19,6 +19,12 @@ Thumbs.db
 # 도구 캐시
 .serena/
 
+# Cursor MCP — 로컬 경로·시크릿 (example 만 커밋, E5-04)
+.cursor/mcp.json
+!.cursor/mcp.json.example
+!.cursor/rules/
+!.cursor/rules/ecosystem.mdc
+
 # Qdrant 로컬 스토리지 / memory 런타임 데이터
 .qdrant_storage/
 memory/

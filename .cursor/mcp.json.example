@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "yohan-os": {
+      "command": "node",
+      "args": [
+        "dist/index.js"
+      ],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}
