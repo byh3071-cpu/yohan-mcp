@@ -1,7 +1,6 @@
 # yohan-mcp — AGENTS.md (에이전트 작동 규약)
 
 > ⚡ 이 파일은 RULES.md에서 자동 생성됨 (vhk sync). 직접 수정 금지.
-> 빠른 시작(토큰 절감): `docs/context/agent-compact.md` 를 먼저 읽으세요.
 
 ## Loop Protocol
 - 루프: `context → goal next → 작업 → goal check → goal done`
