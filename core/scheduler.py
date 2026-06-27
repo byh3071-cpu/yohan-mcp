@@ -21,7 +21,7 @@ from pathlib import Path
 
 from core.policy import PolicyEngine
 
-ROOT = Path(__file__).resolve().parent.parent
+from core.paths import resolve_mcp_runtime_dir
 _KST = timezone(timedelta(hours=9))
 
 _KINDS = ("cron", "webhook", "manual")
@@ -38,7 +38,7 @@ class TriggerRunLog:
         if path is not None:
             self.path = Path(path)
         else:
-            base = Path(os.getenv("MEMORY_DIR", ROOT / "memory"))
+            base = resolve_mcp_runtime_dir()
             self.path = base / "trigger_runs.jsonl"
 
     def record(self, entry: dict) -> dict:

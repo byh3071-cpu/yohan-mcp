@@ -15,7 +15,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from core.paths import resolve_mcp_runtime_dir
 _KST = timezone(timedelta(hours=9))
 
 
@@ -30,7 +30,7 @@ class LinkStore:
         if path is not None:
             self.path = Path(path)
         else:
-            base = Path(os.getenv("MEMORY_DIR", ROOT / "memory"))
+            base = resolve_mcp_runtime_dir()
             self.path = base / "links.jsonl"
 
     def record(self, source: str, target: str, relation: str, **meta) -> dict:

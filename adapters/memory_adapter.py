@@ -6,7 +6,7 @@
 - decision → memory/decisions/<id>.yaml
 - ingest   → memory/ingest/<id>.yaml
 
-환경변수 MEMORY_DIR 로 베이스 경로 변경 가능(기본: 리포 루트/memory).
+환경변수 MEMORY_DIR / YOHAN_BRAIN_ROOT 로 베이스 경로 변경 (기본: 리포 루트/memory, deprecated).
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from pathlib import Path
 import yaml
 
 from adapters.base import BackendAdapter, _Timer, health, make_record
+from core.paths import resolve_memory_dir
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -33,7 +34,7 @@ class MemoryAdapter(BackendAdapter):
     name = "memory"
 
     def __init__(self, base_dir: str | os.PathLike | None = None) -> None:
-        self.base = Path(base_dir) if base_dir else Path(os.getenv("MEMORY_DIR", ROOT / "memory"))
+        self.base = Path(base_dir) if base_dir else resolve_memory_dir()
 
     # ── 경로 헬퍼 ───────────────────────────────────────────────
     @staticmethod

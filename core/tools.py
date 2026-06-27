@@ -23,6 +23,7 @@ import httpx
 
 from adapters.base import BackendAdapter, make_record
 from adapters.memory_adapter import MemoryAdapter
+from core.paths import resolve_mcp_runtime_dir
 from adapters.n8n_adapter import N8nAdapter
 from adapters.notion_adapter import NotionAdapter
 from adapters.qdrant_adapter import QdrantAdapter
@@ -195,7 +196,7 @@ class CreateStore:
         if path is not None:
             self.path = Path(path)
         else:
-            base = Path(os.getenv("MEMORY_DIR", ROOT / "memory"))
+            base = resolve_mcp_runtime_dir()
             self.path = base / "created.jsonl"
 
     def _all(self) -> list[dict]:
@@ -244,33 +245,16 @@ class ToolContext:
         self.adapters = adapters
         self.router = router
         self.validator = validator
-        base = self._memory_base()
-        self.links_store = links_store or (
-            LinkStore(Path(base) / "links.jsonl") if base is not None else LinkStore()
-        )
-        # P4 — 승인큐/실행저널(프로토콜 엔진). memory base 하위로 tmp_path 격리.
-        self.approvals_store = approvals_store or (
-            ApprovalQueue(Path(base) / "approvals.jsonl") if base is not None else ApprovalQueue()
-        )
-        self.runs_store = runs_store or (
-            P.RunStore(Path(base) / "runs.jsonl") if base is not None else P.RunStore()
-        )
+        base = resolve_mcp_runtime_dir()
+        self.links_store = links_store or LinkStore(Path(base) / "links.jsonl")
+        # P4 — 승인큐/실행저널(프로토콜 엔진). brain-linked 시 ops/mcp-runtime 하위.
+        self.approvals_store = approvals_store or ApprovalQueue(Path(base) / "approvals.jsonl")
+        self.runs_store = runs_store or P.RunStore(Path(base) / "runs.jsonl")
         # P6 — create 멱등 저널(같은 SoT Key 재생성 중복 방지)
-        self.create_store = create_store or (
-            CreateStore(Path(base) / "created.jsonl") if base is not None else CreateStore()
-        )
+        self.create_store = create_store or CreateStore(Path(base) / "created.jsonl")
         # P5 — 정책 엔진(감사 로그) + 스케줄러(트리거). 정책 자동승인/사람 폴백.
-        self.policy = policy or PolicyEngine(
-            log_path=(Path(base) / "policy_log.jsonl") if base is not None else None
-        )
-        self.scheduler = scheduler or S.Scheduler(
-            runlog_path=(Path(base) / "trigger_runs.jsonl") if base is not None else None
-        )
-
-    def _memory_base(self) -> "Path | None":
-        """memory 어댑터의 base 경로(없으면 None) — 런타임 저장소 격리 기준."""
-        mem = self.adapters.get("memory")
-        return getattr(mem, "base", None)
+        self.policy = policy or PolicyEngine(log_path=Path(base) / "policy_log.jsonl")
+        self.scheduler = scheduler or S.Scheduler(runlog_path=Path(base) / "trigger_runs.jsonl")
 
     @classmethod
     def from_env(cls) -> "ToolContext":
@@ -568,8 +552,8 @@ async def tool_list_triggers(ctx: ToolContext) -> dict:
 def _trigger_engine(ctx: ToolContext):
     """트리거 실발화 엔진(P7) — 상태/이력/락은 memory base 하위로 격리."""
     from core import triggers as TR  # 지연 임포트: tools ↔ triggers 순환 방지
-    base = ctx._memory_base()
-    data_dir = (Path(base) / "triggerdata") if base is not None else None
+    base = resolve_mcp_runtime_dir()
+    data_dir = Path(base) / "triggerdata"
     return TR.TriggerEngine(ctx, data_dir=data_dir)
 
 
