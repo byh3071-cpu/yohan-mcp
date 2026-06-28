@@ -419,7 +419,13 @@ async def tool_status(ctx: ToolContext) -> dict:
 
 
 async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = None) -> dict:
-    """query 관련 엔티티 + _links.json 관계를 모아 컨텍스트 구성."""
+    """query 관련 엔티티 + _links 관계 + Dev Log/패턴 회수를 모아 컨텍스트 구성.
+
+    우선순위(양방향 루프의 회수 측): SOUL/정체성 → active-project(matches/links)
+    → devlog(과거 경험) → patterns(재사용 가능 패턴). PHASE 3.
+    opts: {project?, category?, tags?} — Dev Log/패턴 회수 키. 없으면 해당 회수는 빈 배열.
+    """
+    opts = opts or {}
     res = await ctx.router.search(query, opts)
     matches = res["results"]
     matched_types = {r.get("type") for r in matches}
@@ -428,10 +434,34 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         if any(t and t in link.get("source", "") for t in matched_types)
         or any(t and t in link.get("target", "") for t in matched_types)
     ]
+    # ── 역방향 회수 — Dev Log/패턴 DB (notion 어댑터, 각각 격리) ──
+    notion = ctx.adapters.get("notion")
+    project = opts.get("project")
+    category, tags = opts.get("category"), opts.get("tags")
+    devlog: list[dict] = []
+    patterns: list[dict] = []
+    devlog_q = getattr(notion, "devlog_query", None)
+    pattern_q = getattr(notion, "pattern_query", None)
+    if devlog_q and project:
+        try:
+            devlog = await devlog_q(project)
+        except Exception:
+            devlog = []  # 회수 실패가 컨텍스트 전체를 죽이지 않음
+    if pattern_q and (category or tags):
+        try:
+            patterns = await pattern_q(category, tags)
+        except Exception:
+            patterns = []
+    sources = list(res["sources_used"])
+    if devlog:
+        sources.append("notion:devlog")
+    if patterns:
+        sources.append("notion:pattern")
     return _envelope(
-        {"matches": matches, "related_links": related, "count": len(matches)},
+        {"matches": matches, "related_links": related,
+         "devlog": devlog, "patterns": patterns, "count": len(matches)},
         True,
-        res["sources_used"],
+        sources,
         errors=res["errors"],
     )
 

@@ -39,6 +39,9 @@ _ID_FIELD = {
     "ai-dict": "term_id", "execution-log": "log_id",
 }
 
+# 역방향 회수(PHASE 3) — Dev Log 에서 끌어올 유형(과거 맥락)
+_DEVLOG_TYPES = ("세션로그", "상태요약", "핸드오프", "ADR")
+
 _SELECT_FIELDS = {"status", "domain", "category", "difficulty", "work_type", "result", "resource_type"}
 _MULTI_FIELDS = {"tags", "key_insights", "related_terms", "alternatives"}
 _URL_FIELDS = {"source_url", "url", "cover_image"}
@@ -53,6 +56,9 @@ class NotionAdapter(BackendAdapter):
         self._client = client  # 주입 시 그대로, 없으면 lazy 생성
         self._owns_client = client is None  # 자가 생성분만 aclose 대상
         self.db_ids = {t: os.getenv(env) for t, env in _DB_ENV.items()}
+        # 역방향 회수(PHASE 3) — 엔티티 5종과 별개인 Dev Log/패턴 DB
+        self.devlog_db_id = os.getenv("NOTION_DEVLOG_DB_ID")
+        self.pattern_db_id = os.getenv("NOTION_PATTERN_DB_ID")
 
     @property
     def can_create(self) -> bool:
@@ -165,6 +171,63 @@ class NotionAdapter(BackendAdapter):
                 cursor = j["next_cursor"]
             else:
                 break
+        return out
+
+    # ── 역방향 회수 (PHASE 3) — Dev Log / 패턴 DB 쿼리 ──────────
+    async def devlog_query(self, project_name: str | None, limit: int = 10) -> list[dict]:
+        """Dev Log DB 에서 프로젝트별 최근 행 조회(과거 맥락 회수).
+
+        프로젝트=project_name, 유형 IN(세션로그/상태요약/핸드오프/ADR), 실행일 DESC, LIMIT.
+        토큰/DB ID/프로젝트명 없으면 [] (에러 아님 — graceful).
+        반환 필드: {이름, 유형, 교훈, 관련 파일, SoT Key}.
+        """
+        if not self.token or not self.devlog_db_id or not project_name:
+            return []
+        client = self._get_client()
+        body = {
+            "filter": {"and": [
+                {"property": "프로젝트", "select": {"equals": project_name}},
+                {"or": [{"property": "유형", "select": {"equals": t}} for t in _DEVLOG_TYPES]},
+            ]},
+            "sorts": [{"property": "실행일", "direction": "descending"}],
+            "page_size": limit,
+        }
+        resp = await client.post(f"/databases/{self.devlog_db_id}/query", json=body)
+        resp.raise_for_status()
+        out: list[dict] = []
+        for page in resp.json().get("results", []):
+            d = self._from_notion_page("devlog", page)
+            out.append({k: d.get(k) for k in ("이름", "유형", "교훈", "관련 파일", "SoT Key")})
+        return out
+
+    async def pattern_query(
+        self, category: str | None = None, tags: list[str] | None = None, limit: int = 10
+    ) -> list[dict]:
+        """패턴 DB 에서 재사용 가능한 패턴 조회.
+
+        카테고리=category(있으면) + 태그 contains any of tags(있으면), 발견일 DESC, LIMIT.
+        필터 둘 다 없으면 최근순. 토큰/DB ID 없으면 [] (graceful).
+        반환 필드: {패턴명, 증상, 원인, 해결, 적용 조건}.
+        """
+        if not self.token or not self.pattern_db_id:
+            return []
+        client = self._get_client()
+        conds: list[dict] = []
+        if category:
+            conds.append({"property": "카테고리", "select": {"equals": category}})
+        if tags:
+            conds.append({"or": [{"property": "태그", "multi_select": {"contains": t}} for t in tags]})
+        body: dict = {"sorts": [{"property": "발견일", "direction": "descending"}], "page_size": limit}
+        if len(conds) == 1:
+            body["filter"] = conds[0]
+        elif conds:
+            body["filter"] = {"and": conds}
+        resp = await client.post(f"/databases/{self.pattern_db_id}/query", json=body)
+        resp.raise_for_status()
+        out: list[dict] = []
+        for page in resp.json().get("results", []):
+            d = self._from_notion_page("pattern", page)
+            out.append({k: d.get(k) for k in ("패턴명", "증상", "원인", "해결", "적용 조건")})
         return out
 
     # ── 생성/갱신 ───────────────────────────────────────────────
