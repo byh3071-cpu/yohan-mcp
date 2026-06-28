@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """QdrantAdapter — 임베디드(:memory:) 모드 upsert/search/health/멱등 테스트."""
+import logging
+
 import pytest
 
 from adapters.qdrant_adapter import QdrantAdapter
@@ -92,6 +94,44 @@ async def test_qdrant_empty_key_rejected():
     with pytest.raises(ValueError):
         await qa.create("resource", {"title": "url·id 둘 다 없음"})
     await qa.aclose()
+
+
+async def test_qdrant_search_missing_collection_logs_warning(caplog):
+    # 컬렉션 생성 전 검색 → query_points 가 컬렉션 미존재로 예외 → search() except(continue) 경로.
+    qa = _adapter()
+    with caplog.at_level(logging.WARNING):
+        res = await qa.search("어텐션", {"top_k": 5})
+    assert res == []  # graceful 폴백(continue) 유지 — 빈 결과
+    assert any("실패" in r.message or r.levelno == logging.WARNING for r in caplog.records)
+    await qa.aclose()
+
+
+async def test_qdrant_collection_dim_missing_logs_warning(caplog):
+    # 존재하지 않는 컬렉션 차원 조회 → get_collection 예외 → _collection_dim except(return None) 경로.
+    qa = _adapter()
+    client = qa._get_client()
+    with caplog.at_level(logging.WARNING):
+        dim = await qa._collection_dim(client, "definitely_missing_collection")
+    assert dim is None  # graceful 폴백(return None) 유지
+    assert any("실패" in r.message or r.levelno == logging.WARNING for r in caplog.records)
+    await qa.aclose()
+
+
+async def test_qdrant_aclose_failure_logs_warning(caplog):
+    # client.close() 가 예외를 던져도 aclose 는 삼키고 정리(제어흐름 유지) — monkeypatch 로 트리거.
+    qa = _adapter()
+    qa._get_client()
+
+    class _BoomClient:
+        async def close(self):
+            raise RuntimeError("close 폭발")
+
+    qa._client = _BoomClient()
+    qa._owns_client = True
+    with caplog.at_level(logging.WARNING):
+        await qa.aclose()
+    assert qa._client is None  # 예외 삼키고 client 정리(graceful) 유지
+    assert any("실패" in r.message or r.levelno == logging.WARNING for r in caplog.records)
 
 
 async def test_qdrant_dim_mismatch_detected():

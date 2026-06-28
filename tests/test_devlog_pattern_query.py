@@ -5,6 +5,7 @@ ADR-008: get_context 통일 타깃 = yohan-mcp(Python). Dev Log DB(f8e79e6c)·�
 쿼리해 과거 경험/재사용 패턴을 컨텍스트에 주입한다(양방향 루프의 회수 측).
 """
 import json as _json
+import logging
 
 import httpx
 
@@ -187,3 +188,38 @@ async def test_get_context_no_project_empty_devlog(tmp_path):
     assert env["data"]["devlog"] == []      # 프로젝트 없으면 빈 배열(에러 아님)
     assert env["data"]["patterns"] == []    # category/tags 없으면 패턴 조회 안 함
     assert "notion:devlog" not in env["provenance"]["sources_used"]
+
+
+# ── 회수 실패 침묵 방지: 진단 로깅 (devlog/pattern except 경로) ──────────
+async def test_get_context_logs_warning_when_devlog_and_pattern_query_fail(tmp_path, caplog):
+    """devlog_query/pattern_query 가 예외를 던지면 진단 WARNING 이 남아야 한다.
+    제어흐름은 유지 — 회수는 여전히 빈 배열로 graceful 폴백한다."""
+    client = httpx.AsyncClient(base_url="https://api.notion.com/v1", transport=httpx.MockTransport(_routed_handler))
+    notion = NotionAdapter(client=client, token="t")
+    notion.db_ids = {}
+    notion.devlog_db_id = "devlogdb"
+    notion.pattern_db_id = "patterndb"
+
+    async def _boom_devlog(project):
+        raise RuntimeError("devlog 회수 폭발")
+
+    async def _boom_pattern(category=None, tags=None):
+        raise RuntimeError("pattern 회수 폭발")
+
+    notion.devlog_query = _boom_devlog
+    notion.pattern_query = _boom_pattern
+
+    ctx = _ctx_with_notion(tmp_path, notion)
+    with caplog.at_level(logging.WARNING):
+        env = await T.tool_get_context(ctx, "거버넌스", {"project": "VHK", "tags": ["MCP"]})
+    await client.aclose()
+
+    # 제어흐름 유지 — 실패해도 빈 배열 폴백 (예외 전파/크래시 없음)
+    assert env["data"]["devlog"] == []
+    assert env["data"]["patterns"] == []
+    # 진단 로그 — WARNING 레코드가 남아야 함
+    assert any("실패" in r.message or r.levelno == logging.WARNING for r in caplog.records)
+    # 두 경로(devlog/pattern) 각각 한 줄씩
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("devlog" in m.lower() for m in warn_msgs)
+    assert any("pattern" in m.lower() for m in warn_msgs)
