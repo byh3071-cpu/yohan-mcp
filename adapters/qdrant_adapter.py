@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 
@@ -17,6 +18,8 @@ from qdrant_client import AsyncQdrantClient, models
 
 from adapters.base import BackendAdapter, _Timer, health, make_record
 from core.embeddings import get_embedder
+
+logger = logging.getLogger(__name__)
 
 COLLECTION = "yohan_resources"
 # 관제탑(yohan-control-tower)이 적재하는 읽기전용 4컬렉션 — get_context 검색 대상(bge-m3 1024d 동일 모델).
@@ -82,7 +85,8 @@ class QdrantAdapter(BackendAdapter):
         try:
             info = await client.get_collection(coll or self.collection)
             return int(info.config.params.vectors.size)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Qdrant 컬렉션 차원 조회 실패: %s: %s", type(exc).__name__, exc)
             return None
 
     async def drop_collection(self) -> bool:
@@ -151,9 +155,10 @@ class QdrantAdapter(BackendAdapter):
         for coll in self.search_collections:
             try:
                 res = await client.query_points(coll, query=vec, limit=top_k, with_payload=True)
-            except Exception:
+            except Exception as exc:
                 # 컬렉션 미존재/차원불일치(bge-m3 미설치 등) — 건너뛰고 계속.
                 # 진단은 health_check(status 도구)가 '차원 불일치 … bge-m3 pull 필요'로 표면화.
+                logger.warning("Qdrant 컬렉션 '%s' 검색 실패: %s: %s", coll, type(exc).__name__, exc)
                 continue
             # 레거시(yohan_resources)=resource, 관제탑 컬렉션=컬렉션명(스키마 없는 벡터청크 — 검증 제외).
             rtype = "resource" if coll == self.collection else coll
@@ -206,6 +211,6 @@ class QdrantAdapter(BackendAdapter):
         if self._owns_client and self._client is not None:
             try:
                 await self._client.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Qdrant 클라이언트 종료 실패: %s: %s", type(exc).__name__, exc)
             self._client = None

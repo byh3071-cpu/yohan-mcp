@@ -15,9 +15,12 @@ ollama 가 죽었거나 모델 미설치면 hash(dim 384)로 graceful 폴백한�
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DIM = 384
 
@@ -157,12 +160,14 @@ def get_embedder():
     if backend == "ollama":
         try:
             return OllamaEmbedder()
-        except Exception:
+        except Exception as exc:
+            logger.warning("ollama 임베더 생성 실패: %s: %s", type(exc).__name__, exc)
             return HashEmbedder()  # 모델 미설치/서버 다운 → graceful
     # auto: 인프라 우선순위 ollama → local → hash
     for ctor in (OllamaEmbedder, LocalEmbedder):
         try:
             return ctor()
-        except Exception:
+        except Exception as exc:
+            logger.warning("%s 임베더 생성 실패(다음 후보로 폴백): %s: %s", getattr(ctor, "name", ctor), type(exc).__name__, exc)
             continue
     return HashEmbedder()

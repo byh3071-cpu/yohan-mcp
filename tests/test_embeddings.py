@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """임베딩 — OllamaEmbedder(mock) + get_embedder 폴백 (P3)."""
+import logging
 import math
 
 import httpx
@@ -53,6 +54,38 @@ def test_get_embedder_ollama_fallback_to_hash(monkeypatch):
 
     monkeypatch.setattr(E, "OllamaEmbedder", boom)
     assert isinstance(get_embedder(), HashEmbedder)
+
+
+def test_get_embedder_ollama_fallback_logs_warning(monkeypatch, caplog):
+    """EMBED_BACKEND=ollama 폴백 시 진단 WARNING 로그를 남긴다."""
+    monkeypatch.setenv("EMBED_BACKEND", "ollama")
+
+    def boom(*a, **k):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr(E, "OllamaEmbedder", boom)
+    with caplog.at_level(logging.WARNING):
+        assert isinstance(get_embedder(), HashEmbedder)
+    assert any(
+        "실패" in r.message or r.levelno == logging.WARNING for r in caplog.records
+    )
+
+
+def test_get_embedder_auto_chain_logs_warning(monkeypatch, caplog):
+    """auto 폴백 시 ollama·local 실패 진단 WARNING 로그를 남긴다."""
+    monkeypatch.delenv("EMBED_BACKEND", raising=False)
+    monkeypatch.delenv("EMBEDDING_BACKEND", raising=False)
+
+    def boom(*a, **k):
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(E, "OllamaEmbedder", boom)
+    monkeypatch.setattr(E, "LocalEmbedder", boom)
+    with caplog.at_level(logging.WARNING):
+        assert isinstance(get_embedder(), HashEmbedder)
+    assert any(
+        "실패" in r.message or r.levelno == logging.WARNING for r in caplog.records
+    )
 
 
 def test_get_embedder_env_alias(monkeypatch):

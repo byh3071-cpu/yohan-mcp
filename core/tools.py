@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import socket
@@ -38,6 +39,8 @@ from core import scheduler as S
 from core import verify as V
 
 ROOT = Path(__file__).resolve().parent.parent
+
+logger = logging.getLogger(__name__)
 
 
 def _envelope(data, schema_valid, sources_used, **extra) -> dict:
@@ -445,12 +448,14 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
     if devlog_q and project:
         try:
             devlog = await devlog_q(project)
-        except Exception:
+        except Exception as exc:
+            logger.warning("devlog 회수 실패: %s: %s", type(exc).__name__, exc)
             devlog = []  # 회수 실패가 컨텍스트 전체를 죽이지 않음
     if pattern_q and (category or tags):
         try:
             patterns = await pattern_q(category, tags)
-        except Exception:
+        except Exception as exc:
+            logger.warning("pattern 회수 실패: %s: %s", type(exc).__name__, exc)
             patterns = []
     sources = list(res["sources_used"])
     if devlog:
