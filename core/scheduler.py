@@ -22,6 +22,8 @@ from pathlib import Path
 from core.policy import PolicyEngine
 
 from core.paths import resolve_mcp_runtime_dir
+
+ROOT = Path(__file__).resolve().parent.parent
 _KST = timezone(timedelta(hours=9))
 
 _KINDS = ("cron", "webhook", "manual")
