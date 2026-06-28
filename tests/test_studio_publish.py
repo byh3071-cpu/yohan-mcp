@@ -94,11 +94,14 @@ async def test_health_no_url():
 
 def test_publish_journal_default_under_memory_dir(tmp_path, monkeypatch):
     # 발행 멱등 저널도 다른 런타임 저널(runs/approvals/created/links/policy)과 동일하게
-    # MEMORY_DIR 격리 스위치를 따른다 — ROOT/data 예외 제거(격리 일관성).
+    # 격리 스위치를 따른다 — brain-linked(MEMORY_DIR 설정) 시 ops/mcp-runtime 하위.
+    # (E4-01이 런타임 저널을 ops/mcp-runtime로 이동; ROOT/data 예외 제거 의도는 유지.)
+    monkeypatch.delenv("MCP_RUNTIME_DIR", raising=False)  # MEMORY_DIR 기준 해소를 검증
     monkeypatch.setenv("MEMORY_DIR", str(tmp_path))
-    assert StudioPublishJournal().path == tmp_path / "studio_published.jsonl"
+    expected = tmp_path / "ops" / "mcp-runtime" / "studio_published.jsonl"
+    assert StudioPublishJournal().path == expected
     # 명시 journal_path 없는 기본 어댑터도 같은 base 사용
-    assert StudioAdapter(url="", api_key="")._journal.path == tmp_path / "studio_published.jsonl"
+    assert StudioAdapter(url="", api_key="")._journal.path == expected
     # 명시 journal_path 는 그대로 우선(하위호환)
     explicit = tmp_path / "custom.jsonl"
     assert StudioPublishJournal(explicit).path == explicit

@@ -13,7 +13,7 @@
 - pr: git 새 브랜치(publish/{slug}) → 파일 쓰기 → add/commit/push → PR(base=STUDIO_BASE_BRANCH). master 직푸시 금지.
 
 불변 원칙: 외부 연결/경로 없으면 graceful 폴백(드라이런), 예외로 죽지 않음.
-멱등: `<MEMORY_DIR>/studio_published.jsonl` fold → 같은 slug+content-hash 면 no-op(already_published).
+멱등: `<MEMORY_DIR>/ops/mcp-runtime/studio_published.jsonl` fold → 같은 slug+content-hash 면 no-op(already_published).
 변환 결과 POST 는 P1 `schemas/studio/post.schema.json` 에 정합(검증/품질점수 재사용).
 """
 from __future__ import annotations
@@ -67,7 +67,7 @@ def _nonempty(val) -> bool:
 
 
 class StudioPublishJournal:
-    """발행 멱등 저널 — append-only JSONL(`<MEMORY_DIR>/studio_published.jsonl`).
+    """발행 멱등 저널 — append-only JSONL(`<MEMORY_DIR>/ops/mcp-runtime/studio_published.jsonl`).
 
     한 줄 = 한 발행 기록 {slug, content_hash, target_path, mode, summary_id, ts}.
     같은 slug+content_hash 면 이미 발행됨(no-op), 같은 slug 다른 hash 면 contradiction.
