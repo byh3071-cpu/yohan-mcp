@@ -462,13 +462,33 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         sources.append("notion:devlog")
     if patterns:
         sources.append("notion:pattern")
-    return _envelope(
+    env = _envelope(
         {"matches": matches, "related_links": related,
          "devlog": devlog, "patterns": patterns, "count": len(matches)},
         True,
         sources,
         errors=res["errors"],
     )
+    # ADR-008 P0 — brain 코어룰셋 주입(옵트인·멱등). 기본 off라 미옵트인 호출자는 봉투 불변.
+    inject = bool(opts.get("inject_rules")) or os.getenv("YOHAN_INJECT_CORE_RULES") in ("1", "true", "True")
+    if inject:
+        from core.core_rules import inject_core_rules
+        inject_core_rules(env, enabled=True, capabilities=opts.get("capabilities"))
+    return env
+
+
+async def tool_get_core_ruleset(ctx: ToolContext, capabilities=None) -> dict:
+    """brain 코어 독트린 다이제스트 + 사용가능 도구 카탈로그 (ADR-008 P0, 읽기 전용).
+
+    에이전트가 get_context 없이도 독트린을 직접 pull. 출처(brain/snapshot/none) 표기.
+    capabilities(허용 도구명) 미부여 시 쓰기 도구는 locked 로 표식(capability gating).
+    """
+    from core.core_rules import available_tools, build_digest, load_core_ruleset
+    ruleset, source = load_core_ruleset()
+    digest = build_digest(ruleset)
+    digest["source"] = source
+    data = {"core_rules_digest": digest, "available_tools": available_tools(capabilities)}
+    return _envelope(data, True, [f"core-ruleset:{source}"])
 
 
 # ── stub 도구 (P3/P4 예정) ──────────────────────────────────────
