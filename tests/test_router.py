@@ -169,3 +169,33 @@ async def test_rrf_no_cross_type_merge():
         assert len(res["sources"]) == 1  # 각자 단일 출처, provenance 무결성
     types = {res["type"] for res in out["results"]}
     assert types == {"summary", "decision"}
+
+
+async def test_router_top_k_zero_returns_empty():
+    # top_k=0 → 융합 후 fused[:0] 절단 → 빈 결과(router.py `if top_k >= 0`).
+    # 후보는 있으나 명시적으로 0개 요청 → sources_used 는 그대로(검색은 수행됨).
+    a = FakeAdapter("notion", recs("notion", ["x1", "x2", "x3"]))
+    b = FakeAdapter("memory", recs("memory", ["x2", "x4"]))
+    r = SmartRouter({"notion": a, "memory": b}, k=60)
+    out = await r.search("q", {"top_k": 0})
+    assert out["results"] == []
+    assert set(out["sources_used"]) == {"notion", "memory"}  # 검색은 돌았고 절단만 0
+
+
+async def test_router_top_k_negative_returns_all_fused():
+    # top_k<0 → 절단 안 함(음수 = "무제한, 모두 반환" 신호).
+    # 후보를 6개(>기본 5)로 둬서 음수와 기본을 '구분'해 실증한다:
+    # 기본(top_k=5)은 5개로 절단, -1 은 6개 전량 → 음수가 5로 클램프되는 게 아님을 증명.
+    a = FakeAdapter("notion", recs("notion", ["x1", "x2", "x3", "x4", "x5", "x6"]))
+    b = FakeAdapter("memory", recs("memory", ["x2", "x4"]))
+    r = SmartRouter({"notion": a, "memory": b}, k=60)
+
+    out = await r.search("q", {"top_k": -1})
+    ids = {x["id"] for x in out["results"]}
+    assert ids == {"x1", "x2", "x3", "x4", "x5", "x6"}  # 6 distinct 전량 보존(선절단 없음)
+    assert len(out["results"]) == 6
+
+    default_out = await r.search("q")  # 기본 top_k=5 → 5개로 절단
+    assert len(default_out["results"]) == 5
+    # 음수(6) > 기본(5) — 음수가 기본값으로 클램프됐다면 둘 다 5라 구분 불가했을 것
+    assert len(out["results"]) > len(default_out["results"])

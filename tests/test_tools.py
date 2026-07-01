@@ -172,6 +172,42 @@ async def test_tool_status_summarizes_five(tmp_path):
     assert set(env["data"]["details"]) == {"notion", "memory", "qdrant", "studio", "n8n"}
 
 
+async def test_tool_status_aggregates_fail(tmp_path):
+    # 미설정 백엔드(notion 토큰 없음)는 FAIL 로 집계되어야 한다 — OK 만 보이면 진단 무의미.
+    ctx = _ctx_with_memory(tmp_path)
+    env = await T.tool_status(ctx)
+    summaries = env["data"]["summaries"]
+    assert any(s.startswith("notion:") and "FAIL" in s for s in summaries)
+    assert env["data"]["details"]["notion"]["ok"] is False
+
+
+async def test_tool_status_survives_health_check_contract_violation():
+    # health_check 는 예외 금지 계약이지만, 위반(예외)해도 tool_status 는 봉투를 보존해야 한다
+    # (asyncio.gather(return_exceptions=True) → 부분결과 유지 + "계약 위반" detail).
+    class BoomAdapter(BackendAdapter):
+        name = "boom"
+
+        async def search(self, query, opts=None):
+            return []
+
+        async def create(self, type_, data):
+            return make_record("x", type_, self.name, data)
+
+        async def update(self, id_, data, type_=None):
+            return make_record(id_, "t", self.name, data)
+
+        async def health_check(self):
+            raise RuntimeError("health 폭발")
+
+    adapters = {"boom": BoomAdapter(), "ok": FakeAdapter("ok")}
+    ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator())
+    env = await T.tool_status(ctx)
+    _envelope_shape(env)  # 크래시 없이 표준봉투 반환
+    assert env["data"]["details"]["boom"]["ok"] is False
+    assert "계약 위반" in env["data"]["details"]["boom"]["detail"]
+    assert env["data"]["details"]["ok"]["ok"] is True  # 정상 백엔드는 보존
+
+
 # ── check (스키마 검증 도구) ────────────────────────────────────
 async def test_tool_check(tmp_path):
     ctx = _ctx_with_memory(tmp_path)
