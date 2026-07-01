@@ -12,8 +12,11 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _isolate_runtime(tmp_path, monkeypatch):
+def _isolate_runtime(request, tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_RUNTIME_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("MEMORY_DIR", str(tmp_path / "memory"))
     monkeypatch.delenv("YOHAN_BRAIN_ROOT", raising=False)
-    monkeypatch.delenv("QDRANT_URL", raising=False)
+    # integration 마커 테스트는 실 Qdrant 를 써야 하므로 QDRANT_URL 을 보존한다.
+    # 그 외 유닛은 실서버 우발 접속을 막기 위해 삭제(:memory: 강제).
+    if request.node.get_closest_marker("integration") is None:
+        monkeypatch.delenv("QDRANT_URL", raising=False)

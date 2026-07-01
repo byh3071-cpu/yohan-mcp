@@ -169,3 +169,27 @@ async def test_rrf_no_cross_type_merge():
         assert len(res["sources"]) == 1  # 각자 단일 출처, provenance 무결성
     types = {res["type"] for res in out["results"]}
     assert types == {"summary", "decision"}
+
+
+async def test_router_top_k_zero_returns_empty():
+    # top_k=0 → 융합 후 fused[:0] 절단 → 빈 결과(router.py `if top_k >= 0`).
+    # 후보는 있으나 명시적으로 0개 요청 → sources_used 는 그대로(검색은 수행됨).
+    a = FakeAdapter("notion", recs("notion", ["x1", "x2", "x3"]))
+    b = FakeAdapter("memory", recs("memory", ["x2", "x4"]))
+    r = SmartRouter({"notion": a, "memory": b}, k=60)
+    out = await r.search("q", {"top_k": 0})
+    assert out["results"] == []
+    assert set(out["sources_used"]) == {"notion", "memory"}  # 검색은 돌았고 절단만 0
+
+
+async def test_router_top_k_negative_returns_all_fused():
+    # top_k<0 → 절단 안 함(음수 = "모두 반환" 신호). 융합 전량 반환.
+    a = FakeAdapter("notion", recs("notion", ["x1", "x2", "x3"]))
+    b = FakeAdapter("memory", recs("memory", ["x2", "x4"]))
+    r = SmartRouter({"notion": a, "memory": b}, k=60)
+    out = await r.search("q", {"top_k": -1})
+    ids = {x["id"] for x in out["results"]}
+    assert ids == {"x1", "x2", "x3", "x4"}  # 4 distinct 엔티티 전부 보존(선절단 없음)
+    # 기본(top_k=5)에서도 4개 그대로임을 대조 — 음수가 축소하지 않음을 명확히
+    default_out = await r.search("q")
+    assert {x["id"] for x in default_out["results"]} == ids

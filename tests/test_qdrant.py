@@ -189,3 +189,46 @@ async def test_qdrant_dim_mismatch_detected():
     with pytest.raises(RuntimeError):
         await a2.ensure_collection()
     await c.close()
+
+
+async def test_qdrant_search_empty_query_on_live_collection():
+    # 빈 query("")·None 도 실컬렉션에서 크래시 없이 결과를 반환한다.
+    # (query or "" → HashEmbedder 단위벡터 → COSINE 검색 성립. 영벡터 거부 회피.)
+    # 기존 missing-collection 테스트(query="어텐션")와 상보 — 여기선 컬렉션이 존재.
+    qa = _adapter()
+    await qa.create("resource", RESOURCE)  # yohan_resources 생성 + 1점 적재
+    for q in ["", None]:
+        res = await qa.search(q, {"top_k": 5})
+        assert isinstance(res, list) and len(res) >= 1  # 예외 없이 후보 반환
+        assert res[0]["data"]["resource_id"] == "r1"
+    await qa.aclose()
+
+
+async def test_qdrant_health_no_collection_says_seeding_needed():
+    # 컬렉션 미존재 → health 는 ok=False + detail 에 "시딩 필요" 안내(진단 표면화).
+    qa = _adapter()
+    h = await qa.health_check()
+    assert h["ok"] is False
+    assert "시딩 필요" in h["detail"]
+    await qa.aclose()
+
+
+async def test_qdrant_health_dim_mismatch_branch():
+    # health_check 의 차원불일치 분기(집계된 컬렉션 차원 ≠ 임베더 차원) → ok=False + "차원 불일치".
+    # ensure_collection RuntimeError 와 별개 경로(읽기측 진단).
+    from qdrant_client import AsyncQdrantClient
+
+    class Tiny:
+        name, dim = "tiny", 8
+
+        def embed(self, texts):
+            return [[0.1] * 8 for _ in texts]
+
+    c = AsyncQdrantClient(location=":memory:")
+    a1 = QdrantAdapter(client=c, embedder=HashEmbedder())  # dim 384 컬렉션 + 1점
+    await a1.create("resource", RESOURCE)
+    a2 = QdrantAdapter(client=c, embedder=Tiny())  # dim 8 임베더로 같은 컬렉션 헬스 조회
+    h = await a2.health_check()
+    assert h["ok"] is False
+    assert "차원 불일치" in h["detail"]
+    await c.close()
