@@ -82,6 +82,22 @@ async def test_slug_dedup_suffix_and_contradiction(tmp_path):
     assert (blog / f"{r2['slug']}.mdx").exists()
 
 
+async def test_republish_after_contradiction_is_noop(tmp_path):
+    # 회귀: contradiction 으로 접미 슬러그(-2)에 발행된 콘텐츠를 완전히 동일하게 재발행하면
+    # already_published(no-op) 여야 한다. base_slug 한정 앵커링이면 -3, -4 로 무한 증식했다.
+    a = StudioAdapter(repo_path=str(tmp_path), mode="file", journal_path=tmp_path / "pub.jsonl")
+    await a.publish(_summary(summary="첫 번째 본문"), approved=True)          # sum-x
+    r2 = await a.publish(_summary(summary="다른 본문"), approved=True)         # sum-x-2 (contradiction)
+    assert r2["slug"].endswith("-2") and r2["contradiction"] is True
+    r3 = await a.publish(_summary(summary="다른 본문"), approved=True)         # -2 와 동일 → no-op
+    assert r3["already_published"] is True
+    assert r3["published"] is False and r3["dry_run"] is True
+    assert r3["slug"] == r2["slug"]                # 기존 접미 슬러그 재사용
+    assert r3["contradiction"] is False
+    blog = tmp_path / "src" / "content" / "blog"
+    assert len(list(blog.glob("*.mdx"))) == 2      # sum-x.mdx, sum-x-2.mdx — 증식 없음
+
+
 # ── 멱등 (같은 slug+content-hash 면 no-op) ──────────────────────
 async def test_idempotent_no_op_same_content(tmp_path):
     a = StudioAdapter(repo_path=str(tmp_path), mode="file", journal_path=tmp_path / "pub.jsonl")

@@ -309,11 +309,21 @@ class StudioAdapter(BackendAdapter):
         content_hash = hashlib.sha256(mdx.encode("utf-8")).hexdigest()[:16]
 
         entries = self._journal.all()
+        # 멱등 앵커는 base_slug 한정이 아니라 저널 전체의 content-hash 다.
+        # contradiction 으로 접미 슬러그(sum-x-2)에 발행된 이력도 동일 content 면 그 슬러그를
+        # 재사용해 no-op 처리해야 한다. base_slug 로만 앵커링하면 접미 슬러그로 발행된 콘텐츠를
+        # 재발행할 때 already 를 못 봐 sum-x-3, sum-x-4 … 로 파일이 무한 증식한다.
+        prior = next((e for e in entries if e.get("content_hash") == content_hash), None)
+        already = prior is not None
         same_slug = [e for e in entries if e.get("slug") == base_slug]
-        already = any(e.get("content_hash") == content_hash for e in same_slug)
         contradiction = (not already) and any(e.get("content_hash") != content_hash for e in same_slug)
 
-        slug = base_slug if not contradiction else self._next_slug(base_slug, entries)
+        if already:
+            slug = prior.get("slug") or base_slug
+        elif contradiction:
+            slug = self._next_slug(base_slug, entries)
+        else:
+            slug = base_slug
         if slug != base_slug:
             post = {**post, "slug": slug, "post_id": post.get("post_id")}
         target = self._target_path(slug)
