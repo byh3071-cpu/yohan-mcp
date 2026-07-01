@@ -105,3 +105,71 @@ async def test_get_context_includes_brain_md(tmp_path):
     brain_matches = [m for m in env["data"]["matches"] if str(m["type"]).startswith("brain:")]
     assert brain_matches                       # router 경유로 brain 지식노트가 matches 에 포함
     assert any(m["data"].get("_path") for m in brain_matches)  # provenance(_path) 보존
+
+
+# ── 적대리뷰 반영 회귀 ──────────────────────────────────────────
+async def test_nested_same_stem_not_collapsed(tmp_path):
+    # 중첩 폴더 동명 파일(frontmatter id 없음)이 stem 충돌로 RRF dedup 에서 소실되면 안 됨(HIGH).
+    (tmp_path / "wiki" / "2024").mkdir(parents=True)
+    (tmp_path / "wiki" / "2025").mkdir(parents=True)
+    (tmp_path / "wiki" / "2024" / "intro.md").write_text("어텐션 2024 버전 노트", encoding="utf-8")
+    (tmp_path / "wiki" / "2025" / "intro.md").write_text("어텐션 2025 버전 노트", encoding="utf-8")
+    adapters = {"memory": MemoryAdapter(base_dir=tmp_path)}
+    ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator())
+    env = await T.tool_get_context(ctx, "어텐션", {"top_k": 20})
+    ids = {m["id"] for m in env["data"]["matches"] if str(m["type"]).startswith("brain:")}
+    assert len(ids) == 2  # 경로 기반 id 라 둘 다 보존(stem 이면 'intro' 하나로 접혔을 것)
+
+
+def test_read_md_body_starting_with_hr_not_lost(tmp_path):
+    # 본문 첫 줄이 수평선 '---' 이고 frontmatter 가 아닌 md → 본문 손실/필드 오주입 없어야 함(MED-HIGH).
+    p = tmp_path / "x.md"
+    p.write_text("---\n제목 아닌 그냥 텍스트\n---\n실제 본문 어텐션", encoding="utf-8")
+    rec = MemoryAdapter._read_md(p)
+    assert "제목 아닌 그냥 텍스트" in rec["body"]  # 앞부분 안 잘림
+    assert "실제 본문 어텐션" in rec["body"]
+    assert set(rec) == {"body"}  # 스칼라를 frontmatter 필드로 주입 안 함
+
+
+async def test_mtime_cache_invalidates_on_change(tmp_path):
+    import os
+    (tmp_path / "wiki").mkdir(parents=True)
+    p = tmp_path / "wiki" / "c.md"
+    p.write_text("---\nid: c\n---\n원본 어텐션", encoding="utf-8")
+    qa = MemoryAdapter(base_dir=tmp_path)
+    r1 = qa._read_md_cached(p)
+    assert "원본" in r1["body"]
+    p.write_text("---\nid: c\n---\n수정 어텐션", encoding="utf-8")
+    mt = p.stat().st_mtime + 10
+    os.utime(p, (mt, mt))  # mtime 강제 변경(동초 stale 회피)
+    r2 = qa._read_md_cached(p)
+    assert "수정" in r2["body"] and r2 is not r1  # 변경 반영(무효화)
+
+
+async def test_more_excluded_folders(tmp_path):
+    # ops·inbox·templates·core 도 노출 안 됨(주석 allowlist 와 정합).
+    for d in ("ops", "inbox", "templates", "core"):
+        (tmp_path / d).mkdir(parents=True)
+        (tmp_path / d / "n.md").write_text(f"어텐션 {d} 잡음", encoding="utf-8")
+    qa = MemoryAdapter(base_dir=tmp_path)
+    res = await qa.search("어텐션")
+    assert res == []  # 지식 폴더 아님 → 하나도 안 잡힘
+
+
+async def test_multiword_substring_limitation_documented(tmp_path):
+    # memory search 는 전체쿼리 연속 substring — 다어절(비연속)은 0건이 될 수 있음(의미검색은 Qdrant).
+    (tmp_path / "wiki").mkdir(parents=True)
+    (tmp_path / "wiki" / "a.md").write_text("알파 중간말 베타", encoding="utf-8")
+    qa = MemoryAdapter(base_dir=tmp_path)
+    assert len(await qa.search("알파")) == 1          # 단일 토큰 매칭
+    assert await qa.search("알파 베타") == []          # 비연속 다어절 → 0(한계 명시)
+
+
+async def test_count_ranking(tmp_path):
+    # blob 매칭 빈도(count) 내림차순 = 백엔드 내 순위.
+    (tmp_path / "wiki").mkdir(parents=True)
+    (tmp_path / "wiki" / "hi.md").write_text("어텐션 어텐션 어텐션 많음", encoding="utf-8")
+    (tmp_path / "wiki" / "lo.md").write_text("어텐션 적음", encoding="utf-8")
+    qa = MemoryAdapter(base_dir=tmp_path)
+    res = await qa.search("어텐션")
+    assert res[0]["data"]["_path"].endswith("hi.md")  # 빈도 높은 노트가 상위

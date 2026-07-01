@@ -37,6 +37,8 @@ _ID_FIELD = {"profile": "name", "decision": "decision_id", "ingest": "ingest_id"
 # ADR-008 B.3 — brain memory 에서 읽어올 지식 폴더 allowlist(읽기 전용).
 # 제외: logs·metrics·ops·inbox·templates·core (회수 노이즈·저가치·config 중복).
 _BRAIN_KNOWLEDGE_DIRS = ("decisions", "wiki", "ingest", "knowledge-hub", "projects", "rules")
+# brain 지식노트 본문 상한 — 회수 봉투 토큰 폭증 방지(전문은 data._path 로 접근).
+_MD_BODY_MAX = 4000
 
 
 class MemoryAdapter(BackendAdapter):
@@ -99,14 +101,16 @@ class MemoryAdapter(BackendAdapter):
                 if lines[i].strip() == "---":
                     try:
                         loaded = yaml.safe_load("\n".join(lines[1:i]))
-                        if isinstance(loaded, dict):
-                            fm = loaded
                     except Exception:
-                        fm = {}  # 깨진 frontmatter — 무시, 본문 검색은 유지
-                    body = "\n".join(lines[i + 1:])
+                        loaded = None  # 깨진 frontmatter
+                    # dict 일 때만 frontmatter 로 인정 → 본문 첫 줄이 우연히 '---'(수평선)여도
+                    # 본문을 잘라먹거나 스칼라/list 를 필드로 오주입하지 않는다.
+                    if isinstance(loaded, dict):
+                        fm = loaded
+                        body = "\n".join(lines[i + 1:])
                     break
         rec = dict(fm)
-        rec["body"] = body.strip()
+        rec["body"] = body.strip()[:_MD_BODY_MAX]  # 상한(토큰 폭증 방지)
         return rec
 
     def _read_md_cached(self, path: Path) -> dict | None:
@@ -154,8 +158,13 @@ class MemoryAdapter(BackendAdapter):
                 if data is None:
                     continue
                 rec = dict(data)
-                rec["_path"] = str(p.relative_to(self.base)).replace("\\", "/")
-                id_ = str(data.get("id") or data.get("slug") or p.stem)
+                rel = str(p.relative_to(self.base)).replace("\\", "/")
+                rec["_path"] = rel
+                # id 는 frontmatter id/slug, 없으면 **상대경로**(유니크) — 파일 stem 은 중첩 폴더
+                # 동명 파일(wiki/2024/intro.md·wiki/2025/intro.md)에서 type::id 충돌→RRF dedup 소실.
+                id_ = str(data.get("id") or data.get("slug") or rel)
+                # 회수 타입 = brain:<folder>. backend 는 여전히 "memory"(make_record). 스키마 없는
+                # 논리 회수 타입이라 검증 스킵·_links 관계 없음(지식노트는 관계그래프 밖 — 정상).
                 yield f"brain:{kdir}", id_, rec
 
     async def search(self, query: str, opts: dict | None = None) -> list[dict]:
@@ -166,6 +175,10 @@ class MemoryAdapter(BackendAdapter):
         hits: list[tuple[int, dict]] = []
         for type_, id_, data in self._iter_all():
             if want_type and type_ != want_type:
+                continue
+            # 빈 쿼리는 전건 매칭인데, brain 지식노트(수백 건)가 쏟아지면 후보풀을 삼켜
+            # 다른 백엔드를 밀어낸다 → 빈 쿼리일 때 brain:* 는 제외(yaml 엔티티만 나열).
+            if not q and str(type_).startswith("brain:"):
                 continue
             blob = yaml.safe_dump(data, allow_unicode=True).lower()
             if not q or q in blob:
