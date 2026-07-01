@@ -641,8 +641,8 @@ async def _resolve_summary(ctx: ToolContext, summary) -> dict | None:
                 d = rec.get("data", {})
                 if d.get("summary_id") == sid or rec.get("id") == sid:
                     return d
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("요약 로드 실패(notion.search): sid=%s %s: %s", sid, type(exc).__name__, exc)
     return None
 
 
