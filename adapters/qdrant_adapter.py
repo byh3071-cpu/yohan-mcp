@@ -148,13 +148,17 @@ class QdrantAdapter(BackendAdapter):
     async def search(self, query: str, opts: dict | None = None) -> list[dict]:
         opts = opts or {}
         top_k = int(opts.get("top_k", 5))
+        # 후보풀은 top_k 보다 크게(fetch_k) 확보한다. 최종 top_k 절단은 어댑터/컬렉션 단계가
+        # 아니라 router 가 RRF 융합 '이후'에 수행한다(랭킹 전 선절단 금지). 어댑터에서 미리
+        # top_k 로 자르면 융합·다양화 이전에 다른 페이지 후보가 폐기되어 재현율/다양성이 급감한다.
+        fetch_k = int(opts.get("fetch_k", max(top_k * 5, 50)))
         # 읽기 경로에서는 컬렉션을 생성하지 않는다(ensure_collection 부작용 제거 — MAJOR-1).
         client = self._get_client()
         vec = (await self._embed([query or ""]))[0]
         records: list[dict] = []
         for coll in self.search_collections:
             try:
-                res = await client.query_points(coll, query=vec, limit=top_k, with_payload=True)
+                res = await client.query_points(coll, query=vec, limit=fetch_k, with_payload=True)
             except Exception as exc:
                 # 컬렉션 미존재/차원불일치(bge-m3 미설치 등) — 건너뛰고 계속.
                 # 진단은 health_check(status 도구)가 '차원 불일치 … bge-m3 pull 필요'로 표면화.
@@ -164,17 +168,17 @@ class QdrantAdapter(BackendAdapter):
             rtype = "resource" if coll == self.collection else coll
             for p in res.points:
                 payload = p.payload or {}
-                rid = str(
-                    payload.get("notion_page_id")
-                    or payload.get("resource_id")
-                    or payload.get("source_url")
-                    or p.id
-                )
+                # record id = 청크 고유 point_id. 페이지 공유키(notion_page_id)가 아니라 청크 단위로
+                # 식별해야 router 의 dedup 키(type::id)가 같은 페이지의 서로 다른 청크를 하나로
+                # 붕괴시키지 않는다(회수 보존). notion_page_id/chunk_index/title 등 페이지 메타는
+                # payload(data)에 그대로 남아 provenance·역참조에 쓰인다.
+                rid = str(p.id)
                 score = float(p.score) if p.score is not None else None  # None-safe(BLOCKER-1)
                 records.append(make_record(rid, rtype, self.name, payload, score=score))
         # 컬렉션 간 병합 — score 내림차순이 곧 RRF 입력 순위(base.py 계약). None 은 맨 뒤.
         records.sort(key=lambda r: r["score"] if r["score"] is not None else float("-inf"), reverse=True)
-        return records[:top_k]
+        # fetch_k 로만 상한(후보풀 크기). 최종 top_k 절단은 router 가 RRF 융합 이후 적용.
+        return records[:fetch_k]
 
     # ── health ──────────────────────────────────────────────────
     async def health_check(self) -> dict:
