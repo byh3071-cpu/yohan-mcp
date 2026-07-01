@@ -70,6 +70,16 @@ async def status() -> dict:
 
 
 @mcp.tool()
+async def get_core_ruleset(capabilities: list[str] | None = None) -> dict:
+    """brain 코어 독트린(절대규칙·안전·정체성·패턴) 다이제스트 + 사용가능 도구 카탈로그 (ADR-008 P0).
+
+    yohan-mcp(배관)가 brain(원천) core-ruleset.yaml 을 읽어 준다. brain 미연결 시 인레포 스냅샷 폴백.
+    capabilities(명시 승인된 도구명 목록) 없으면 외부 쓰기 도구는 locked 표식(capability gating).
+    """
+    return await T.tool_get_core_ruleset(ctx, capabilities)
+
+
+@mcp.tool()
 async def run_action(action: str, params: dict | None = None) -> dict:
     """프로토콜(순차 step 체인) 실행 (P4 — 자율성 L2, Protocol Engine 위임).
 

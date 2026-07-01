@@ -300,6 +300,8 @@ python scripts/validate_schemas.py
 
 `matches` 는 라우터가 RRF 로 융합한 레코드(`core/router.py` — 어댑터의 `score` 대신 `rrf_score`·`sources` 를 가짐), `related_links` 항목 형식은 `schemas/_links.json` 의 관계 정의를 그대로 따른다. `get_context` 는 조회 도구라 `quality_score` 는 `null`(비적용)이다.
 
+**코어룰셋 주입(옵트인, ADR-008 P0):** `get_context(query, {"inject_rules": true})` 또는 env `YOHAN_INJECT_CORE_RULES=1` 이면 봉투에 `core_rules_digest`(brain `core-ruleset.yaml` 의 정체성·절대규칙·안전·패턴참조 다이제스트, 미연결 시 인레포 스냅샷 폴백)와 `available_tools`(도구 카탈로그 + capability gating — 미승인 쓰기 도구는 `locked:true`)가 추가된다. 기본 off라 미옵트인 호출은 봉투 불변. 독트린만 필요하면 별도 도구 `get_core_ruleset()` 로 직접 pull.
+
 ---
 
 ## 트리거 (자동화)

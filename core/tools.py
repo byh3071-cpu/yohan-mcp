@@ -34,6 +34,7 @@ from core.schema_validator import SchemaValidator
 from core.links import LinkStore
 from core.approval import ApprovalQueue
 from core.policy import PolicyEngine
+from core import core_rules as CR
 from core import protocols as P
 from core import scheduler as S
 from core import verify as V
@@ -462,13 +463,34 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         sources.append("notion:devlog")
     if patterns:
         sources.append("notion:pattern")
-    return _envelope(
+    env = _envelope(
         {"matches": matches, "related_links": related,
          "devlog": devlog, "patterns": patterns, "count": len(matches)},
         True,
         sources,
         errors=res["errors"],
     )
+    # ADR-008 P0 — brain 코어룰셋 주입(옵트인·멱등). 기본 off라 미옵트인 호출자는 봉투 불변.
+    # 주입 실패가 정상 회수 봉투를 죽이지 않게 방어(devlog/pattern 회수와 동일 격리).
+    if CR.is_truthy(opts.get("inject_rules")) or CR.is_truthy(os.getenv("YOHAN_INJECT_CORE_RULES")):
+        try:
+            CR.inject_core_rules(env, enabled=True, capabilities=opts.get("capabilities"))
+        except Exception as exc:
+            logger.warning("코어룰셋 주입 실패: %s: %s", type(exc).__name__, exc)
+    return env
+
+
+async def tool_get_core_ruleset(ctx: ToolContext, capabilities=None) -> dict:
+    """brain 코어 독트린 다이제스트 + 사용가능 도구 카탈로그 (ADR-008 P0, 읽기 전용).
+
+    에이전트가 get_context 없이도 독트린을 직접 pull. 출처(brain/snapshot/none) 표기.
+    capabilities(허용 도구명) 미부여 시 쓰기 도구는 locked 로 표식(capability gating).
+    """
+    ruleset, source = CR.load_core_ruleset()
+    digest = CR.build_digest(ruleset)
+    digest["source"] = source
+    data = {"core_rules_digest": digest, "available_tools": CR.available_tools(capabilities)}
+    return _envelope(data, True, [f"core-ruleset:{source}"])
 
 
 # ── stub 도구 (P3/P4 예정) ──────────────────────────────────────
