@@ -159,7 +159,7 @@ FastMCP 진입점. **도구 16개 + Resources + Prompts** 를 등록한다. impo
 | 어댑터 | 백엔드 | 상태 |
 | --- | --- | --- |
 | `notion_adapter` | Notion API v1 | 실동작 — `NOTION_TOKEN` 없으면 create 가 드라이런 폴백 |
-| `memory_adapter` | 로컬 `memory/`(yaml) | 실동작 — 무설정(profile/decision/ingest CRUD) |
+| `memory_adapter` | 로컬 `memory/`(yaml) + brain `.md`(읽기) | 실동작 — 무설정(profile/decision/ingest CRUD) + ADR-008 B.3: brain 지식폴더(decisions·wiki·ingest·knowledge-hub·projects·rules)의 `.md`+frontmatter 를 **읽기 전용** 회수(type `brain:<folder>`) |
 | `qdrant_adapter` | Qdrant 벡터DB | 실동작 — `QDRANT_URL` 없으면 `:memory:` 폴백 |
 | `studio_adapter` | yohan-studio 레포(MDX) | 실동작 — 기본 `dry_run`(파일 미작성) |
 | `n8n_adapter` | n8n | `health_check` 만(search/create 미구현) |

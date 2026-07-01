@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""memory 백엔드 어댑터 (P2 실동작).
+"""memory 백엔드 어댑터 (P2 실동작 + ADR-008 B.3 brain .md 읽기).
 
 로컬 파일시스템 memory/ 디렉토리를 읽고 쓴다.
 - profile  → memory/profile.yaml           (단일)
@@ -7,6 +7,11 @@
 - ingest   → memory/ingest/<id>.yaml
 
 환경변수 MEMORY_DIR / YOHAN_BRAIN_ROOT 로 베이스 경로 변경 (기본: 리포 루트/memory, deprecated).
+
+ADR-008 B.3 — brain(yohan-brain/memory/)은 지식을 `.md`+frontmatter 로 쌓는다(수백 건). yaml 만
+읽으면 그 지식이 search/get_context 에 안 잡혀 memory 백엔드가 사실상 빈다. 지식 폴더 allowlist 의
+`.md` 를 **읽기 전용**으로 순회해 frontmatter+본문을 레코드로 노출한다(type=`brain:<folder>`,
+스키마 없는 회수용). 쓰기 경로는 무변경 — brain 파일을 건드리지 않는다.
 """
 from __future__ import annotations
 
@@ -29,12 +34,20 @@ _LAYOUT = {
 # 타입별 ID 필드명 (스키마 PK)
 _ID_FIELD = {"profile": "name", "decision": "decision_id", "ingest": "ingest_id"}
 
+# ADR-008 B.3 — brain memory 에서 읽어올 지식 폴더 allowlist(읽기 전용).
+# 제외: logs·metrics·ops·inbox·templates·core (회수 노이즈·저가치·config 중복).
+_BRAIN_KNOWLEDGE_DIRS = ("decisions", "wiki", "ingest", "knowledge-hub", "projects", "rules")
+# brain 지식노트 본문 상한 — 회수 봉투 토큰 폭증 방지(전문은 data._path 로 접근).
+_MD_BODY_MAX = 4000
+
 
 class MemoryAdapter(BackendAdapter):
     name = "memory"
 
     def __init__(self, base_dir: str | os.PathLike | None = None) -> None:
         self.base = Path(base_dir) if base_dir else resolve_memory_dir()
+        # brain .md 파싱 캐시 (path → (mtime, data)). 변화 없으면 재읽기·재파싱 회피.
+        self._md_cache: dict[str, tuple[float, dict]] = {}
 
     # ── 경로 헬퍼 ───────────────────────────────────────────────
     @staticmethod
@@ -70,8 +83,53 @@ class MemoryAdapter(BackendAdapter):
             return None
         return yaml.safe_load(content) or {}
 
+    @staticmethod
+    def _read_md(path: Path) -> dict | None:
+        """brain `.md`+frontmatter → 레코드 dict. 선두 `---` 블록=frontmatter, 나머지=body.
+
+        frontmatter 없으면 {"body": 전문}. 깨진 frontmatter 는 무시하고 본문은 살린다(graceful).
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        fm: dict = {}
+        body = text
+        lines = text.split("\n")
+        if lines and lines[0].strip() == "---":
+            for i in range(1, len(lines)):
+                if lines[i].strip() == "---":
+                    try:
+                        loaded = yaml.safe_load("\n".join(lines[1:i]))
+                    except Exception:
+                        loaded = None  # 깨진 frontmatter
+                    # dict 일 때만 frontmatter 로 인정 → 본문 첫 줄이 우연히 '---'(수평선)여도
+                    # 본문을 잘라먹거나 스칼라/list 를 필드로 오주입하지 않는다.
+                    if isinstance(loaded, dict):
+                        fm = loaded
+                        body = "\n".join(lines[i + 1:])
+                    break
+        rec = dict(fm)
+        rec["body"] = body.strip()[:_MD_BODY_MAX]  # 상한(토큰 폭증 방지)
+        return rec
+
+    def _read_md_cached(self, path: Path) -> dict | None:
+        """mtime 기반 캐시 — 변화 없으면 재파싱하지 않는다."""
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return None
+        key = str(path)
+        cached = self._md_cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        data = self._read_md(path)
+        if data is not None:
+            self._md_cache[key] = (mtime, data)
+        return data
+
     def _iter_all(self):
-        """(type_, id_, data) 전부 순회."""
+        """(type_, id_, data) 전부 순회 — yaml 레이아웃 + brain .md 지식노트."""
         for type_, (sub, single) in _LAYOUT.items():
             if single:
                 p = self.base / sub
@@ -86,6 +144,28 @@ class MemoryAdapter(BackendAdapter):
                         data = self._read_yaml(p)
                         if data is not None:
                             yield type_, data.get(_ID_FIELD[type_], p.stem), data
+        # ── ADR-008 B.3 — brain 지식 폴더의 .md (읽기 전용, 스키마 없는 회수 타입) ──
+        base_resolved = self.base.resolve()
+        for kdir in _BRAIN_KNOWLEDGE_DIRS:
+            root = self.base / kdir
+            if not root.exists():
+                continue
+            for p in sorted(root.rglob("*.md")):
+                # 경로 봉쇄 재확인(심링크 등으로 base 밖 탈출 차단)
+                if not p.resolve().is_relative_to(base_resolved):
+                    continue
+                data = self._read_md_cached(p)
+                if data is None:
+                    continue
+                rec = dict(data)
+                rel = str(p.relative_to(self.base)).replace("\\", "/")
+                rec["_path"] = rel
+                # id 는 frontmatter id/slug, 없으면 **상대경로**(유니크) — 파일 stem 은 중첩 폴더
+                # 동명 파일(wiki/2024/intro.md·wiki/2025/intro.md)에서 type::id 충돌→RRF dedup 소실.
+                id_ = str(data.get("id") or data.get("slug") or rel)
+                # 회수 타입 = brain:<folder>. backend 는 여전히 "memory"(make_record). 스키마 없는
+                # 논리 회수 타입이라 검증 스킵·_links 관계 없음(지식노트는 관계그래프 밖 — 정상).
+                yield f"brain:{kdir}", id_, rec
 
     async def search(self, query: str, opts: dict | None = None) -> list[dict]:
         """파일 본문 substring 매칭. opts['type']로 타입 한정 가능."""
@@ -95,6 +175,10 @@ class MemoryAdapter(BackendAdapter):
         hits: list[tuple[int, dict]] = []
         for type_, id_, data in self._iter_all():
             if want_type and type_ != want_type:
+                continue
+            # 빈 쿼리는 전건 매칭인데, brain 지식노트(수백 건)가 쏟아지면 후보풀을 삼켜
+            # 다른 백엔드를 밀어낸다 → 빈 쿼리일 때 brain:* 는 제외(yaml 엔티티만 나열).
+            if not q and str(type_).startswith("brain:"):
                 continue
             blob = yaml.safe_dump(data, allow_unicode=True).lower()
             if not q or q in blob:
