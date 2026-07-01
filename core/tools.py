@@ -34,6 +34,7 @@ from core.schema_validator import SchemaValidator
 from core.links import LinkStore
 from core.approval import ApprovalQueue
 from core.policy import PolicyEngine
+from core import core_rules as CR
 from core import protocols as P
 from core import scheduler as S
 from core import verify as V
@@ -470,10 +471,12 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         errors=res["errors"],
     )
     # ADR-008 P0 — brain 코어룰셋 주입(옵트인·멱등). 기본 off라 미옵트인 호출자는 봉투 불변.
-    inject = bool(opts.get("inject_rules")) or os.getenv("YOHAN_INJECT_CORE_RULES") in ("1", "true", "True")
-    if inject:
-        from core.core_rules import inject_core_rules
-        inject_core_rules(env, enabled=True, capabilities=opts.get("capabilities"))
+    # 주입 실패가 정상 회수 봉투를 죽이지 않게 방어(devlog/pattern 회수와 동일 격리).
+    if CR.is_truthy(opts.get("inject_rules")) or CR.is_truthy(os.getenv("YOHAN_INJECT_CORE_RULES")):
+        try:
+            CR.inject_core_rules(env, enabled=True, capabilities=opts.get("capabilities"))
+        except Exception as exc:
+            logger.warning("코어룰셋 주입 실패: %s: %s", type(exc).__name__, exc)
     return env
 
 
@@ -483,11 +486,10 @@ async def tool_get_core_ruleset(ctx: ToolContext, capabilities=None) -> dict:
     에이전트가 get_context 없이도 독트린을 직접 pull. 출처(brain/snapshot/none) 표기.
     capabilities(허용 도구명) 미부여 시 쓰기 도구는 locked 로 표식(capability gating).
     """
-    from core.core_rules import available_tools, build_digest, load_core_ruleset
-    ruleset, source = load_core_ruleset()
-    digest = build_digest(ruleset)
+    ruleset, source = CR.load_core_ruleset()
+    digest = CR.build_digest(ruleset)
     digest["source"] = source
-    data = {"core_rules_digest": digest, "available_tools": available_tools(capabilities)}
+    data = {"core_rules_digest": digest, "available_tools": CR.available_tools(capabilities)}
     return _envelope(data, True, [f"core-ruleset:{source}"])
 
 

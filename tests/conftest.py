@@ -16,6 +16,8 @@ def _isolate_runtime(request, tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_RUNTIME_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("MEMORY_DIR", str(tmp_path / "memory"))
     monkeypatch.delenv("YOHAN_BRAIN_ROOT", raising=False)
+    # 코어룰셋 주입 옵트인 env 가 새면 "기본 off" 단정이 flaky → 항상 격리.
+    monkeypatch.delenv("YOHAN_INJECT_CORE_RULES", raising=False)
     # integration 마커 테스트는 실 Qdrant 를 써야 하므로 QDRANT_* 를 보존한다.
     # 그 외 유닛은 실서버 우발 접속 + .env 누출(예: integration 테스트의 load_dotenv 가
     # os.environ 에 남긴 QDRANT_COLLECTION/SEARCH_COLLECTIONS)을 막기 위해 삭제한다 —

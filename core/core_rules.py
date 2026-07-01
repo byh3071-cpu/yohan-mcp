@@ -77,7 +77,10 @@ def load_core_ruleset(*, use_cache: bool = True) -> tuple[dict | None, str]:
         except Exception as exc:
             logger.warning("CORE-RULES.md 스냅샷 파싱 실패: %s: %s", type(exc).__name__, exc)
 
-    if use_cache:
+    # 캐시는 **brain 성공만** 고정한다. snapshot/none(폴백·실패)은 캐시하지 않아,
+    # 부팅 시 brain FS 가 아직 없어 폴백됐다가 이후 brain 이 붙으면 다음 호출에서 승격된다
+    # (일시 오류의 영구 고착 방지 — HIGH). brain yaml 은 작아 매 호출 재읽기 비용도 낮다.
+    if use_cache and result[1] == "brain":
         _cache = result
     return result
 
@@ -105,23 +108,28 @@ def _parse_snapshot(text: str) -> dict | None:
         if cur is not None and mb:
             sections[cur].append(mb.group(1).strip())
 
-    def _find(prefix: str) -> list[str]:
+    def _find(*keys: str) -> list[str]:
+        # 헤더 번호(예 "1.")나 키워드(예 "절대") 어느 쪽이든 매칭 — 재번호·개명에 견고.
         for k, v in sections.items():
-            if k.startswith(prefix):
+            if any(key in k for key in keys):
                 return v
         return []
 
-    identity: dict[str, str] = {}
-    for b in _find("0."):  # "- **role:** ..." / "- **doctrine:** ..."
-        mi = re.match(r"\*\*(role|doctrine):\*\*\s*(.*)$", b)
-        if mi:
-            identity[mi.group(1)] = mi.group(2).strip()
+    def _bold_bullets_to_dict(bullets: list[str]) -> dict[str, str]:
+        # "**key:** value" 형태 불릿을 dict 로 정규화(§0 정체성·§5 안전 동형).
+        out: dict[str, str] = {}
+        for b in bullets:
+            mi = re.match(r"\*\*([^:*]+):\*\*\s*(.*)$", b)
+            if mi:
+                out[mi.group(1).strip()] = mi.group(2).strip()
+        return out
 
     parsed = {
         "version": version,
-        "identity": identity,
-        "non_negotiable": _find("1."),
-        "safety": _find("5."),  # 스냅샷은 dict 가 아닌 불릿 list — build_digest 가 둘 다 수용
+        "identity": _bold_bullets_to_dict(_find("0.", "정체")),
+        "non_negotiable": _find("1.", "절대"),
+        # §5 안전 불릿도 dict 로 정규화 → digest.safety 타입을 brain(dict)과 일치시킨다(shape 안정, C3).
+        "safety": _bold_bullets_to_dict(_find("5.", "안전")),
         "pattern_refs": [b.split()[0] for b in _find("패턴") if b.strip()],
     }
     # 최소한 절대규칙이라도 있어야 유효 스냅샷으로 인정
@@ -149,6 +157,34 @@ def build_digest(ruleset: dict | None) -> dict:
     }
 
 
+# ── 헬퍼 ────────────────────────────────────────────────────────
+def is_truthy(v) -> bool:
+    """옵트인 값의 일관된 truthy 판정 — 닫힌집합 allowlist 대조(PAT-001).
+
+    bool 은 그대로, 문자열은 소문자·strip 후 {1,true,yes,on} 만 참(대문자·별칭·"false" 문자열 안전).
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _coerce_caps(capabilities) -> set[str]:
+    """capabilities 를 도구명 집합으로 안전 강제 — 잘못된 타입이 크래시/오게이팅 못 하게(C2).
+
+    None→빈집합, str→단일원소(문자셋 분해 방지), 이터러블→str 집합, 그 외→빈집합.
+    """
+    if capabilities is None:
+        return set()
+    if isinstance(capabilities, str):
+        return {capabilities}
+    try:
+        return {str(c) for c in capabilities}
+    except TypeError:
+        return set()
+
+
 # ── 도구 카탈로그 + capability gating ───────────────────────────
 def available_tools(capabilities=None) -> list[dict]:
     """도구 카탈로그 + capability gating. capabilities(허용 도구명 집합) 없으면 gated 도구는 locked.
@@ -156,7 +192,7 @@ def available_tools(capabilities=None) -> list[dict]:
     CORE-RULES §5: "외부 쓰기·배포·삭제 도구는 기본 잠금 → 명시 승인 시에만. 선제 호출 금지."
     잠긴 도구도 목록엔 남긴다(에이전트가 존재·잠금을 인지하도록) — 다만 locked=True 표식.
     """
-    caps = set(capabilities or [])
+    caps = _coerce_caps(capabilities)
     out: list[dict] = []
     for t in _TOOL_REGISTRY:
         locked = bool(t["gated"]) and t["name"] not in caps
@@ -173,7 +209,7 @@ def inject_core_rules(envelope: dict, *, enabled: bool, capabilities=None) -> di
     """
     if not enabled or not isinstance(envelope, dict):
         return envelope
-    if "core_rules_digest" in envelope and "available_tools" in envelope:
+    if "core_rules_digest" in envelope:  # 멱등 마커 단일키(부분상태 클로버링 방지, C6)
         return envelope
     ruleset, source = load_core_ruleset()
     digest = build_digest(ruleset)

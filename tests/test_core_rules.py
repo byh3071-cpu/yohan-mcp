@@ -134,7 +134,8 @@ async def test_get_context_optin_injection(tmp_path):
 
     injected = await T.tool_get_context(ctx, "아무거나", {"inject_rules": True})
     assert "core_rules_digest" in injected and "available_tools" in injected
-    assert injected["core_rules_digest"]["source"] in ("brain", "snapshot", "none")
+    # conftest 가 MEMORY_DIR=tmp 로 brain 부재 보장 → 스냅샷 폴백이 실제로 탔는지 핀박기(공허단정 방지)
+    assert injected["core_rules_digest"]["source"] == "snapshot"
 
 
 # ⑧-b tool_get_core_ruleset 직접 pull
@@ -151,3 +152,54 @@ async def test_tool_get_core_ruleset(tmp_path):
     assert set(env) >= {"data", "verification", "provenance"}
     assert "core_rules_digest" in env["data"] and "available_tools" in env["data"]
     assert env["provenance"]["sources_used"][0].startswith("core-ruleset:")
+
+
+# ── 적대리뷰 반영 회귀 ──────────────────────────────────────────
+def test_snapshot_safety_is_dict():
+    # 폴백(snapshot) 에서도 digest.safety 는 dict — brain 과 shape 일치(C3). list 였으면 소비자 깨짐.
+    ruleset, source = CR.load_core_ruleset(use_cache=False)
+    assert source == "snapshot"
+    d = CR.build_digest(ruleset)
+    assert isinstance(d["safety"], dict)
+    assert "capability_gating" in d["safety"]  # §5 불릿이 named dict 로 정규화됨
+    assert isinstance(d["identity"], dict) and d["identity"].get("role")
+
+
+def test_capabilities_coercion_safe():
+    # 잘못된 capabilities 타입이 크래시/오게이팅 못 하게(C2).
+    assert CR.available_tools(5)          # int → 크래시 없이 목록 반환(빈 caps 취급)
+    assert CR.available_tools(True)       # bool → 크래시 없음
+    # str 단일 도구명은 문자셋 분해 없이 그 도구만 해제
+    by = {t["name"]: t for t in CR.available_tools("create")}
+    assert by["create"]["locked"] is False
+    assert by["update"]["locked"] is True
+    # 문자셋 분해 버그였다면 'c','r','e'... 로 아무 도구도 매칭 못 해 create 가 locked 였을 것
+
+
+def test_is_truthy():
+    for v in ("1", "true", "TRUE", "Yes", "on", " true ", True):
+        assert CR.is_truthy(v) is True, v
+    for v in ("0", "false", "False", "no", "", None, False, "off"):
+        assert CR.is_truthy(v) is False, v
+
+
+def test_tool_registry_matches_server():
+    # _TOOL_REGISTRY 가 server.py 의 @mcp.tool 목록과 드리프트 없는지 가드(F5).
+    # server 임포트 부작용을 피해 소스만 정규식 스캔.
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "server.py").read_text(encoding="utf-8")
+    server_tools = set(re.findall(r"@mcp\.tool\(\)\s*\nasync def (\w+)\(", src))
+    registry = {t["name"] for t in CR._TOOL_REGISTRY}
+    assert registry == server_tools, f"드리프트: registry-server={registry - server_tools}, server-registry={server_tools - registry}"
+
+
+def test_cache_not_stuck_on_snapshot(tmp_path):
+    # snapshot 폴백은 캐시되지 않아, 이후 brain 이 붙으면 승격돼야 한다(C1 영구고착 방지).
+    CR._cache = None
+    r1, s1 = CR.load_core_ruleset()      # brain 부재(conftest tmp) → snapshot, 캐시 안 됨
+    assert s1 == "snapshot" and CR._cache is None
+    _write_brain_yaml(tmp_path)          # 이제 brain yaml 등장
+    r2, s2 = CR.load_core_ruleset()      # 재호출 → brain 승격(고착 없음)
+    assert s2 == "brain" and r2["version"] == "9.9.9"
