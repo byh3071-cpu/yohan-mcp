@@ -76,12 +76,22 @@ class SmartRouter:
 
         융합 키는 '타입::id' 라 서로 다른 타입이 우연히 같은 id 를 가져도
         한 결과로 잘못 합쳐지지 않는다(provenance 무결성 보존).
+
+        RRF 정의상 각 백엔드(시스템)는 한 논리 엔티티당 단 한 번(최선 순위)만
+        점수에 기여한다. 단일 백엔드가 같은 엔티티를 여러 청크로 나눠 여러 번
+        반환해도(예: qdrant 멀티청크), 그 백엔드에서는 첫(최상위) rank 만 가산해
+        '청크 수에 의한 점수 인플레이션'을 막는다. 리스트는 백엔드 내 순위순이므로
+        첫 등장 = 최선 순위.
         """
         agg: dict[str, dict] = {}
         for backend, records in ranked_lists:
+            counted_keys: set[str] = set()  # 이 백엔드가 이미 가산한 키(멀티청크 중복 가산 차단)
             for rank, rec in enumerate(records, start=1):
                 rid = rec.get("id")
                 key = f"{rec.get('type')}::{rid}"  # 논리 엔티티 키
+                if key in counted_keys:
+                    continue  # 같은 백엔드의 동일 엔티티 재등장 — 최선 rank 만 기여
+                counted_keys.add(key)
                 contrib = 1.0 / (self.k + rank)
                 if key not in agg:
                     agg[key] = {

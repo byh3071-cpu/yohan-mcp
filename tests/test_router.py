@@ -95,6 +95,30 @@ async def test_search_isolates_backend_exception():
     assert "memory" in out["errors"] and "boom" in out["errors"]["memory"]
 
 
+async def test_rrf_single_backend_multichunk_no_inflation():
+    # 단일 백엔드가 같은 (type,id) 를 여러 청크로 반환해도 점수가 합산되지 않는다.
+    # RRF 정의: 각 백엔드는 한 엔티티당 최선(첫) rank 한 번만 기여.
+    multichunk = [
+        make_record("page1", "knowledge_base", "qdrant", {"chunk": 0}),  # rank 1
+        make_record("page1", "knowledge_base", "qdrant", {"chunk": 1}),  # rank 2 (중복 — 무시)
+        make_record("page2", "knowledge_base", "qdrant", {"chunk": 0}),  # rank 3
+        make_record("page1", "knowledge_base", "qdrant", {"chunk": 2}),  # rank 4 (중복 — 무시)
+    ]
+    a = FakeAdapter("qdrant", multichunk)
+    r = SmartRouter({"qdrant": a}, k=60)
+    out = await r.search("q")
+    by_id = {x["id"]: x for x in out["results"]}
+    # page1 은 청크 3개지만 첫 rank(1) 만 기여 → 1/61, 청크 수 인플레이션 없음
+    assert by_id["page1"]["rrf_score"] == pytest.approx(1 / 61)
+    # page2 는 원래 리스트 rank 3 유지
+    assert by_id["page2"]["rrf_score"] == pytest.approx(1 / 63)
+    # 청크 수와 무관하게 결과 엔티티는 2개, 각 단일 출처
+    assert len(out["results"]) == 2
+    assert by_id["page1"]["sources"] == ["qdrant"]
+    # page1(1/61) > page2(1/63) — 청크 수가 아니라 순위가 결정
+    assert [x["id"] for x in out["results"]] == ["page1", "page2"]
+
+
 async def test_rrf_no_cross_type_merge():
     # 서로 다른 타입이 우연히 같은 id 를 가져도 하나로 합쳐지면 안 됨
     a = FakeAdapter("notion", [make_record("x1", "summary", "notion", {"summary_id": "x1"})])
