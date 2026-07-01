@@ -207,6 +207,44 @@ async def test_failure_isolation(tmp_path, monkeypatch):
     assert by.get("B") == "completed"               # B 는 정상 실행(스케줄러 생존)
 
 
+# ── ⑥-b transient fallback 은 원인 해소 후 재실행(stale replay 금지) ─────
+async def test_transient_fallback_reruns_after_recovery(tmp_path, monkeypatch):
+    """일시적 실패로 fallback 된 입력은 원인 해소 후 재발화 시 실제 체인을 재실행해야 한다.
+
+    회귀: fallback 봉투가 run_key 로 캐시돼 idempotent_replay 로 stale 반환되면
+    네트워크 복구 후에도 완결 루프가 그 입력에 영구 정지(wedge)한다.
+    """
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+    real_ingest = T.tool_ingest
+    calls = {"n": 0, "fail": True}
+
+    async def flaky(ctx_, url, *a, **k):
+        calls["n"] += 1
+        if calls["fail"]:
+            raise RuntimeError("일시적 외부 장애")
+        return await real_ingest(ctx_, url, *a, **k)
+    monkeypatch.setattr(T, "tool_ingest", flaky)
+
+    trig = _iv("rc", "https://e.com/rc")
+    eng = _engine(_ctx(tmp_path, [trig]), tmp_path, max_retries=1)
+
+    r1 = await eng.fire(trig)                        # 1차 — transient 실패 → fallback
+    assert r1["data"]["status"] in ("fallback", "failed")
+    n_after_fail = calls["n"]
+    assert n_after_fail >= 1                          # 체인이 시도됨(재시도 포함)
+
+    calls["fail"] = False                            # 원인 해소(네트워크 복구)
+    r2 = await eng.fire(trig)                         # 2차 — 동일 입력 재발화
+    assert r2["data"]["status"] == "completed"       # stale replay 아니라 실제 재실행
+    assert not r2.get("idempotent_replay")           # 폴백은 replay 대상이 아니어야
+    assert calls["n"] > n_after_fail                 # 실제 체인이 재호출됨
+    # 종결 처리는 1건(중복 실행 0) — completed 재실행 후엔 watermark 전진
+    assert len([e for e in eng.runs.all() if e.get("processed") == 1]) == 1
+
+    r3 = await eng.fire(trig)                         # 3차 — 이제 no_new(watermark 동일)
+    assert r3["data"]["skip_reason"] == "no_new"
+
+
 # ── ⑦ single-flight 락 ─────────────────────────────────────────
 def test_single_flight_lock_and_stale(tmp_path):
     fresh = lambda: datetime(2026, 6, 9, 10, 0, tzinfo=_KST)  # noqa: E731

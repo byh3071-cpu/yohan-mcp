@@ -39,6 +39,9 @@ from core.policy import PolicyEngine, RECOMMENDED_AUTO_POLICY
 ROOT = Path(__file__).resolve().parent.parent
 _KST = timezone(timedelta(hours=9))
 _LOCK_TTL_SEC = 300
+# 종결(terminal) 상태 — 처리 완료로 확정돼 watermark 를 전진시키고 run_key 로 replay 가능한 상태.
+# transient 인 fallback/failed 는 여기 없음 → 재실행 대상(재시도 안전장치 유지).
+_TERMINAL_STATUS = ("completed", "pending_approval")
 
 
 # ── 시간/해시 유틸 ──────────────────────────────────────────────────
@@ -403,10 +406,12 @@ class TriggerEngine:
                 self._record(tid, None, "no_new", event_id)
                 return self._skip(tid, "no_new", "watermark 동일 — 신규 입력 없음")
 
-            # 멱등 — run_key 이미 있으면 replay
+            # 멱등 — run_key 로 종결된 prior 가 있으면 replay.
+            # 단, transient fallback/failed 는 replay 대상 아님 → 원인 해소 후 재실행돼야
+            # 하므로 종결(terminal) 상태만 replay(재시도 안전장치와 정합).
             run_key = _sha(f"{tid}:{watermark or ''}:{input_hash}")
             prior = self.runs.get(run_key)
-            if prior is not None and not force:
+            if prior is not None and not force and prior.get("status") in _TERMINAL_STATUS:
                 env = dict(prior.get("envelope") or {})
                 env["idempotent_replay"] = True
                 return env
@@ -414,7 +419,7 @@ class TriggerEngine:
             env = await self._run_chain(trig, params)
             env.setdefault("trigger", {"id": tid, "type": _trigger_type(trig)})
             status = self._status_of(env)
-            processed = 1 if status in ("completed", "pending_approval") else 0
+            processed = 1 if status in _TERMINAL_STATUS else 0
             if processed:  # watermark 전진(처리됨) — 실패는 전진 안 함
                 self.state.merge(tid, {"watermark": input_hash,
                                        "last_processed_ts": now.isoformat()})
