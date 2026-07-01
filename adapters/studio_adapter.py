@@ -355,6 +355,13 @@ class StudioAdapter(BackendAdapter):
                         "detail": f"MDX 파일 발행 완료: {target}"}
             # pr 모드
             pr = await asyncio.to_thread(self._publish_pr, slug, target, mdx)
+            # push 실패(원격 없음·인증 실패 등)는 _publish_pr 가 예외 대신 pushed=False 로 보고 →
+            # 여기서 '발행됨'으로 기록하면 PR 없는데 멱등 저널이 오염돼 정당한 재시도가 영구 차단된다.
+            # → 저널 기록 생략 + published:False 로 재시도 가능 상태 유지.
+            if not pr.get("pushed"):
+                return {**base, "published": False, "dry_run": True,
+                        "detail": f"PR push 실패 → 발행 미완료(재시도 가능): {pr.get('pr_url')}",
+                        "errors": [str(pr.get("pr_url") or "push 실패")], "pr": pr}
             self._journal.record({
                 "slug": slug, "content_hash": content_hash, "target_path": str(target),
                 "mode": "pr", "summary_id": post.get("summary_id"), "branch": pr.get("branch"),

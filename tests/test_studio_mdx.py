@@ -103,6 +103,33 @@ async def test_pr_mode_graceful_fallback_when_not_git(tmp_path):
     assert "폴백" in res["detail"]
 
 
+# ── PR 모드: 커밋은 됐지만 push 실패 → 발행 미완료 + 멱등 저널 미오염 ──
+def _git_init(repo):
+    import subprocess
+    for args in (
+        ["init"], ["config", "user.email", "t@t.t"], ["config", "user.name", "t"],
+        ["commit", "--allow-empty", "-m", "init"],
+    ):
+        subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True)
+
+
+async def test_pr_mode_push_fail_not_published_and_journal_clean(tmp_path):
+    # 실제 git repo(체크아웃/커밋 성공) + origin 없음 → push 만 실패(pushed=False)
+    _git_init(tmp_path)
+    journal = tmp_path / "pub.jsonl"
+    a = StudioAdapter(repo_path=str(tmp_path), mode="pr", journal_path=journal)
+    res = await a.publish(_summary(), approved=True)
+    # push 실패는 '발행됨'이 아니다
+    assert res["published"] is False and res["dry_run"] is True
+    assert res.get("errors")
+    assert res["pr"]["pushed"] is False
+    # 멱등 저널 미오염 → 재발행이 already_published(no-op)로 막히지 않는다
+    assert not journal.exists() or journal.read_text(encoding="utf-8").strip() == ""
+    res2 = await a.publish(_summary(), approved=True)
+    assert res2["already_published"] is False   # no-op 로 막히지 않음 → 재시도 가능
+    assert res2["published"] is False
+
+
 # ── tool_publish 봉투 완전성(불변 봉투 + MDX 신호) ─────────────
 async def test_tool_publish_envelope_completeness(tmp_path):
     ctx = _ctx(tmp_path)
