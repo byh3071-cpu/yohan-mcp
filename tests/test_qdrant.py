@@ -134,6 +134,45 @@ async def test_qdrant_aclose_failure_logs_warning(caplog):
     assert any("실패" in r.message or r.levelno == logging.WARNING for r in caplog.records)
 
 
+async def test_qdrant_multichunk_same_page_not_collapsed():
+    # 같은 notion_page_id 를 공유하는 서로 다른 청크(고유 point_id)들이 하나로 붕괴되지 않고
+    # 전부 별개 레코드로 회수되는지 + 어댑터 단계에서 top_k 로 선절단하지 않는지(융합 후 절단) 검증.
+    import uuid as _uuid
+
+    from qdrant_client import models
+
+    e = HashEmbedder()
+    qa = QdrantAdapter(url=None, embedder=e, collection="yohan_resources")
+    client = qa._get_client()
+    await client.create_collection(
+        "yohan_resources",
+        vectors_config=models.VectorParams(size=e.dim, distance=models.Distance.COSINE),
+    )
+    # 한 페이지의 6개 청크(같은 notion_page_id, 서로 다른 본문/청크인덱스/고유 point_id)
+    n_chunks = 6
+    vecs = e.embed([f"어텐션 메커니즘 청크 {i} 쿼리 키 값" for i in range(n_chunks)])
+    points = [
+        models.PointStruct(
+            id=str(_uuid.uuid4()),
+            vector=vecs[i],
+            payload={"notion_page_id": "PAGE-A", "chunk_index": i, "title": "트랜스포머"},
+        )
+        for i in range(n_chunks)
+    ]
+    await client.upsert("yohan_resources", points=points)
+
+    # top_k=3 이지만 어댑터는 후보를 top_k 로 선절단하지 않는다(fetch_k 로만 상한).
+    res = await qa.search("어텐션 메커니즘", {"top_k": 3})
+    ids = [r["id"] for r in res]
+    # 붕괴 0: 6개 청크 모두 별개 레코드(고유 point_id id)로 회수
+    assert len(ids) == n_chunks, f"청크 붕괴/선절단 발생: {len(ids)} != {n_chunks}"
+    assert len(set(ids)) == n_chunks  # id 가 청크 고유(point_id) — notion_page_id 로 접히지 않음
+    # 페이지 메타(notion_page_id)는 data(payload)에 보존 — provenance/역참조용
+    assert all(r["data"]["notion_page_id"] == "PAGE-A" for r in res)
+    assert {r["data"]["chunk_index"] for r in res} == set(range(n_chunks))
+    await qa.aclose()
+
+
 async def test_qdrant_dim_mismatch_detected():
     from qdrant_client import AsyncQdrantClient
 

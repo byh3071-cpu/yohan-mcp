@@ -43,6 +43,7 @@ class SmartRouter:
         반환: {"results": [...], "sources_used": [...], "errors": {backend: msg}}
         각 result: {id, type, backend, data, rrf_score, sources:[backend...]}
         """
+        opts = opts or {}
         names = self.select_backends(query, opts)
         tasks = [self._safe_search(n, query, opts) for n in names]
         per_backend = await asyncio.gather(*tasks)
@@ -58,6 +59,11 @@ class SmartRouter:
             ranked_lists.append((name, records))
 
         fused = self._rrf_fuse(ranked_lists)
+        # top_k 절단은 RRF 융합 '이후'에만 수행한다 — 백엔드/어댑터가 랭킹 전에 후보를 버리면
+        # 융합·다양화 이전에 유효 후보가 폐기되어 재현율/다양성이 급감한다(선절단 금지).
+        top_k = int(opts.get("top_k", 5))
+        if top_k >= 0:
+            fused = fused[:top_k]
         return {"results": fused, "sources_used": sources_used, "errors": errors}
 
     async def _safe_search(self, name: str, query: str, opts: dict | None):

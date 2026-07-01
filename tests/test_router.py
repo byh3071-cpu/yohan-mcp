@@ -119,6 +119,45 @@ async def test_rrf_single_backend_multichunk_no_inflation():
     assert [x["id"] for x in out["results"]] == ["page1", "page2"]
 
 
+async def test_router_top_k_applied_after_fusion():
+    # top_k 절단이 RRF 융합 '이후'에 적용되는지 검증.
+    # notion 은 x5 를 최하위(rank5)로 반환하지만, memory 에서 x5 가 rank1 로 재등장해
+    # 융합 점수가 최상위가 된다. 만약 top_k 를 융합 '전'(백엔드 단계)에 적용했다면
+    # notion 의 x5(rank5)는 top_k=2 절단에 걸려 폐기됐을 것 — 그 경우 x5 는 최상위가 못 된다.
+    a = FakeAdapter("notion", recs("notion", ["x1", "x2", "x3", "x4", "x5"]))
+    b = FakeAdapter("memory", recs("memory", ["x5", "x6"]))
+    r = SmartRouter({"notion": a, "memory": b}, k=60)
+    out = await r.search("q", {"top_k": 2})
+    ids = [x["id"] for x in out["results"]]
+    # 융합 후 top_k=2 절단 → 정확히 2개
+    assert len(ids) == 2
+    # x5 = notion rank5(1/65) + memory rank1(1/61) 로 최상위 → 선절단이 없었다는 증거
+    assert ids[0] == "x5"
+    by_id = {x["id"]: x for x in out["results"]}
+    assert by_id["x5"]["rrf_score"] == pytest.approx(1 / 65 + 1 / 61)
+    assert set(by_id["x5"]["sources"]) == {"notion", "memory"}
+
+
+async def test_router_multichunk_distinct_pointids_not_collapsed():
+    # 같은 notion_page_id 를 data 에 담더라도 서로 다른 청크 id(point_id)면 융합에서 붕괴되지 않는다.
+    # (qdrant 어댑터가 record id 를 청크 고유 point_id 로 발급 → 아래처럼 id 가 서로 다름)
+    chunks = [
+        make_record("pt-0", "knowledge_base", "qdrant", {"notion_page_id": "P", "chunk_index": 0}),
+        make_record("pt-1", "knowledge_base", "qdrant", {"notion_page_id": "P", "chunk_index": 1}),
+        make_record("pt-2", "knowledge_base", "qdrant", {"notion_page_id": "P", "chunk_index": 2}),
+    ]
+    a = FakeAdapter("qdrant", chunks)
+    r = SmartRouter({"qdrant": a}, k=60)
+    out = await r.search("q", {"top_k": 5})
+    ids = [x["id"] for x in out["results"]]
+    # 붕괴 0: 세 청크가 별개 결과로 보존(같은 page 라도 point_id 로 식별)
+    assert len(ids) == 3 and set(ids) == {"pt-0", "pt-1", "pt-2"}
+    # 각 청크는 단일 백엔드 rank 1개만 기여(청크 수 인플레이션 없음, 서로 다른 엔티티)
+    by_id = {x["id"]: x for x in out["results"]}
+    assert by_id["pt-0"]["rrf_score"] == pytest.approx(1 / 61)
+    assert by_id["pt-1"]["rrf_score"] == pytest.approx(1 / 62)
+
+
 async def test_rrf_no_cross_type_merge():
     # 서로 다른 타입이 우연히 같은 id 를 가져도 하나로 합쳐지면 안 됨
     a = FakeAdapter("notion", [make_record("x1", "summary", "notion", {"summary_id": "x1"})])
