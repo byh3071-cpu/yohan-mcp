@@ -359,8 +359,11 @@ class StudioAdapter(BackendAdapter):
             # 여기서 '발행됨'으로 기록하면 PR 없는데 멱등 저널이 오염돼 정당한 재시도가 영구 차단된다.
             # → 저널 기록 생략 + published:False 로 재시도 가능 상태 유지.
             if not pr.get("pushed"):
-                return {**base, "published": False, "dry_run": True,
-                        "detail": f"PR push 실패 → 발행 미완료(재시도 가능): {pr.get('pr_url')}",
+                # dry_run=False: 로컬 브랜치/커밋이 남는 부작용이 있으므로 '무변경(dry_run)' 이 아니다.
+                # side_effect 로 잔류 부작용을 명시해 소비자가 orphan 브랜치를 인지하게 한다.
+                return {**base, "published": False, "dry_run": False,
+                        "side_effect": "local_branch_committed",
+                        "detail": f"PR push 실패 → 발행 미완료(로컬 브랜치/커밋 잔류, 재시도 가능): {pr.get('pr_url')}",
                         "errors": [str(pr.get("pr_url") or "push 실패")], "pr": pr}
             self._journal.record({
                 "slug": slug, "content_hash": content_hash, "target_path": str(target),
@@ -385,8 +388,25 @@ class StudioAdapter(BackendAdapter):
             capture_output=True, text=True, check=True,
         )
 
+    def _has_staged_changes(self) -> bool:
+        """스테이지에 커밋할 변경이 있으면 True. `git diff --cached --quiet` 는 변경 있을 때 exit 1.
+
+        check=False 로 돌려 CalledProcessError 를 유발하지 않는다(정상적 '변경 있음' 신호이므로)."""
+        res = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=self.repo_path, capture_output=True, text=True,
+        )
+        return res.returncode != 0
+
     def _publish_pr(self, slug: str, target: Path, mdx: str) -> dict:
-        """git 새 브랜치 → 파일 쓰기 → add/commit/push → PR(base=base_branch). master 직푸시 금지."""
+        """git 새 브랜치 → 파일 쓰기 → add/commit/push → PR(base=base_branch). master 직푸시 금지.
+
+        재진입(재시도) 견고화: 1차에서 push 만 실패하면 로컬 브랜치 `publish/<slug>` 에
+        발행 커밋이 남는다(orphan). 2차에 동일-content 로 재호출하면 기존 브랜치 checkout →
+        동일내용 write → add 후 스테이지가 비어 `git commit` 이 "nothing to commit"(exit 1)로
+        죽고 push 에 영영 도달 못 했다. → 스테이지 변경이 있을 때만 commit 하고, 변경이 없으면
+        (이미 발행 커밋 존재) commit 을 건너뛰고 곧장 push 를 재시도한다.
+        """
         branch = f"publish/{slug}"
         # 새 브랜치(존재하면 체크아웃) — 절대 base_branch 에 직접 쓰지 않는다
         try:
@@ -396,7 +416,10 @@ class StudioAdapter(BackendAdapter):
         self._write_file(target, mdx)
         rel = str(target.relative_to(self.repo_path)) if self.repo_path else str(target)
         self._git("add", rel)
-        self._git("commit", "-m", f"publish: {slug}")
+        # 스테이지 변경이 있을 때만 커밋. 재진입이면 동일-content 라 스테이지가 비어 있고,
+        # 이때 commit 하면 "nothing to commit"(exit 1)으로 죽으므로 건너뛰고 기존 발행 커밋을 push.
+        if self._has_staged_changes():
+            self._git("commit", "-m", f"publish: {slug}")
         pushed = False
         pr_url = None
         try:

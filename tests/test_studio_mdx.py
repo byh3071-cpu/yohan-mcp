@@ -120,7 +120,10 @@ async def test_pr_mode_push_fail_not_published_and_journal_clean(tmp_path):
     a = StudioAdapter(repo_path=str(tmp_path), mode="pr", journal_path=journal)
     res = await a.publish(_summary(), approved=True)
     # push 실패는 '발행됨'이 아니다
-    assert res["published"] is False and res["dry_run"] is True
+    assert res["published"] is False
+    # 로컬 브랜치/커밋이 남는 부작용 → dry_run(무변경) 아님 + side_effect 명시
+    assert res["dry_run"] is False
+    assert res["side_effect"] == "local_branch_committed"
     assert res.get("errors")
     assert res["pr"]["pushed"] is False
     # 멱등 저널 미오염 → 재발행이 already_published(no-op)로 막히지 않는다
@@ -128,6 +131,51 @@ async def test_pr_mode_push_fail_not_published_and_journal_clean(tmp_path):
     res2 = await a.publish(_summary(), approved=True)
     assert res2["already_published"] is False   # no-op 로 막히지 않음 → 재시도 가능
     assert res2["published"] is False
+
+
+def _git_add_bare_origin(repo, bare):
+    """bare repo 를 origin 으로 등록(=원격 장애 복구 시뮬레이션)."""
+    import subprocess
+    subprocess.run(["git", "init", "--bare", str(bare)], capture_output=True, text=True, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)],
+                   cwd=repo, capture_output=True, text=True, check=True)
+
+
+async def test_pr_mode_retry_reaches_push_after_origin_recovers(tmp_path):
+    # 재진입 견고화 회귀: 1차 push 실패로 orphan 발행 커밋만 남고, origin 복구 후
+    # 동일-content 재호출이 'nothing to commit' 폴백에 갇히지 않고 실제 push 에 재도달해야 한다.
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    journal = tmp_path / "pub.jsonl"
+    a = StudioAdapter(repo_path=str(repo), mode="pr", journal_path=journal)
+
+    # 1차: origin 없음 → push 실패, 로컬 브랜치 publish/<slug> + 발행 커밋 잔류
+    res1 = await a.publish(_summary(), approved=True)
+    assert res1["published"] is False and res1["pr"]["pushed"] is False
+    slug = res1["slug"]
+    branch = f"publish/{slug}"
+
+    # 원격 장애 복구: bare repo 를 origin 으로 등록
+    bare = tmp_path / "origin.git"
+    _git_add_bare_origin(repo, bare)
+
+    # 2차: 동일 summary(=동일 content-hash) 재호출 → commit 단계 건너뛰고 push 재도달
+    res2 = await a.publish(_summary(), approved=True)
+    assert res2["already_published"] is False        # 저널 미오염 → no-op 아님
+    assert res2["pr"]["pushed"] is True               # 실제 push 재도달(핵심 회귀 검증)
+    assert res2["published"] is True                  # 발행 완료로 승격
+    assert res2["dry_run"] is False
+
+    # origin 에 실제 발행 브랜치 ref 가 존재해야 한다
+    ls = subprocess.run(["git", "ls-remote", "origin", branch],
+                        cwd=repo, capture_output=True, text=True, check=True)
+    assert branch in ls.stdout                        # origin refs 존재 확인
+
+    # 멱등 저널이 push 성공 시에만 기록됨 → 재재호출은 already_published(no-op)
+    res3 = await a.publish(_summary(), approved=True)
+    assert res3["already_published"] is True and res3["published"] is False
 
 
 # ── tool_publish 봉투 완전성(불변 봉투 + MDX 신호) ─────────────
