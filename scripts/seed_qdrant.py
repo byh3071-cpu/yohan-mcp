@@ -64,8 +64,14 @@ _DEMO_RESOURCES = [
 
 # ── 관제탑 4컬렉션 데모 시드 (로컬/CI 실증 전용, control-tower 실데이터 아님) ──
 # 실소유자는 yohan-control-tower — 이 시드는 get_context 벡터 회수를 로컬에서 재현하기 위한
-# 데모 청크일 뿐이다. 각 청크는 payload._demo=True 로 마킹되어 실데이터와 구분된다.
-# 컬렉션당 1~2개 데모 페이지를 청크 분할해 넣는다(같은 notion_page_id, 고유 point_id).
+# 데모 청크일 뿐이다. 각 청크는 payload._demo=True 로 마킹된다.
+#
+# 안전 설계: 실 관제탑 컬렉션(knowledge_base 등)에는 절대 쓰지 않는다. 아래 키에
+# DEMO_COLLECTION_PREFIX 를 붙인 **데모 전용 컬렉션**(demo_knowledge_base 등)에만
+# 생성·삭제·적재한다 → 실 QDRANT_URL 대상이라도 실데이터 드롭·오염·오차원 생성 0.
+# get_context 로 회수하려면 QDRANT_SEARCH_COLLECTIONS 로 데모 컬렉션을 지정한다(아래 출력 안내).
+DEMO_COLLECTION_PREFIX = "demo_"
+
 _CONTROL_TOWER_DEMO: dict[str, list[tuple[str, list[str]]]] = {
     "knowledge_base": [
         ("kb-attention", [
@@ -100,19 +106,22 @@ _CONTROL_TOWER_DEMO: dict[str, list[tuple[str, list[str]]]] = {
 
 
 async def seed_control_tower_demo(qdrant: QdrantAdapter, rebuild: bool = False) -> int:
-    """관제탑 4컬렉션에 데모 청크를 시드. 반환: 적재한 포인트 수."""
-    print("⚠ 관제탑 데모 시드 — 로컬/CI 실증 전용(control-tower 실데이터 아님, payload._demo=True 마킹).")
-    if qdrant.url:
-        print(f"⚠ 실서버 대상({qdrant.url}) — 데모 청크를 append 한다(기존 삭제 안 함). "
-              "실 컬렉션 차원(bge-m3 1024)과 임베더 차원이 다르면 해당 청크는 스킵된다.")
+    """데모 전용 컬렉션(demo_*)에 관제탑 회수용 데모 청크를 시드. 반환: 적재한 포인트 수.
+
+    실 관제탑 컬렉션(knowledge_base 등)은 건드리지 않는다 — demo_ 접두 컬렉션만 생성/드롭/적재.
+    """
+    print("⚠ 관제탑 데모 시드 — 로컬/CI 실증 전용(실데이터 아님, payload._demo=True 마킹).")
+    print(f"   실 관제탑 컬렉션 불가침 — '{DEMO_COLLECTION_PREFIX}' 접두 데모 컬렉션에만 쓴다.")
     client = qdrant._get_client()
     dim = qdrant.embedder.dim
     print(f"임베더: {qdrant.embedder.name} (dim={dim})")
 
     total = 0
-    for coll, pages in _CONTROL_TOWER_DEMO.items():
+    seeded: list[str] = []
+    for base_coll, pages in _CONTROL_TOWER_DEMO.items():
+        coll = f"{DEMO_COLLECTION_PREFIX}{base_coll}"  # demo_knowledge_base — 실 컬렉션과 이름 충돌 0
         if rebuild and await client.collection_exists(coll):
-            await client.delete_collection(coll)
+            await client.delete_collection(coll)  # 데모 컬렉션만 드롭(실데이터 무관)
         if not await client.collection_exists(coll):
             await client.create_collection(
                 coll, vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE)
@@ -120,7 +129,8 @@ async def seed_control_tower_demo(qdrant: QdrantAdapter, rebuild: bool = False) 
         ok = 0
         for page_id, chunks in pages:
             try:
-                vecs = qdrant.embedder.embed(chunks)
+                # 어댑터 계약과 동일하게 동기 임베딩을 스레드로 — 이벤트루프 블로킹 방지
+                vecs = await asyncio.to_thread(qdrant.embedder.embed, chunks)
             except Exception as exc:  # 임베딩 실패는 해당 페이지만 스킵
                 print(f"  스킵 [{coll}/{page_id}] 임베딩 실패: {type(exc).__name__}: {exc}")
                 continue
@@ -140,7 +150,13 @@ async def seed_control_tower_demo(qdrant: QdrantAdapter, rebuild: bool = False) 
                 print(f"  스킵 [{coll}/{page_id}] upsert 실패: {type(exc).__name__}: {exc}")
         print(f"  {coll}: {ok} 청크 적재")
         total += ok
-    print(f"완료 — 관제탑 데모 청크 {total}개 (컬렉션 {len(_CONTROL_TOWER_DEMO)}개)")
+        if ok:
+            seeded.append(coll)
+    print(f"완료 — 데모 청크 {total}개 (데모 컬렉션 {len(seeded)}개)")
+    if seeded:
+        joined = ",".join(seeded)
+        print("get_context 로 회수하려면 검색 대상에 데모 컬렉션을 지정(PowerShell):")
+        print(f'  $env:QDRANT_SEARCH_COLLECTIONS="{joined}"; python server.py')
     return total
 
 
@@ -193,10 +209,12 @@ async def seed(limit: int | None = None, batch: int = 64, rebuild: bool = False,
 async def _run_control_tower_demo(rebuild: bool) -> None:
     load_dotenv()
     qdrant = QdrantAdapter()
-    if not qdrant.url:
-        print("⚠ QDRANT_URL 미설정 → 임베디드(:memory:) 모드 — 영속되지 않음(데모용).")
-    await seed_control_tower_demo(qdrant, rebuild=rebuild)
-    await qdrant.aclose()
+    try:
+        if not qdrant.url:
+            print("⚠ QDRANT_URL 미설정 → 임베디드(:memory:) 모드 — 영속되지 않음(데모용).")
+        await seed_control_tower_demo(qdrant, rebuild=rebuild)
+    finally:
+        await qdrant.aclose()  # 예외 시에도 클라이언트 정리
 
 
 def main() -> int:

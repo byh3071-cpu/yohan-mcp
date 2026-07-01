@@ -16,7 +16,10 @@ def _isolate_runtime(request, tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_RUNTIME_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("MEMORY_DIR", str(tmp_path / "memory"))
     monkeypatch.delenv("YOHAN_BRAIN_ROOT", raising=False)
-    # integration 마커 테스트는 실 Qdrant 를 써야 하므로 QDRANT_URL 을 보존한다.
-    # 그 외 유닛은 실서버 우발 접속을 막기 위해 삭제(:memory: 강제).
+    # integration 마커 테스트는 실 Qdrant 를 써야 하므로 QDRANT_* 를 보존한다.
+    # 그 외 유닛은 실서버 우발 접속 + .env 누출(예: integration 테스트의 load_dotenv 가
+    # os.environ 에 남긴 QDRANT_COLLECTION/SEARCH_COLLECTIONS)을 막기 위해 삭제한다 —
+    # search_collections/rtype 계산이 .env 값에 오염되면 유닛 단정이 흔들린다(:memory: 강제).
     if request.node.get_closest_marker("integration") is None:
-        monkeypatch.delenv("QDRANT_URL", raising=False)
+        for _k in ("QDRANT_URL", "QDRANT_COLLECTION", "QDRANT_SEARCH_COLLECTIONS"):
+            monkeypatch.delenv(_k, raising=False)

@@ -82,7 +82,12 @@ async def test_integration_get_context_multichunk_on_real_server(tmp_path):
         h = await qa.health_check()
         assert h["ok"] is True and "points" in h["detail"] and "embed=" in h["detail"]
     finally:
+        # 정리 실패가 본문 assertion 예외를 가리지 않도록 각각 삼킨다(false-diagnosis 방지).
         try:
             await qa._get_client().delete_collection(coll)  # 임시 컬렉션 정리
-        finally:
+        except Exception:
+            pass
+        try:
             await qa.aclose()
+        except Exception:
+            pass

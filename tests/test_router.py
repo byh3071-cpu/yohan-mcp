@@ -183,13 +183,19 @@ async def test_router_top_k_zero_returns_empty():
 
 
 async def test_router_top_k_negative_returns_all_fused():
-    # top_k<0 → 절단 안 함(음수 = "모두 반환" 신호). 융합 전량 반환.
-    a = FakeAdapter("notion", recs("notion", ["x1", "x2", "x3"]))
+    # top_k<0 → 절단 안 함(음수 = "무제한, 모두 반환" 신호).
+    # 후보를 6개(>기본 5)로 둬서 음수와 기본을 '구분'해 실증한다:
+    # 기본(top_k=5)은 5개로 절단, -1 은 6개 전량 → 음수가 5로 클램프되는 게 아님을 증명.
+    a = FakeAdapter("notion", recs("notion", ["x1", "x2", "x3", "x4", "x5", "x6"]))
     b = FakeAdapter("memory", recs("memory", ["x2", "x4"]))
     r = SmartRouter({"notion": a, "memory": b}, k=60)
+
     out = await r.search("q", {"top_k": -1})
     ids = {x["id"] for x in out["results"]}
-    assert ids == {"x1", "x2", "x3", "x4"}  # 4 distinct 엔티티 전부 보존(선절단 없음)
-    # 기본(top_k=5)에서도 4개 그대로임을 대조 — 음수가 축소하지 않음을 명확히
-    default_out = await r.search("q")
-    assert {x["id"] for x in default_out["results"]} == ids
+    assert ids == {"x1", "x2", "x3", "x4", "x5", "x6"}  # 6 distinct 전량 보존(선절단 없음)
+    assert len(out["results"]) == 6
+
+    default_out = await r.search("q")  # 기본 top_k=5 → 5개로 절단
+    assert len(default_out["results"]) == 5
+    # 음수(6) > 기본(5) — 음수가 기본값으로 클램프됐다면 둘 다 5라 구분 불가했을 것
+    assert len(out["results"]) > len(default_out["results"])

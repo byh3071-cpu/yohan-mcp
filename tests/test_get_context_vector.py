@@ -6,7 +6,6 @@
 tool_get_context 가 router 를 경유해 같은 페이지의 여러 청크를 붕괴 없이 회수하는지 검증한다.
 :memory: Qdrant + HashEmbedder(결정적, dim 384) 로 인라인 시드 → 외부 의존 0.
 """
-import json as _json
 import uuid as _uuid
 
 import httpx
@@ -77,14 +76,26 @@ async def test_get_context_vector_multichunk_not_collapsed(tmp_path):
 
 
 async def test_get_context_top_k_zero_still_runs_reverse_recall(tmp_path):
-    # top_k=0 이면 벡터 matches 는 0 이지만, 역방향 회수(devlog/patterns)는 별도 경로라 살아있어야 한다.
+    # top_k=0 이면 벡터 matches 는 절단되어 0 이지만, 역방향 회수(devlog/patterns)는 top_k 와
+    # 무관한 별도 경로라 여전히 채워져야 한다. notion mock 을 붙여 '실제로 회수됐는지'를 검증한다
+    # (키 존재만 보면 tool_get_context 가 devlog/patterns 를 항상 []로 초기화해 동어반복이 됨).
     qa = await _seed_qdrant()
-    adapters = {"memory": MemoryAdapter(base_dir=tmp_path), "qdrant": qa}
+    client = httpx.AsyncClient(base_url="https://api.notion.com/v1", transport=httpx.MockTransport(_routed_handler))
+    notion = NotionAdapter(client=client, token="t")
+    notion.db_ids = {}
+    notion.devlog_db_id = "devlogdb"
+    notion.pattern_db_id = "patterndb"
+    adapters = {"notion": notion, "memory": MemoryAdapter(base_dir=tmp_path), "qdrant": qa}
     ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator())
-    env = await T.tool_get_context(ctx, QUERY, {"top_k": 0})
-    assert env["data"]["matches"] == []       # 융합후 절단 0
+
+    env = await T.tool_get_context(ctx, QUERY, {"top_k": 0, "project": "yohan-mcp", "tags": ["MCP"]})
+    await client.aclose()
+
+    assert env["data"]["matches"] == []       # 벡터 매치는 융합후 top_k=0 절단
     assert env["data"]["count"] == 0
-    assert "devlog" in env["data"] and "patterns" in env["data"]  # 키는 항상 존재
+    # 역방향 회수는 top_k 절단과 독립 — 실제로 1건씩 채워졌는지 검증(동어반복 아님)
+    assert len(env["data"]["devlog"]) == 1
+    assert len(env["data"]["patterns"]) == 1
     await qa.aclose()
 
 
