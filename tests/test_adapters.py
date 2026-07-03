@@ -51,6 +51,34 @@ async def test_memory_update_no_profile_pollution(tmp_path):
     assert "status" not in prof and prof["name"] == "yohan"  # profile 미오염
 
 
+async def test_memory_corrupt_yaml_isolated(tmp_path):
+    """손상 YAML 1개가 memory 검색 전체를 죽이면 안 됨 — 해당 파일만 skip (격리)."""
+    m = MemoryAdapter(base_dir=tmp_path)
+    await m.create("decision", {"decision_id": "good", "title": "킵미", "status": "제안"})
+    ddir = tmp_path / "decisions"
+    (ddir / "broken.yaml").write_text("title: 'unterminated\nstatus: [", encoding="utf-8")  # ScannerError
+    (ddir / "scalar.yaml").write_text("그냥 문자열", encoding="utf-8")  # dict 아닌 스칼라
+
+    found = await m.search("킵미")  # ParserError/AttributeError 로 죽지 않아야 함
+    assert [r["id"] for r in found] == ["good"]
+    all_ = await m.search("")  # 전건 나열도 정상 파일만
+    assert any(r["id"] == "good" for r in all_)
+    assert all(r["id"] not in ("broken", "scalar") for r in all_)
+
+
+async def test_memory_corrupt_yaml_update_no_clobber(tmp_path):
+    """손상 YAML 을 {} 취급해 update 로 덮어쓰면 데이터 소실 → 명시적 에러 + 원본 보존."""
+    m = MemoryAdapter(base_dir=tmp_path)
+    ddir = tmp_path / "decisions"
+    ddir.mkdir()
+    original = "title: 'unterminated\nstatus: ["
+    (ddir / "broken.yaml").write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="손상 YAML"):
+        await m.update("broken", {"status": "승인"}, type_="decision")
+    assert (ddir / "broken.yaml").read_text(encoding="utf-8") == original  # 클로버 금지
+
+
 async def test_memory_path_traversal_blocked(tmp_path):
     m = MemoryAdapter(base_dir=tmp_path)
     for bad in ["../evil", "../../evil", "a/b", "C:/Windows/Temp/evil"]:

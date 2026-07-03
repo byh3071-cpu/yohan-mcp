@@ -13,8 +13,10 @@ ADR-008 B.3 — brain(yohan-brain/memory/)은 지식을 `.md`+frontmatter 로 �
 `.md` 를 **읽기 전용**으로 순회해 frontmatter+본문을 레코드로 노출한다(type=`brain:<folder>`,
 스키마 없는 회수용). 쓰기 경로는 무변경 — brain 파일을 건드리지 않는다.
 """
+
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -22,6 +24,8 @@ import yaml
 
 from adapters.base import BackendAdapter, _Timer, health, make_record
 from core.paths import resolve_memory_dir
+
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -36,7 +40,14 @@ _ID_FIELD = {"profile": "name", "decision": "decision_id", "ingest": "ingest_id"
 
 # ADR-008 B.3 — brain memory 에서 읽어올 지식 폴더 allowlist(읽기 전용).
 # 제외: logs·metrics·ops·inbox·templates·core (회수 노이즈·저가치·config 중복).
-_BRAIN_KNOWLEDGE_DIRS = ("decisions", "wiki", "ingest", "knowledge-hub", "projects", "rules")
+_BRAIN_KNOWLEDGE_DIRS = (
+    "decisions",
+    "wiki",
+    "ingest",
+    "knowledge-hub",
+    "projects",
+    "rules",
+)
 # brain 지식노트 본문 상한 — 회수 봉투 토큰 폭증 방지(전문은 data._path 로 접근).
 _MD_BODY_MAX = 4000
 
@@ -77,11 +88,24 @@ class MemoryAdapter(BackendAdapter):
 
     # ── 읽기/검색 ───────────────────────────────────────────────
     def _read_yaml(self, path: Path) -> dict | None:
+        """단일 yaml → dict. 손상/비dict 파일은 None — 해당 파일만 skip(graceful).
+
+        memory/ 는 사람이 손편집하는 SoT 라 깨진 YAML 이 생긴다. 여기서 YAMLError·비dict 를
+        흡수하지 않으면 파일 1개가 _iter_all→search 전체를 죽여 백엔드 회수가 0이 된다(격리 실패).
+        """
         try:
             content = path.read_text(encoding="utf-8")
         except OSError:
             return None
-        return yaml.safe_load(content) or {}
+        try:
+            data = yaml.safe_load(content) or {}
+        except yaml.YAMLError as exc:
+            logger.warning("손상 YAML skip: %s: %s: %s", path, type(exc).__name__, exc)
+            return None
+        if not isinstance(data, dict):
+            logger.warning("비dict YAML skip(%s): %s", type(data).__name__, path)
+            return None
+        return data
 
     @staticmethod
     def _read_md(path: Path) -> dict | None:
@@ -107,7 +131,7 @@ class MemoryAdapter(BackendAdapter):
                     # 본문을 잘라먹거나 스칼라/list 를 필드로 오주입하지 않는다.
                     if isinstance(loaded, dict):
                         fm = loaded
-                        body = "\n".join(lines[i + 1:])
+                        body = "\n".join(lines[i + 1 :])
                     break
         rec = dict(fm)
         rec["body"] = body.strip()[:_MD_BODY_MAX]  # 상한(토큰 폭증 방지)
@@ -183,7 +207,14 @@ class MemoryAdapter(BackendAdapter):
             blob = yaml.safe_dump(data, allow_unicode=True).lower()
             if not q or q in blob:
                 count = blob.count(q) if q else 1
-                hits.append((count, make_record(str(id_), type_, self.name, data, score=float(count))))
+                hits.append(
+                    (
+                        count,
+                        make_record(
+                            str(id_), type_, self.name, data, score=float(count)
+                        ),
+                    )
+                )
         # 매칭 빈도 내림차순 = 백엔드 내 순위
         hits.sort(key=lambda t: -t[0])
         return [rec for _, rec in hits]
@@ -195,7 +226,9 @@ class MemoryAdapter(BackendAdapter):
         id_ = self._id_of(type_, data)
         path = self._path_for(type_, id_)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        path.write_text(
+            yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
         return make_record(str(id_), type_, self.name, data)
 
     async def update(self, id_: str, data: dict, type_: str | None = None) -> dict:
@@ -213,12 +246,17 @@ class MemoryAdapter(BackendAdapter):
             path = self._path_for(t, id_)
             if not path.exists():
                 continue
-            current = self._read_yaml(path) or {}
+            current = self._read_yaml(path)
+            if current is None:
+                # 손상/비dict YAML 을 {} 로 간주해 병합하면 기존 내용을 조용히 덮어씀(데이터 소실)
+                # → 명시적 에러로 사람 복구를 요구한다.
+                raise ValueError(f"손상 YAML 로 update 불가(수동 복구 필요): {path}")
             if single and str(current.get(_ID_FIELD[t], "")) != self._safe_id(id_):
                 continue  # profile 은 id 일치할 때만 (오염 방지)
             current.update(data)
             path.write_text(
-                yaml.safe_dump(current, allow_unicode=True, sort_keys=False), encoding="utf-8"
+                yaml.safe_dump(current, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
             )
             return make_record(str(id_), t, self.name, current)
         raise FileNotFoundError(f"memory 에 id={id_} 엔티티 없음")
