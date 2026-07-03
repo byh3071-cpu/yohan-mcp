@@ -82,6 +82,34 @@ async def test_slug_dedup_suffix_and_contradiction(tmp_path):
     assert (blog / f"{r2['slug']}.mdx").exists()
 
 
+async def test_contradiction_then_same_content_republish_is_noop(tmp_path):
+    """회귀: contradiction 으로 slug-2 발행 후 동일-content 재발행은 no-op 이어야 한다.
+
+    버그였던 동작: already 판정이 base_slug 저널 항목만 봐서 slug-2 기록을 못 찾고
+    매 호출마다 contradiction→_next_slug 로 빠져 slug-3, slug-4 … 중복 파일 무한 생성.
+    """
+    a = StudioAdapter(repo_path=str(tmp_path), mode="file", journal_path=tmp_path / "pub.jsonl")
+    r1 = await a.publish(_summary(summary="첫 번째 본문"), approved=True)
+    r2 = await a.publish(_summary(summary="다른 본문"), approved=True)   # contradiction → slug-2
+    assert r2["contradiction"] is True and r2["slug"].endswith("-2")
+
+    # v2 동일-content 재발행 → 이미 발행됨(no-op), 새 파일 생성 금지
+    r3 = await a.publish(_summary(summary="다른 본문"), approved=True)
+    assert r3["already_published"] is True
+    assert r3["contradiction"] is False
+    assert r3["published"] is False and r3["dry_run"] is True
+    assert r3["slug"] == r2["slug"]                   # 실제 발행됐던 slug 를 가리킴
+
+    # 한 번 더 재발행해도 여전히 no-op (slug-3, slug-4 … 증식 없음)
+    r4 = await a.publish(_summary(summary="다른 본문"), approved=True)
+    assert r4["already_published"] is True and r4["published"] is False
+
+    blog = tmp_path / "src" / "content" / "blog"
+    assert sorted(p.name for p in blog.glob("*.mdx")) == sorted(
+        [f"{r1['slug']}.mdx", f"{r2['slug']}.mdx"]
+    )                                                  # 디스크 파일은 정확히 2개
+
+
 # ── 멱등 (같은 slug+content-hash 면 no-op) ──────────────────────
 async def test_idempotent_no_op_same_content(tmp_path):
     a = StudioAdapter(repo_path=str(tmp_path), mode="file", journal_path=tmp_path / "pub.jsonl")
