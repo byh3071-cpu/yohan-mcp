@@ -329,8 +329,11 @@ async def tool_create(ctx: ToolContext, type_: str, data: dict) -> dict:
     key = f"{type_}:{pk}" if pk else None
     if key:
         cached = ctx.create_store.get(key)
-        if cached is not None:  # 이미 생성됨 — 저장 봉투 그대로(중복 생성 방지)
-            env = dict(cached)
+        # 캐시 히트여도 드라이런 봉투(실생성 0건)이고 지금은 백엔드가 실생성 가능하면
+        # replay 하지 않고 실호출로 진행 — 드라이런 캐시가 실생성을 영구 차단하는 것 방지.
+        # (실생성 봉투가 _emit 되면 fold 마지막 우선으로 드라이런 봉투를 덮는다)
+        if cached is not None and not (cached.get("dry_run") and _backend_can_create(adapter)):
+            env = dict(cached)  # 이미 생성됨 — 저장 봉투 그대로(중복 생성 방지)
             env["idempotent_replay"] = True
             return env
 

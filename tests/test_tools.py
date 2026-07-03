@@ -131,6 +131,33 @@ async def test_tool_create_notion_dry_run_fallback(tmp_path):
     assert env["provenance"]["sources_used"] == ["notion"]
 
 
+async def test_tool_create_dryrun_cache_not_blocking_real_create(tmp_path):
+    """(회귀 YOHA-6) 드라이런 봉투(실생성 0건)가 캐시돼도 백엔드 전환 시 실생성 차단 금지.
+
+    증상: 토큰 미설정 상태에서 create 한 엔티티는 드라이런 봉투가 CreateStore 에 캐시되고,
+    이후 .env 를 채워도 같은 SoT Key 재생성 시 드라이런 봉투만 replay 돼 실생성이 영구 차단됐다.
+    수정: 캐시 히트여도 dry_run 봉투 + 백엔드 실생성 가능이면 replay 대신 실호출로 진행.
+    """
+    ctx = _ctx_with_memory(tmp_path)
+    fake = FakeAdapter("notion")
+    fake.can_create = False  # 토큰 미설정 상태 시뮬레이션
+    ctx.adapters["notion"] = fake
+
+    first = await T.tool_create(ctx, "summary", VALID_SUMMARY)
+    assert first.get("dry_run") is True  # 드라이런 폴백 봉투
+
+    fake.can_create = True  # .env 채움 — 실생성 가능 전환
+    second = await T.tool_create(ctx, "summary", VALID_SUMMARY)
+    assert second.get("dry_run") is None            # 실생성으로 전환됨
+    assert second.get("idempotent_replay") is None  # 드라이런 봉투 replay 아님
+    assert second["provenance"]["sources_used"] == ["notion"]
+
+    # 실생성 봉투가 fold 마지막 우선으로 캐시를 덮음 — 3차부터는 정상 멱등 replay
+    third = await T.tool_create(ctx, "summary", VALID_SUMMARY)
+    assert third.get("idempotent_replay") is True
+    assert third.get("dry_run") is None
+
+
 async def test_tool_create_idempotent_replay(tmp_path):
     """(P6) 같은 SoT Key(type:pk) 재생성 → CreateStore fold+replay(중복 생성 방지)."""
     ctx = _ctx_with_memory(tmp_path)
