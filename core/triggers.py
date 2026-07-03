@@ -403,10 +403,14 @@ class TriggerEngine:
                 self._record(tid, None, "no_new", event_id)
                 return self._skip(tid, "no_new", "watermark 동일 — 신규 입력 없음")
 
-            # 멱등 — run_key 이미 있으면 replay
+            # 멱등 — 처리 성공(processed) run 만 replay.
+            # 실패 봉투(fallback/aborted 등)는 watermark 를 전진시키지 않으므로(아래 418행)
+            # replay 하면 '다음 tick 재시도' 의도가 무효화됨 → 실패 prior 는 체인 재실행.
             run_key = _sha(f"{tid}:{watermark or ''}:{input_hash}")
             prior = self.runs.get(run_key)
-            if prior is not None and not force:
+            if prior is not None and not force and (
+                    prior.get("processed") == 1
+                    or prior.get("status") in ("completed", "pending_approval")):
                 env = dict(prior.get("envelope") or {})
                 env["idempotent_replay"] = True
                 return env

@@ -207,6 +207,36 @@ async def test_failure_isolation(tmp_path, monkeypatch):
     assert by.get("B") == "completed"               # B 는 정상 실행(스케줄러 생존)
 
 
+# ── ⑥-b 실패 봉투는 replay 금지 → 다음 발화에서 재시도 ─────────
+async def test_failed_run_retries_next_fire(tmp_path, monkeypatch):
+    """일시 장애로 폴백된 run 은 run_key replay 대상이 아니며 다음 발화에서 체인을 재실행한다."""
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+    real_ingest = T.tool_ingest
+    calls = {"n": 0}
+
+    async def flaky(ctx_, url, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("일시 네트워크 장애")
+        return await real_ingest(ctx_, url, *a, **k)
+    monkeypatch.setattr(T, "tool_ingest", flaky)
+
+    trig = _iv("rt", "https://e.com/rt")
+    eng = _engine(_ctx(tmp_path, [trig]), tmp_path, max_retries=0)
+    r1 = await eng.fire(trig)
+    assert r1["data"]["status"] == "fallback"        # 1차: 장애 → 폴백(격리)
+    assert r1.get("idempotent_replay") is None
+
+    r2 = await eng.fire(trig)                        # 2차: 장애 복구 → 재시도
+    assert r2.get("idempotent_replay") is None       # 실패 봉투 replay 아님
+    assert r2["data"]["status"] == "completed"
+    assert calls["n"] == 2                           # 체인이 실제로 재호출됨
+
+    r3 = await eng.fire(trig)                        # 3차: 성공 후 watermark 전진 → no_new
+    assert r3["data"]["skip_reason"] == "no_new"
+    assert len([e for e in eng.runs.all() if e.get("processed") == 1]) == 1  # 중복 실행 0 유지
+
+
 # ── ⑦ single-flight 락 ─────────────────────────────────────────
 def test_single_flight_lock_and_stale(tmp_path):
     fresh = lambda: datetime(2026, 6, 9, 10, 0, tzinfo=_KST)  # noqa: E731
