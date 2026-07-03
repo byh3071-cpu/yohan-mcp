@@ -70,7 +70,9 @@ class StudioPublishJournal:
     """발행 멱등 저널 — append-only JSONL(`<MEMORY_DIR>/ops/mcp-runtime/studio_published.jsonl`).
 
     한 줄 = 한 발행 기록 {slug, content_hash, target_path, mode, summary_id, ts}.
-    같은 slug+content_hash 면 이미 발행됨(no-op), 같은 slug 다른 hash 면 contradiction.
+    같은 content_hash 가 base_slug 파생 slug 집합(base, base-2 …) 안에 있으면
+    이미 발행됨(no-op), 같은 base_slug 에 다른 hash 만 있으면 contradiction.
+    (contradiction 발행은 개명된 slug 로 기록되므로 멱등 조회도 파생 집합 전체를 본다.)
     """
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
@@ -309,11 +311,22 @@ class StudioAdapter(BackendAdapter):
         content_hash = hashlib.sha256(mdx.encode("utf-8")).hexdigest()[:16]
 
         entries = self._journal.all()
-        same_slug = [e for e in entries if e.get("slug") == base_slug]
-        already = any(e.get("content_hash") == content_hash for e in same_slug)
+        # 멱등(already) 조회는 base_slug 파생 slug 집합(base, base-2, base-3 …) 전체를 본다.
+        # contradiction 발행 기록은 개명된 slug(base-2)로 저널에 남으므로(아래 record 참조),
+        # base_slug 항목만 보면 동일-content 재발행이 already 매칭에 실패해 매번
+        # contradiction→_next_slug 로 빠져 base-3, base-4 … 중복 파일을 무한 생성한다.
+        family_re = re.compile(rf"^{re.escape(base_slug)}(-\d+)?$")
+        family = [e for e in entries if family_re.match(str(e.get("slug") or ""))]
+        already_entry = next((e for e in family if e.get("content_hash") == content_hash), None)
+        already = already_entry is not None
+        same_slug = [e for e in family if e.get("slug") == base_slug]
         contradiction = (not already) and any(e.get("content_hash") != content_hash for e in same_slug)
 
-        slug = base_slug if not contradiction else self._next_slug(base_slug, entries)
+        if already:
+            # 실제 발행됐던 slug(개명본 포함)를 그대로 보고해 no-op 대상 파일을 정확히 가리킨다.
+            slug = str(already_entry.get("slug") or base_slug)
+        else:
+            slug = base_slug if not contradiction else self._next_slug(base_slug, entries)
         if slug != base_slug:
             post = {**post, "slug": slug, "post_id": post.get("post_id")}
         target = self._target_path(slug)
