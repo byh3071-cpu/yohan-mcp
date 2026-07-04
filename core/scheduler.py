@@ -112,8 +112,11 @@ async def run_trigger(ctx, trigger_id: str, params: dict | None = None) -> dict:
 
     트리거에 policy 가 있으면 그 정책으로 게이트를 평가한다(감사 로그는 ctx.policy 와 공유).
     실행 결과 봉투에 trigger 메타를 덧붙이고, 실행 이력을 trigger_runs.jsonl 에 남긴다.
+    legacy(protocol 키)·P7(target.chain) 두 선언 형식 모두 TriggerEngine 과 같은 규칙으로
+    해소한다(core.triggers._chain_of/_protocol_of 재사용) — 진입점 간 스키마 정합.
     """
     from core import tools as T  # 지연 임포트: tools ↔ scheduler 순환 방지
+    from core import triggers as TR  # 지연 임포트: 체인 해소 규칙 공유(순환 방지)
 
     sched: Scheduler = ctx.scheduler
     trig = sched.get(trigger_id)
@@ -131,13 +134,19 @@ async def run_trigger(ctx, trigger_id: str, params: dict | None = None) -> dict:
         shared_log = getattr(getattr(ctx, "policy", None), "log", None)
         engine = PolicyEngine(trig["policy"], log=shared_log)
 
-    env = await T.tool_run_action(ctx, trig["protocol"], merged, policy=engine)
+    # P7 형식은 protocol 키가 없어 trig["protocol"] 직접 인덱싱은 KeyError(봉투 계약 위반)였다.
+    chain = TR._chain_of(trig)
+    protocol = TR._protocol_of(trig)
+    if chain == "ingest_summarize":  # 프로토콜 미등록 인라인 체인 — TriggerEngine 과 동일 경로
+        env = await TR._chain_ingest_summarize(ctx, merged)
+    else:
+        env = await T.tool_run_action(ctx, protocol, merged, policy=engine)
 
     status = env.get("data", {}).get("status") if isinstance(env.get("data"), dict) else None
     sched.runlog.record({
         "trigger_id": trigger_id,
         "kind": trig.get("kind"),
-        "protocol": trig.get("protocol"),
+        "protocol": protocol or chain,
         "run_id": (env.get("data") or {}).get("run_id"),
         "status": status,
     })

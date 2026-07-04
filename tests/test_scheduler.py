@@ -36,9 +36,9 @@ _TRIGGERS = {
 }
 
 
-def _ctx(tmp_path):
+def _ctx(tmp_path, triggers=None):
     tpath = tmp_path / "triggers.json"
-    tpath.write_text(json.dumps(_TRIGGERS, ensure_ascii=False), encoding="utf-8")
+    tpath.write_text(json.dumps(triggers or _TRIGGERS, ensure_ascii=False), encoding="utf-8")
     adapters = {
         "notion": NotionAdapter(token=""),
         "memory": MemoryAdapter(base_dir=tmp_path),
@@ -105,6 +105,53 @@ async def test_run_trigger_params_override(tmp_path):
     assert env["data"]["status"] == "completed"
     # override 가 트리거 기본 params 를 덮어 결정 초안에 반영
     assert "오버라이드 결정" in env["data"]["result"]["data"]["title"]
+
+
+# ── run_trigger P7 형식(target.chain, protocol 키 없음) ─────────
+# 리포 triggers.json 의 hourly_ingest/nightly_full_loop 와 동형 — 과거 run_trigger 가
+# trig["protocol"] 직접 인덱싱으로 KeyError 'protocol' 즉사하던 회귀 가드.
+_P7_TRIGGERS = {
+    "triggers": [
+        {
+            "id": "p7_ingest", "type": "interval", "enabled": True,
+            "schedule": {"every_sec": 3600},
+            "target": {"chain": "ingest_summarize"},
+            "params": {"url": "https://example.com/feed"},
+        },
+        {
+            "id": "p7_full_loop", "type": "daily", "enabled": True,
+            "schedule": {"at": "02:30", "tz": "Asia/Seoul"},
+            "target": {"chain": "full_loop"},
+            "params": {"url": "https://example.com/nightly"},
+            "policy": {"publish_mode": "dry_run", "require_approval": True},
+        },
+    ]
+}
+
+
+async def test_run_trigger_p7_inline_chain(tmp_path, monkeypatch):
+    """P7 target.chain=ingest_summarize → 인라인 체인 완주(표준 봉투, 예외 없음)."""
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+    ctx = _ctx(tmp_path, triggers=_P7_TRIGGERS)
+    env = await T.tool_run_trigger(ctx, "p7_ingest")
+    assert env["data"]["status"] == "completed"
+    assert env["data"]["chain"] == "ingest_summarize"
+    assert env["trigger"]["id"] == "p7_ingest"
+    # 실행 이력에 해소된 체인이 기록됨(protocol 키 없어도 None 아님)
+    runs = ctx.scheduler.runlog.all()
+    assert runs and runs[-1]["trigger_id"] == "p7_ingest"
+    assert runs[-1]["status"] == "completed" and runs[-1]["protocol"] == "ingest_summarize"
+
+
+async def test_run_trigger_p7_full_loop_gate(tmp_path, monkeypatch):
+    """P7 target.chain=full_loop → 프로토콜 해소 실행 + require_approval 이라 승인큐 폴백."""
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+    ctx = _ctx(tmp_path, triggers=_P7_TRIGGERS)
+    env = await T.tool_run_trigger(ctx, "p7_full_loop")
+    assert env["data"]["status"] == "pending_approval"
+    assert len(ctx.approvals_store.list_pending()) == 1
+    runs = ctx.scheduler.runlog.all()
+    assert runs and runs[-1]["protocol"] == "ingest_summarize_publish"
 
 
 # ── Scheduler 단위 ──────────────────────────────────────────────
