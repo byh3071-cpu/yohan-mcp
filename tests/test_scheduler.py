@@ -36,14 +36,14 @@ _TRIGGERS = {
 }
 
 
-def _ctx(tmp_path, triggers=None):
+def _ctx(tmp_path, triggers=None, studio=None):
     tpath = tmp_path / "triggers.json"
     tpath.write_text(json.dumps(triggers or _TRIGGERS, ensure_ascii=False), encoding="utf-8")
     adapters = {
         "notion": NotionAdapter(token=""),
         "memory": MemoryAdapter(base_dir=tmp_path),
         "qdrant": QdrantAdapter(url=None, embedder=HashEmbedder()),
-        "studio": StudioAdapter(url="", api_key=""),
+        "studio": studio if studio is not None else StudioAdapter(url="", api_key=""),
         "n8n": N8nAdapter(url=""),
     }
     sched = Scheduler(triggers_path=tpath, runlog_path=tmp_path / "trigger_runs.jsonl")
@@ -149,9 +149,40 @@ async def test_run_trigger_p7_full_loop_gate(tmp_path, monkeypatch):
     ctx = _ctx(tmp_path, triggers=_P7_TRIGGERS)
     env = await T.tool_run_trigger(ctx, "p7_full_loop")
     assert env["data"]["status"] == "pending_approval"
+    # require_approval=True 는 TriggerEngine 과 같은 번역(always_gate=is_publish) — 진입점 정합
+    assert env["data"]["policy_decision"]["rule"] == "is_publish"
     assert len(ctx.approvals_store.list_pending()) == 1
     runs = ctx.scheduler.runlog.all()
     assert runs and runs[-1]["protocol"] == "ingest_summarize_publish"
+
+
+# ── run_trigger 선언 publish_mode 정합(YOHA-5 회귀 가드) ────────
+async def test_run_trigger_honors_declared_publish_mode_dry_run(tmp_path, monkeypatch):
+    """publish_mode=dry_run 선언 트리거는 run_trigger 진입점에서도 드라이런 완주 — 실파일 0.
+
+    회귀(YOHA-5): run_trigger 가 선언 publish_mode·policy 번역을 TriggerEngine 과
+    공유하지 않아, 같은 트리거가 엔진 발화(fire)로는 드라이런 완주하는데 run_trigger
+    로는 env 모드(file)로 게이트 pending → 승인 시 실파일이 써졌다(승인자는 dry_run
+    트리거로 알고 승인). 이제 선언 해석은 dispatch_declared_trigger 단일 지점 공유.
+    """
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+    repo = tmp_path / "repo"
+    # 위험 구성 재현: studio 는 env(file) 모드 + 실제 repo_path — 실발행 가능 상태
+    studio = StudioAdapter(repo_path=str(repo), mode="file", journal_path=tmp_path / "pub.jsonl")
+    trig = {"id": "dry_declared", "type": "daily", "enabled": True, "schedule": {"at": "00:00"},
+            "target": {"chain": "full_loop"}, "params": {"url": "https://e.com/dry"},
+            "policy": {"publish_mode": "dry_run", "require_approval": False}}
+    ctx = _ctx(tmp_path, triggers={"triggers": [trig]}, studio=studio)
+
+    env = await T.tool_run_trigger(ctx, "dry_declared")
+    # TriggerEngine.fire(test_full_loop_unmanned_dry_run)와 동일 결과 — 무인 드라이런 완주
+    assert env["data"]["status"] == "completed"
+    assert env["data"]["auto_approved"] is True
+    assert env["dry_run"] is True
+    assert ctx.approvals_store.list_pending() == []          # 승인 큐 폴백 없음
+    blog = repo / "src" / "content" / "blog"
+    assert not blog.exists() or not list(blog.glob("*.mdx"))  # 실파일 0 (선언 dry_run 준수)
+    assert studio.mode == "file"                              # 실행 후 env 모드 복원(누수 없음)
 
 
 # ── Scheduler 단위 ──────────────────────────────────────────────

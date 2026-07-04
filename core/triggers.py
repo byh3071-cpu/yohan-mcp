@@ -337,6 +337,65 @@ async def _chain_ingest_summarize(ctx, params: dict) -> dict:
     )
 
 
+# ── 트리거 선언 해석 — 진입점 공유(단일 지점) ───────────────────────
+def _publish_mode_of(trig: dict) -> str | None:
+    """선언 publish_mode — policy.publish_mode 우선, 없으면 target.publish_mode."""
+    pol = trig.get("policy") or {}
+    tgt = trig.get("target") or {}
+    return pol.get("publish_mode") or tgt.get("publish_mode")
+
+
+def _policy_engine_for(ctx, trig: dict):
+    """선언 policy → PolicyEngine 번역(감사 로그/일일 카운터는 ctx.policy 와 공유).
+
+    - require_approval=True: 트리거발 publish 는 무조건 사람 승인(always_gate) — 무인 통과 금지.
+    - require_approval=False: 권장 자동화 프리셋(드라이런 고품질만 자동, 외부 실발행 게이트).
+    - legacy 명시 정책(auto_approve_when/always_gate 등): 그대로 사용.
+    - 정책 없음: None → 실행부가 ctx.policy 기본(보수적)을 쓴다.
+    """
+    pol = trig.get("policy") or {}
+    shared_log = getattr(getattr(ctx, "policy", None), "log", None)
+    if "require_approval" in pol:
+        if pol.get("require_approval", True):
+            # 트리거발 publish 는 무조건 사람 승인(always_gate) — 무인 통과 금지
+            base = {"auto_approve_when": [], "always_gate": ["is_publish", "external_publish"],
+                    "max_publishes_per_day": 0}
+        else:
+            base = dict(RECOMMENDED_AUTO_POLICY)
+        return PolicyEngine(base, log=shared_log)
+    if pol:  # legacy 명시 정책(auto_approve_when/always_gate 등)
+        return PolicyEngine(pol, log=shared_log)
+    return None  # ctx.policy 기본(보수적)
+
+
+async def dispatch_declared_trigger(ctx, trig: dict, params: dict) -> dict:
+    """선언 트리거(triggers.json) 체인 1회 실행 — **선언 해석의 단일 지점**.
+
+    TriggerEngine(tick/fire/webhook)과 run_trigger(MCP 수동 진입점)가 모두 이 함수를
+    거친다. 같은 선언은 어느 진입점이든 같은 규칙으로 실행된다(설정 정합):
+    체인 해소(_chain_of/_protocol_of) + 정책 번역(_policy_engine_for) +
+    publish_mode 임시 적용. 과거 run_trigger 가 publish_mode·policy 번역을 공유하지
+    않아 같은 dry_run 선언이 진입점에 따라 실발행으로 갈렸다(YOHA-5 회귀 방지).
+    """
+    from core import tools as T  # 지연 임포트: triggers ↔ tools 순환 방지
+    chain = _chain_of(trig)
+    if chain == "ingest_summarize":
+        return await _chain_ingest_summarize(ctx, params)
+    proto = _protocol_of(trig)
+    engine = _policy_engine_for(ctx, trig)
+    # publish_mode 를 이 실행에 한해 studio 어댑터에 반영(끝나면 복원)
+    mode = _publish_mode_of(trig)
+    studio = ctx.adapters.get("studio")
+    prev_mode = getattr(studio, "mode", None)
+    if mode and studio is not None:
+        studio.mode = mode
+    try:
+        return await T.tool_run_action(ctx, proto, params, policy=engine)
+    finally:
+        if mode and studio is not None:
+            studio.mode = prev_mode
+
+
 # ── 트리거 엔진 ─────────────────────────────────────────────────────
 class TriggerEngine:
     """선언 트리거를 실제로 발화시키는 엔진(cron 계열 tick + webhook 핸들러)."""
@@ -470,44 +529,8 @@ class TriggerEngine:
                 delay *= 2
 
     async def _dispatch_chain(self, trig: dict, params: dict) -> dict:
-        from core import tools as T  # 지연 임포트
-        chain = _chain_of(trig)
-        if chain == "ingest_summarize":
-            return await _chain_ingest_summarize(self.ctx, params)
-        proto = _protocol_of(trig)
-        engine = self._policy_for(trig)
-        # publish_mode 를 이 발화에 한해 studio 어댑터에 반영(끝나면 복원)
-        mode = self._publish_mode(trig)
-        studio = self.ctx.adapters.get("studio")
-        prev_mode = getattr(studio, "mode", None)
-        if mode and studio is not None:
-            studio.mode = mode
-        try:
-            return await T.tool_run_action(self.ctx, proto, params, policy=engine)
-        finally:
-            if mode and studio is not None:
-                studio.mode = prev_mode
-
-    # ── 정책/모드 ───────────────────────────────────────────────
-    def _policy_for(self, trig: dict):
-        pol = trig.get("policy") or {}
-        if "require_approval" in pol:
-            if pol.get("require_approval", True):
-                # 트리거발 publish 는 무조건 사람 승인(always_gate) — 무인 통과 금지
-                base = {"auto_approve_when": [], "always_gate": ["is_publish", "external_publish"],
-                        "max_publishes_per_day": 0}
-            else:
-                base = dict(RECOMMENDED_AUTO_POLICY)
-            return PolicyEngine(base, log=self.ctx.policy.log)
-        if pol:  # legacy 명시 정책(auto_approve_when/always_gate 등)
-            return PolicyEngine(pol, log=self.ctx.policy.log)
-        return None  # ctx.policy 기본(보수적)
-
-    @staticmethod
-    def _publish_mode(trig: dict) -> str | None:
-        pol = trig.get("policy") or {}
-        tgt = trig.get("target") or {}
-        return pol.get("publish_mode") or tgt.get("publish_mode")
+        # 선언 해석(체인·정책 번역·publish_mode)은 run_trigger 와 공유하는 단일 지점에 위임
+        return await dispatch_declared_trigger(self.ctx, trig, params)
 
     # ── tick (cron 계열) ────────────────────────────────────────
     async def tick(self, now: datetime | None = None) -> list[dict]:
