@@ -165,6 +165,31 @@ async def test_multiword_substring_limitation_documented(tmp_path):
     assert await qa.search("알파 베타") == []          # 비연속 다어절 → 0(한계 명시)
 
 
+async def test_brain_md_long_line_multiword_not_broken_by_dump_fold(tmp_path):
+    # YOHA-4 회귀 — 본문 긴 줄(80자 초과)에 실재하는 '연속' 다어절 질의는 매칭되어야 함.
+    # 과거 blob(safe_dump)은 width=80 접기로 접점 공백이 개행+들여쓰기가 되어 무음 0건.
+    import re
+
+    import yaml
+
+    body = (
+        "밤샘 루프가 멈춘 근본 원인은 invoke 텍스트 주입이었고 재발 방지를 위해 "
+        "골든쿼리 리콜 실측과 접점 회귀 테스트를 함께 적재해 두기로 결정했다는 기록이다."
+    )
+    (tmp_path / "wiki").mkdir(parents=True)
+    (tmp_path / "wiki" / "long.md").write_text(body, encoding="utf-8")
+    qa = MemoryAdapter(base_dir=tmp_path)
+
+    folded = yaml.safe_dump({"body": body}, allow_unicode=True)  # 구 blob 레시피의 접힘 재현
+    pair = re.search(r"(\S+)\n  (\S+)", folded)
+    assert pair, "전제: 80자 초과 한 줄은 safe_dump 기본 width 에서 접혀야 함"
+    query = f"{pair.group(1)} {pair.group(2)}"
+    assert query in body  # 파일 원문에 실재
+
+    res = await qa.search(query)
+    assert len(res) == 1 and res[0]["data"]["_path"] == "wiki/long.md"
+
+
 async def test_count_ranking(tmp_path):
     # blob 매칭 빈도(count) 내림차순 = 백엔드 내 순위.
     (tmp_path / "wiki").mkdir(parents=True)

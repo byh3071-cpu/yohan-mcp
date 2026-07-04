@@ -233,8 +233,36 @@ class MemoryAdapter(BackendAdapter):
                 # 논리 회수 타입이라 검증 스킵·_links 관계 없음(지식노트는 관계그래프 밖 — 정상).
                 yield f"brain:{kdir}", id_, rec
 
+    @staticmethod
+    def _match_blob(data: dict) -> str:
+        """substring 매칭용 blob — 레코드의 키·스칼라 값을 **원문 그대로** 개행 결합(소문자).
+
+        과거엔 yaml.safe_dump 재직렬화 출력을 blob 으로 썼는데, emitter 출력 포매팅이
+        원문을 변형해 파일에 실재하는 질의가 무음 실패했다(YOHA-4):
+        - 기본 width=80 접기(fold)가 긴 줄의 공백을 개행+들여쓰기로 치환
+          → 접점에 걸친 다어절 질의 0건 + 빈도점수 왜곡.
+        - 따옴표 스타일 이스케이프(작은따옴표 이중화 '' 등)가 문자 자체를 변형.
+        값 문자열을 직접 결합하면 이 직렬화 부작용 클래스 전체가 사라진다.
+        개행 결합은 서로 다른 값이 이어붙어 가짜 인접 매칭이 생기는 것을 막는다.
+        """
+        parts: list[str] = []
+
+        def walk(v) -> None:
+            if isinstance(v, dict):
+                for k, val in v.items():
+                    parts.append(str(k))
+                    walk(val)
+            elif isinstance(v, (list, tuple, set)):
+                for item in v:
+                    walk(item)
+            elif v is not None:
+                parts.append(str(v))
+
+        walk(data)
+        return "\n".join(parts).lower()
+
     async def search(self, query: str, opts: dict | None = None) -> list[dict]:
-        """파일 본문 substring 매칭. opts['type']로 타입 한정 가능."""
+        """레코드 키·값 substring 매칭. opts['type']로 타입 한정 가능."""
         opts = opts or {}
         want_type = opts.get("type")
         q = (query or "").lower()
@@ -246,7 +274,7 @@ class MemoryAdapter(BackendAdapter):
             # 다른 백엔드를 밀어낸다 → 빈 쿼리일 때 brain:* 는 제외(yaml 엔티티만 나열).
             if not q and str(type_).startswith("brain:"):
                 continue
-            blob = yaml.safe_dump(data, allow_unicode=True).lower()
+            blob = self._match_blob(data)
             if not q or q in blob:
                 count = blob.count(q) if q else 1
                 hits.append(
