@@ -4,13 +4,16 @@
 벡터 의미검색. P1 schemas/notion/resource 본문을 임베딩해 적재/검색.
 - env QDRANT_URL (예: http://localhost:6333). 미설정 시 임베디드(:memory:) 폴백.
 - env QDRANT_COLLECTION (기본 yohan_resources).
+- env QDRANT_TYPE_WEIGHTS (JSON dict) — U3 payload type 검색 가중 오버라이드(키 단위 병합).
 - 임베딩은 core.embeddings.get_embedder() (env EMBEDDING_BACKEND).
 - point id = uuid5(resource_url) → 재적재 멱등(SoT Key 패턴).
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import os
 import uuid
 
@@ -29,6 +32,55 @@ BRAIN_MEMORY_COLLECTION = "brain_memory"
 ONTOLOGY_TRIPLES_COLLECTION = "ontology_triples"
 BRAIN_MEMORY_COLLECTIONS = [BRAIN_MEMORY_COLLECTION, ONTOLOGY_TRIPLES_COLLECTION]
 _URL_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # RFC 4122 URL 네임스페이스
+
+# ── U3 — payload type 별 검색 가중 ────────────────────────────────
+# 실측 문제(#34 후속): brain_memory 의미 질의 top-5 를 대량 ingest 청크(RSS 등)가 점유해
+# 고가치 문서(rules/decisions/knowledge-hub)가 밀린다(예: "사람 몸에 비유한 시스템 설계"
+# 질의에서 기대 문서가 #17). payload 의 `type: "brain:<folder>"` 를 근거로 스코어를
+# 곱셈 가중해 컬렉션 병합 정렬 직전에 재순위화한다 — RRF(rank 기반) 융합은 이 정렬
+# 순위를 입력으로 받으므로 가중이 최종 랭킹에 그대로 전파된다.
+# 값은 골든 쿼리 3종 실측 튜닝: 결정·규칙(1.25) > 허브(1.2) > 위키(1.15) 차등 —
+# decisions/rules 를 wiki 보다 위로 둬야 "밤 무인 루프" 질의에서 해당 결정 로그가
+# 위키 일반론 청크에 밀리지 않는다(균등 1.2 로는 top-2 에 그침, 실측).
+# 매핑에 없는 타입(관제탑 컬렉션·ontology_triples·레거시 resource 등)은 1.0(무가중).
+DEFAULT_TYPE_WEIGHTS: dict[str, float] = {
+    "brain:decisions": 1.25,
+    "brain:rules": 1.25,
+    "brain:wiki": 1.15,
+    "brain:knowledge-hub": 1.2,
+    "brain:ingest": 0.85,
+}
+
+
+def load_type_weights() -> dict[str, float]:
+    """DEFAULT_TYPE_WEIGHTS 에 env QDRANT_TYPE_WEIGHTS(JSON dict 문자열)를 키 단위 병합.
+
+    예: QDRANT_TYPE_WEIGHTS='{"brain:ingest": 0.7}' 이면 ingest 감쇠만 0.7 로 바뀌고
+    나머지는 기본값 유지. env 가 무효(JSON 파싱 실패·비dict·유한 양수 아닌 가중)면
+    env **전체**를 버리고 기본값 사용 + 경고 로그 — 부분 적용으로 "설정했다고 믿는데
+    일부만 먹는" 상태를 만들지 않는다.
+    """
+    weights = dict(DEFAULT_TYPE_WEIGHTS)
+    raw = os.getenv("QDRANT_TYPE_WEIGHTS")
+    if not raw:
+        return weights
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise TypeError(f"JSON dict 아님: {type(parsed).__name__}")
+        merged: dict[str, float] = {}
+        for k, v in parsed.items():
+            w = float(v)
+            if not math.isfinite(w) or w <= 0:
+                raise ValueError(f"가중 {k}={v!r} 무효 — 유한 양수만 허용")
+            merged[str(k)] = w
+    except Exception as exc:
+        logger.warning(
+            "QDRANT_TYPE_WEIGHTS 무시(기본 가중 사용): %s: %s", type(exc).__name__, exc
+        )
+        return weights
+    weights.update(merged)
+    return weights
 
 
 class QdrantAdapter(BackendAdapter):
@@ -56,6 +108,8 @@ class QdrantAdapter(BackendAdapter):
         self._owns_client = client is None
         self._embedder = embedder
         self._ensured = False
+        # U3 — payload type 가중(기본 + env QDRANT_TYPE_WEIGHTS 병합). 생성 시 1회 확정.
+        self.type_weights = load_type_weights()
 
     @property
     def embedder(self):
@@ -90,6 +144,15 @@ class QdrantAdapter(BackendAdapter):
     async def _embed(self, texts) -> list[list[float]]:
         # 임베딩(동기 CPU/네트워크)을 스레드로 보내 이벤트루프 블로킹 방지
         return await asyncio.to_thread(self.embedder.embed, list(texts))
+
+    def _type_weight(self, payload: dict) -> float:
+        """payload["type"](예: "brain:decisions") 기준 가중. 매핑에 없으면 1.0.
+
+        관제탑 컬렉션·ontology_triples·레거시 resource 는 payload 에 type 키가
+        없거나 문자열이 아니므로 자연히 1.0(무가중)이 된다.
+        """
+        t = payload.get("type")
+        return self.type_weights.get(t, 1.0) if isinstance(t, str) else 1.0
 
     async def _collection_dim(self, client, coll: str | None = None) -> int | None:
         try:
@@ -184,8 +247,14 @@ class QdrantAdapter(BackendAdapter):
                 # payload(data)에 그대로 남아 provenance·역참조에 쓰인다.
                 rid = str(p.id)
                 score = float(p.score) if p.score is not None else None  # None-safe(BLOCKER-1)
+                # U3 — payload type 가중을 병합 정렬 '직전' score 에 곱해 재순위화.
+                # 양수 score 에만 적용 — COSINE 음수 score 에 곱하면 부스트/감쇠가
+                # 역전된다(0.85×음수 = 상승). 음수 후보는 원점수 유지(랭킹 하위권).
+                if score is not None and score > 0:
+                    score *= self._type_weight(payload)
                 records.append(make_record(rid, rtype, self.name, payload, score=score))
         # 컬렉션 간 병합 — score 내림차순이 곧 RRF 입력 순위(base.py 계약). None 은 맨 뒤.
+        # U3 가중이 이미 곱해진 score 로 정렬하므로 type 부스트/감쇠가 RRF 입력 순위에 반영된다.
         records.sort(key=lambda r: r["score"] if r["score"] is not None else float("-inf"), reverse=True)
         # fetch_k 로만 상한(후보풀 크기). 최종 top_k 절단은 router 가 RRF 융합 이후 적용.
         return records[:fetch_k]

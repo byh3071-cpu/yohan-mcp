@@ -18,6 +18,8 @@ Thumbs.db
 
 # 도구 캐시
 .serena/
+# U8 증분 시딩 매니페스트 등 로컬 캐시(scripts/seed_brain_memory.py)
+.cache/
 
 # Cursor MCP — 로컬 경로·시크릿 (example 만 커밋, E5-04)
 .cursor/mcp.json

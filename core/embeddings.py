@@ -95,11 +95,34 @@ class OpenAIEmbedder:
         return [d["embedding"] for d in resp.json()["data"]]
 
 
+def _ollama_timeout(default: float = 60.0) -> float:
+    """env OLLAMA_TIMEOUT 초 파싱 — 무효값(비수치/0 이하)은 기본 60초 폴백 + 경고.
+
+    대량 시딩 배치(큰 원자 청크×배치)가 CPU 에서 60초를 넘겨 ReadTimeout 으로 죽는
+    실측 사례(U8 전량 시드) 때문에 조절 가능하게 한다. env 오타가 시딩을 조용히
+    죽이지 않도록 무효값은 예외가 아니라 기본값 폴백이다.
+    """
+    raw = os.getenv("OLLAMA_TIMEOUT")
+    if not raw:
+        return default
+    try:
+        timeout = float(raw)
+        if not timeout > 0:  # 0/음수/NaN 전부 거부(NaN 은 비교가 False)
+            raise ValueError(raw)
+    except ValueError:
+        logger.warning("OLLAMA_TIMEOUT 무효(%r) → 기본 %s초", raw, default)
+        return default
+    return timeout
+
+
 class OllamaEmbedder:
     """로컬 ollama 서버 임베딩 (REST /api/embed, 모델 기본 bge-m3).
 
     - url   : env OLLAMA_URL (기본 http://localhost:11434)
     - model : env EMBEDDING_MODEL (기본 bge-m3, dim 1024)
+    - timeout : env OLLAMA_TIMEOUT 초(기본 60) — 대량 시딩 배치(큰 원자 청크×배치)가
+      CPU 에서 60초를 넘겨 ReadTimeout 으로 죽는 실측 사례가 있어 조절 가능하게 한다
+      (seed_brain_memory 전량 시드는 OLLAMA_TIMEOUT=300 권장).
     dim 은 생성자에서 1건 임베딩으로 실측한다 → 모델 교체에 자동 적응.
     모델 미설치/서버 다운이면 생성자에서 예외 → get_embedder 가 hash 로 폴백.
     embed 은 동기 호출(qdrant_adapter 가 asyncio.to_thread 로 감쌈).
@@ -112,8 +135,8 @@ class OllamaEmbedder:
 
         self.model_name = model_name or os.getenv("EMBEDDING_MODEL", "bge-m3")
         self.url = (url if url is not None else os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip("/")
-        # 첫 호출은 모델 로딩이 끼어 느릴 수 있어 타임아웃을 넉넉히
-        self._client = client or httpx.Client(base_url=self.url, timeout=60.0)
+        # 첫 호출은 모델 로딩이 끼어 느릴 수 있어 타임아웃을 넉넉히 (env OLLAMA_TIMEOUT 조절).
+        self._client = client or httpx.Client(base_url=self.url, timeout=_ollama_timeout())
         # dim 실측 — 모델 미설치면 여기서 예외가 나 폴백을 유도한다
         self.dim = len(self._embed_batch(["dim probe"])[0])
 

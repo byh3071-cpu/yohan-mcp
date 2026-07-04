@@ -17,10 +17,18 @@
 멱등: point id = uuid5(고정 네임스페이스, 안정 키) — memory 는 "path#chunk{i}", triples 는
 "subject|relation|object". 같은 입력을 몇 번 재시딩해도 포인트 수가 늘지 않는다(upsert).
 
+증분(U8): memory 서브커맨드는 파일별 sha256(원본 바이트)을 로컬 매니페스트
+`.cache/brain_seed_manifest.json`(mcp 레포 내, gitignore)에 기록한다. 재실행 시 hash 불변
+파일은 임베딩 없이 스킵하고 변경/신규만 재임베딩한다 — 전량(~25분)이 무변경 재실행 시
+수 초로 준다. 삭제된 파일·축소된 파일의 잔존(stale) 포인트는 **목록만 보고**하고 자동
+삭제하지 않는다(삭제는 사람 판단). `--full` 로 hash 스킵 없이 전량 재임베딩을 강제한다.
+매니페스트는 collection/embedder/dim/base 가 현재 실행과 다르면 통째로 무효 처리(전량).
+
 사용법:
-  python scripts/seed_brain_memory.py                    # brain_memory 전체 시드
+  python scripts/seed_brain_memory.py                    # brain_memory 증분 시드(기본)
+  python scripts/seed_brain_memory.py --full             # hash 스킵 없이 전량 재임베딩
   python scripts/seed_brain_memory.py --limit 20         # 파일 20건만(테스트용)
-  python scripts/seed_brain_memory.py --rebuild          # 컬렉션 삭제 후 재생성
+  python scripts/seed_brain_memory.py --rebuild          # 컬렉션 삭제 후 재생성(매니페스트 리셋)
   python scripts/seed_brain_memory.py triples            # ontology_triples 시드
   python scripts/seed_brain_memory.py triples --rebuild
 """
@@ -28,6 +36,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
 import logging
 import sys
 import uuid
@@ -51,7 +61,7 @@ from adapters.qdrant_adapter import (
     QdrantAdapter,
 )
 from core.chunking import chunk_markdown
-from core.paths import resolve_memory_dir
+from core.paths import ROOT, resolve_memory_dir
 from core.triple_map import parse_triple_map, sentence_for_triple
 
 logger = logging.getLogger(__name__)
@@ -60,6 +70,52 @@ logger = logging.getLogger(__name__)
 _NS = uuid.uuid5(uuid.NAMESPACE_URL, "yohan-mcp/brain-memory-seed")
 
 BATCH_SIZE = 32  # ollama 배치 임베딩 크기(진행률 출력 겸용) — 첫 배치가 느리면 줄여서 재시도.
+
+# U8 — 증분 시딩 매니페스트(파일 상대경로 → sha256/청크수). memory/ 밖(mcp 레포 내 .cache/,
+# gitignore)에 두어 brain SoT 를 오염시키지 않는다. CLI 기본 경로 — 라이브러리 호출(테스트)은
+# manifest_path 를 직접 주입하거나 None(증분 비활성·현행 전량 동작)으로 쓴다.
+DEFAULT_MANIFEST_PATH = ROOT / ".cache" / "brain_seed_manifest.json"
+_MANIFEST_VERSION = 1
+
+
+def _load_manifest(path: Path | None, *, collection: str, embedder: str, dim: int, base: str) -> dict:
+    """매니페스트 로드 + 환경 정합 검증. 없거나 무효면 빈 files 로 시작(=전량 처리).
+
+    collection/embedder/dim/base 중 하나라도 현재 실행과 다르면 그 매니페스트의 hash 는
+    "지금 Qdrant 컬렉션에 이 임베딩이 들어있다"는 증거가 못 되므로 통째로 버린다.
+    """
+    empty = {
+        "version": _MANIFEST_VERSION, "collection": collection,
+        "embedder": embedder, "dim": dim, "base": base, "files": {},
+    }
+    if path is None or not path.exists():
+        return empty
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"매니페스트 손상 → 전량 처리: {path} ({type(exc).__name__}: {exc})")
+        return empty
+    for key, want in (
+        ("version", _MANIFEST_VERSION), ("collection", collection),
+        ("embedder", embedder), ("dim", dim), ("base", base),
+    ):
+        if data.get(key) != want:
+            print(f"매니페스트 환경 불일치({key}: {data.get(key)!r} != {want!r}) → 전량 처리")
+            return empty
+    files = data.get("files")
+    if not isinstance(files, dict):
+        return empty
+    # 항목 shape 방어 — 손편집 등으로 비dict 항목이 섞이면 그 항목만 버린다(전량 재처리 유도).
+    data["files"] = {k: v for k, v in files.items() if isinstance(v, dict)}
+    return data
+
+
+def _save_manifest(path: Path, manifest: dict) -> None:
+    """원자적 저장(tmp 쓰기 → replace) — 크래시로 잘린 JSON 이 다음 실행을 오염시키지 않게."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(path)
 
 
 class HardFailEmbedderError(RuntimeError):
@@ -108,6 +164,8 @@ async def seed_memory(
     rebuild: bool = False,
     allow_fallback: bool = False,
     batch_size: int = BATCH_SIZE,
+    full: bool = False,
+    manifest_path: "Path | None" = None,
     qdrant: "QdrantAdapter | None" = None,
     base_dir: "Path | None" = None,
 ) -> dict:
@@ -117,7 +175,15 @@ async def seed_memory(
     offset/limit — 대량 재실행 시 파일 목록을 슬라이스해 여러 번에 나눠 돌릴 수 있게 한다(예:
     CPU 임베딩이 느려 1회 실행이 오래 걸릴 때). point id 가 경로+청크인덱스 결정적이라 슬라이스를
     나눠 돌려도 멱등 — 어느 슬라이스를 몇 번 반복해도 안전하다.
-    반환: {"embedder","dim","files","skipped_files","chunks","collection"}.
+
+    U8 증분 — manifest_path 지정 시 파일별 sha256 을 매니페스트에 기록하고, 재실행에서
+    hash 불변 파일은 임베딩 없이 스킵한다(full=True 면 스킵 없이 전량 재임베딩). 매니페스트
+    갱신은 파일 단위 원자적: 파일의 모든 청크가 Qdrant upsert 로 반영된 flush 시점에만
+    기록·저장되므로 중간 크래시 후 재실행이 미완 파일을 자동으로 다시 임베딩한다.
+    삭제된 파일·청크 수가 줄어든 파일의 잔존(stale) 포인트는 목록으로 보고만 하고 절대
+    자동 삭제하지 않는다(삭제는 사람 판단). manifest_path=None 이면 증분 비활성(현행 전량).
+    반환: {"embedder","dim","files","skipped_files","chunks","collection",
+           "new_files","reembedded_files","unchanged_files","deleted","stale_chunks","manifest"}.
     """
     base = base_dir or resolve_memory_dir()
     owns_adapter = qdrant is None
@@ -133,6 +199,20 @@ async def seed_memory(
         await qdrant.ensure_collection()
         client = qdrant._get_client()
 
+        # ── U8 매니페스트 — collection/embedder/dim/base 불일치면 통째 무효(전량) ──
+        manifest = _load_manifest(
+            manifest_path, collection=qdrant.collection,
+            embedder=qdrant.embedder.name, dim=qdrant.embedder.dim,
+            base=str(base.resolve()),
+        )
+        if rebuild:
+            manifest["files"] = {}  # 컬렉션을 지웠으므로 과거 적재 증거도 무효
+            if manifest_path is not None:
+                _save_manifest(manifest_path, manifest)
+        known: dict[str, dict] = manifest["files"]
+        if manifest_path is not None:
+            print(f"{'전량(--full)' if full else '증분'} 시딩 — 매니페스트 {manifest_path} (기존 {len(known)}건)")
+
         all_files = list(_iter_brain_md_files(base))
         files = all_files[offset:]
         if limit:
@@ -141,39 +221,70 @@ async def seed_memory(
             f"대상 파일: {len(files)}건(전체 {len(all_files)}건 중 offset={offset}) "
             f"(allowlist: {', '.join(_BRAIN_KNOWLEDGE_DIRS)})"
         )
+        # 삭제 감지는 슬라이스 전 디스크 전수 기준 — limit/offset 분할 실행이 삭제로 오인되지 않게.
+        disk_rels = {str(p.relative_to(base)).replace("\\", "/") for _, p in all_files}
 
         total_chunks = 0
         skipped_files = 0
+        n_new = n_reembed = n_unchanged = 0
+        stale_chunks: list[dict] = []
         pending_meta: list[tuple[str, dict]] = []
         pending_texts: list[str] = []
+        staged_entries: dict[str, dict] = {}  # 전 청크가 pending 에 들어간 파일만 스테이징
 
         async def _flush() -> None:
             nonlocal pending_meta, pending_texts, total_chunks
-            if not pending_texts:
-                return
-            vecs = await asyncio.to_thread(qdrant.embedder.embed, pending_texts)
-            points = [
-                models.PointStruct(id=pid, vector=vecs[i], payload=payload)
-                for i, (pid, payload) in enumerate(pending_meta)
-            ]
-            await client.upsert(qdrant.collection, points=points)
-            total_chunks += len(points)
-            pending_meta = []
-            pending_texts = []
+            if pending_texts:
+                vecs = await asyncio.to_thread(qdrant.embedder.embed, pending_texts)
+                points = [
+                    models.PointStruct(id=pid, vector=vecs[i], payload=payload)
+                    for i, (pid, payload) in enumerate(pending_meta)
+                ]
+                await client.upsert(qdrant.collection, points=points)
+                total_chunks += len(points)
+                pending_meta = []
+                pending_texts = []
+            # 증분 커밋 — 이 시점에 staged 파일의 모든 청크는 위 upsert 로 반영 완료.
+            # (스테이징은 파일의 전 청크가 pending 에 들어간 뒤에만 하므로, pending 을
+            # 전부 비운 지금은 staged 파일 전부가 Qdrant 에 존재한다 — 파일 단위 원자성.)
+            if staged_entries:
+                known.update(staged_entries)
+                staged_entries.clear()
+                if manifest_path is not None:
+                    _save_manifest(manifest_path, manifest)
 
         for i, (kdir, path) in enumerate(files, 1):
+            rel = str(path.relative_to(base)).replace("\\", "/")
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                skipped_files += 1
+                print(f"  스킵 [{i}/{len(files)}] {path}: 읽기 실패")
+                continue
+            sha = hashlib.sha256(raw).hexdigest()
+            prev = known.get(rel)
+            if not full and prev is not None and prev.get("sha256") == sha:
+                n_unchanged += 1  # hash 불변 — 임베딩/upsert 없이 스킵(U8)
+                continue
             rec = MemoryAdapter._read_md_uncapped(path)
             if rec is None:
                 skipped_files += 1
                 print(f"  스킵 [{i}/{len(files)}] {path}: 읽기 실패")
                 continue
             body = rec.get("body", "")
-            rel = str(path.relative_to(base)).replace("\\", "/")
             title = _title_of(rel, rec)
             base_line = int(rec.get("_body_start_line", 1))
             chunks = chunk_markdown(body, base_line=base_line)
-            if not chunks:
-                continue
+            if prev is None:
+                n_new += 1
+            else:
+                n_reembed += 1
+                old_n = int(prev.get("chunks", 0))
+                if len(chunks) < old_n:
+                    # 청크 수 축소 — path#chunk{new}..{old-1} 포인트가 옛 내용으로 잔존(stale).
+                    stale_chunks.append(
+                        {"path": rel, "old_chunks": old_n, "new_chunks": len(chunks)}
+                    )
             for idx, ch in enumerate(chunks):
                 pid = str(uuid.uuid5(_NS, f"{rel}#chunk{idx}"))
                 payload = {
@@ -188,21 +299,48 @@ async def seed_memory(
                 pending_texts.append(ch.text)
                 if len(pending_texts) >= batch_size:
                     await _flush()
+            # 파일의 모든 청크가 pending 에 들어간 뒤에만 스테이징(0청크 파일도 기록해
+            # 다음 실행에서 재파싱을 건너뛴다) — 커밋은 _flush 가 upsert 완료 후 수행.
+            staged_entries[rel] = {"sha256": sha, "chunks": len(chunks)}
             if i % 20 == 0 or i == len(files):
                 print(f"  진행 {i}/{len(files)} 파일 (누적 청크 {total_chunks + len(pending_texts)})")
 
         await _flush()
+
+        # ── stale 보고(자동 삭제 금지 — 삭제는 사람) ──
+        deleted = sorted(set(known) - disk_rels)
+        if deleted:
+            print(f"삭제 감지 {len(deleted)}건 — Qdrant 포인트는 자동 삭제하지 않음(삭제는 사람):")
+            for rel in deleted:
+                n = int(known[rel].get("chunks", 0))
+                print(f"  - {rel} (잔존 포인트 {n}개, id=uuid5(시드NS, '{rel}#chunk0..{max(n - 1, 0)}'))")
+        if stale_chunks:
+            print(f"축소 파일 stale 청크 {len(stale_chunks)}건 — 자동 삭제하지 않음(삭제는 사람):")
+            for s in stale_chunks:
+                print(
+                    f"  - {s['path']}: 청크 {s['old_chunks']} → {s['new_chunks']} "
+                    f"(chunk{s['new_chunks']}..{s['old_chunks'] - 1} 잔존)"
+                )
+
+        processed = len(files) - skipped_files - n_unchanged
         print(
-            f"완료 — 파일 {len(files) - skipped_files}건 처리(스킵 {skipped_files}), "
+            f"완료 — 파일 {processed}건 처리(신규 {n_new}·재임베딩 {n_reembed}·"
+            f"무변경 스킵 {n_unchanged}·읽기실패 {skipped_files}), "
             f"청크 {total_chunks}개 적재 → '{qdrant.collection}'"
         )
         return {
             "embedder": qdrant.embedder.name,
             "dim": qdrant.embedder.dim,
-            "files": len(files) - skipped_files,
+            "files": processed,
             "skipped_files": skipped_files,
             "chunks": total_chunks,
             "collection": qdrant.collection,
+            "new_files": n_new,
+            "reembedded_files": n_reembed,
+            "unchanged_files": n_unchanged,
+            "deleted": deleted,
+            "stale_chunks": stale_chunks,
+            "manifest": str(manifest_path) if manifest_path is not None else None,
         }
     finally:
         if owns_adapter:
@@ -279,7 +417,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="yohan-brain memory/ → Qdrant 벡터 인제스트(기본: brain_memory 시드)")
     ap.add_argument("--limit", type=int, default=None, help="처리 파일 수 제한(테스트용, memory 전용)")
     ap.add_argument("--offset", type=int, default=0, help="파일 목록 시작 오프셋(대량 재실행 분할용, memory 전용)")
-    ap.add_argument("--rebuild", action="store_true", help="컬렉션 삭제 후 재생성(차원 변경 시)")
+    ap.add_argument("--rebuild", action="store_true", help="컬렉션 삭제 후 재생성(차원 변경 시, 매니페스트 리셋)")
+    ap.add_argument(
+        "--full", action="store_true",
+        help="U8 증분 스킵 없이 전량 재임베딩 강제(매니페스트는 갱신됨, memory 전용)",
+    )
     ap.add_argument(
         "--allow-fallback", action="store_true", dest="allow_fallback",
         help="하드페일 가드 우회 — ollama/1024d 아니어도 강제 진행(테스트/오프라인 전용, 실사용 금지)",
@@ -304,6 +446,7 @@ def main() -> int:
             await seed_memory(
                 limit=args.limit, offset=args.offset, rebuild=args.rebuild,
                 allow_fallback=args.allow_fallback, batch_size=args.batch_size,
+                full=args.full, manifest_path=DEFAULT_MANIFEST_PATH,  # CLI 는 항상 증분(U8)
             )
 
     asyncio.run(_run())
