@@ -405,6 +405,9 @@ class StudioAdapter(BackendAdapter):
         return subprocess.run(
             ["git", *args], cwd=self.repo_path,
             capture_output=True, text=True, check=True, timeout=_GIT_TIMEOUT,
+            # git 출력은 UTF-8(로케일 무관). encoding 미지정 시 cp949 로케일에서 reader 스레드가
+            # UTF-8 한글을 만나 UnicodeDecodeError 로 죽고 stdout/stderr 가 조용히 None 이 된다.
+            encoding="utf-8", errors="replace",
         )
 
     def _has_staged_changes(self) -> bool:
@@ -414,6 +417,7 @@ class StudioAdapter(BackendAdapter):
         res = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=self.repo_path, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
+            encoding="utf-8", errors="replace",
         )
         return res.returncode != 0
 
@@ -456,6 +460,7 @@ class StudioAdapter(BackendAdapter):
                      "--title", f"publish: {slug}", "--body", "yohan-mcp 자동 발행 초안"],
                     cwd=self.repo_path, capture_output=True, text=True, check=True,
                     timeout=_GIT_TIMEOUT,
+                    encoding="utf-8", errors="replace",
                 )
                 pr_url = (res.stdout or "").strip() or pr_url
             except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
