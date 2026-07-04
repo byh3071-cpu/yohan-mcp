@@ -23,9 +23,11 @@ P5 는 트리거를 **선언**(triggers.json)하고 수동 진입점(run_trigger
 """
 from __future__ import annotations
 
+import asyncio
 import errno
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import signal
@@ -428,7 +430,10 @@ class TriggerEngine:
         self.runs = TriggerRuns(d / "trigger_runs.jsonl")
         self.locks_dir = d / "locks"
         self._now = now or _now_kst
-        self._sleep = sleep if sleep is not None else __import__("time").sleep
+        # 백오프 sleep 기본값은 asyncio.sleep — _run_chain 이 async 라 동기 time.sleep 이면
+        # 서버 이벤트루프 전체가 정지한다(다른 MCP 요청·헬스체크 블로킹). 주입은 동기 콜러블
+        # (테스트 lambda)·async 콜러블 모두 허용 — 호출부에서 awaitable 이면 await 한다.
+        self._sleep = sleep if sleep is not None else asyncio.sleep
         self._secret = secret
         self._max_retries = max_retries
 
@@ -522,7 +527,7 @@ class TriggerEngine:
             lock.release()
 
     async def _run_chain(self, trig: dict, params: dict) -> dict:
-        """체인 실행 + 지수 백오프 재시도. 한도 초과 시 드라이런 폴백 봉투."""
+        """체인 실행 + 지수 백오프 재시도(비블로킹). 한도 초과 시 드라이런 폴백 봉투."""
         attempts = 0
         delay = 1
         while True:
@@ -537,7 +542,9 @@ class TriggerEngine:
                         reasoning_steps=[f"{attempts - 1}회 재시도 후 드라이런 폴백"],
                         dry_run=True, errors=[f"{type(exc).__name__}: {exc}"],
                     )
-                self._sleep(delay)
+                wait = self._sleep(delay)
+                if inspect.isawaitable(wait):  # 기본 asyncio.sleep — 루프 양보(비블로킹)
+                    await wait
                 delay *= 2
 
     async def _dispatch_chain(self, trig: dict, params: dict) -> dict:
@@ -599,7 +606,6 @@ class TriggerEngine:
     # ── run_forever (데몬, graceful shutdown) ──────────────────
     def run_forever(self, *, poll_sec: float = 1.0) -> None:  # pragma: no cover
         """SIGINT/SIGTERM 까지 tick 루프. 진행 중 run 저널 flush 후 종료."""
-        import asyncio
         stop = {"flag": False}
 
         def _handler(_signum, _frame):

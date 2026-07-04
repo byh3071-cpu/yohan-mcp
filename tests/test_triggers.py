@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """트리거 실발화 엔진 (P7) — 로드/due/멱등/always_gate/HMAC/실패격리/락/watermark/완결루프."""
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -392,6 +394,39 @@ async def test_summary_create_validation_failure_aborts_no_watermark(tmp_path, m
     r2 = await eng.fire(trig)                            # 같은 입력 재발화 → 스킵 아닌 재실행
     assert (r2["data"] or {}).get("skip_reason") != "no_new"
     assert r2["data"]["status"] == "aborted"
+
+# ── ⑥-c 재시도 백오프가 이벤트루프를 블로킹하지 않는다 ─────────
+async def test_retry_backoff_does_not_block_event_loop(tmp_path, monkeypatch):
+    """sleep 미주입(서버 실경로와 동일) 기본값이 asyncio.sleep — 백오프 중 다른 태스크가 계속 돈다.
+
+    회귀: 기본값이 time.sleep 이던 시절, 실패 체인 1건의 백오프(1s)마다 루프 전체가
+    정지해 다른 MCP 요청·헬스체크가 멈췄다(하트비트 0틱 실측).
+    """
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+
+    async def boom(ctx_, url, *a, **k):
+        raise RuntimeError("지속 장애")
+    monkeypatch.setattr(T, "tool_ingest", boom)
+
+    trig = _iv("nb", "https://e.com/nb")
+    eng = TriggerEngine(_ctx(tmp_path, [trig]), data_dir=tmp_path / "tdata", max_retries=1)
+
+    ticks = {"n": 0}
+
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(0.02)
+            ticks["n"] += 1
+
+    hb = asyncio.create_task(heartbeat())
+    try:
+        env = await eng.fire(trig)                   # 실패 → 백오프 1s → 재실패 → 폴백
+    finally:
+        hb.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
+    assert env["data"]["status"] == "fallback"
+    assert ticks["n"] >= 5                           # time.sleep 블로킹이면 0틱 근처
 
 
 # ── ⑦ single-flight 락 ─────────────────────────────────────────
