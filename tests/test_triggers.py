@@ -5,6 +5,7 @@ import hmac
 import json
 from datetime import datetime, timedelta, timezone
 
+from adapters.base import make_record
 from adapters.memory_adapter import MemoryAdapter
 from adapters.n8n_adapter import N8nAdapter
 from adapters.notion_adapter import NotionAdapter
@@ -315,6 +316,82 @@ async def test_full_loop_aborted_run_retries_next_fire(tmp_path, monkeypatch):
 
     r3 = await eng.fire(trig)                        # 3차: watermark 전진 → no_new
     assert r3["data"]["skip_reason"] == "no_new"
+
+# ── ⑥-c summary create 실패는 completed 위장 금지 → watermark 미전진·재시도 ──
+class _SummaryFailingNotion:
+    """summary create 만 죽는 notion(백엔드 장애 시뮬레이션) — ingest 의 resource 적재는 성공.
+
+    can_create=True 라 tool_create 가 드라이런 폴백 없이 실호출 분기로 들어가고,
+    거기서 예외 → tools.py 가 data=None 실패 봉투로 격리한다(예외 미전파 계약).
+    """
+    can_create = True
+
+    def __init__(self):
+        self.fail_summary = True
+
+    async def create(self, type_, data):
+        if type_ == "summary" and self.fail_summary:
+            raise RuntimeError("notion 503(일시 장애)")
+        pk = str(data.get("summary_id") or data.get("resource_id") or "x")
+        return make_record(pk, type_, "notion", data)
+
+
+async def test_summary_create_backend_failure_aborts_then_retries(tmp_path, monkeypatch):
+    """(회귀 YOHA-2) summary create 백엔드 장애 → aborted 보고·watermark 미전진·다음 발화 재시도.
+
+    증상: ingest 성공 후 tool_create 가 백엔드 예외를 data=None 봉투로 격리하면
+    체인이 status=completed·errors 미전파로 감싸 watermark 가 전진 → 같은 입력은
+    이후 영원히 no_new 스킵(요약 조용히 소실, 재시도 0회 — 무인 루프 영구 데이터 소실).
+    """
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+    trig = _iv("sc", "https://e.com/sc")
+    ctx = _ctx(tmp_path, [trig])
+    notion = _SummaryFailingNotion()
+    ctx.adapters["notion"] = notion
+    eng = _engine(ctx, tmp_path)
+
+    r1 = await eng.fire(trig)
+    assert r1["data"]["status"] == "aborted"             # completed 위장 금지
+    assert r1["data"]["stage"] == "summary_create"
+    assert r1["data"]["resource_id"]                     # 수집은 성공 — 고아 리소스 추적 가능
+    assert r1["errors"] and "notion" in str(r1["errors"])  # create 실패 사유 전파
+    assert r1.get("completed") is None
+    assert (eng.state.get("sc") or {}).get("watermark") is None   # 실패는 전진 안 함
+
+    notion.fail_summary = False                          # 장애 복구
+    r2 = await eng.fire(trig)                            # 동일 입력 → no_new 아님(재시도)
+    assert r2.get("idempotent_replay") is None           # 실패 봉투 replay 금지
+    assert r2["data"]["status"] == "completed"
+    assert r2["data"]["summary"] is not None
+
+    r3 = await eng.fire(trig)                            # 성공 후에만 watermark 전진
+    assert r3["data"]["skip_reason"] == "no_new"
+    assert len([e for e in eng.runs.all() if e.get("processed") == 1]) == 1
+
+
+async def test_summary_create_validation_failure_aborts_no_watermark(tmp_path, monkeypatch):
+    """트리거 params.domain 이 enum 밖 → summary 스키마 검증 실패(data=None 봉투).
+
+    completed 위장·watermark 전진 없이 aborted+errors 로 드러나야 운영자가
+    트리거 params 를 고치면 다음 발화에서 처리된다(영구 no_new 스킵 금지).
+    """
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+    trig = {"id": "vd", "type": "interval", "enabled": True,
+            "schedule": {"every_sec": 1}, "target": {"chain": "ingest_summarize"},
+            "params": {"url": "https://e.com/vd", "domain": "존재하지않는도메인"}}
+    eng = _engine(_ctx(tmp_path, [trig]), tmp_path)
+
+    r1 = await eng.fire(trig)
+    assert r1["data"]["status"] == "aborted"
+    assert r1["data"]["stage"] == "summary_create"
+    assert r1["errors"]                                  # 검증 실패 사유 전파(가시화)
+    assert r1["verification"]["schema_valid"] is False
+    assert (eng.state.get("vd") or {}).get("watermark") is None   # 미전진
+    assert all(e.get("processed") != 1 for e in eng.runs.all())
+
+    r2 = await eng.fire(trig)                            # 같은 입력 재발화 → 스킵 아닌 재실행
+    assert (r2["data"] or {}).get("skip_reason") != "no_new"
+    assert r2["data"]["status"] == "aborted"
 
 
 # ── ⑦ single-flight 락 ─────────────────────────────────────────
