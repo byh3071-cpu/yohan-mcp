@@ -131,18 +131,29 @@ def _protocol_of(trig: dict) -> str | None:
 
 
 def _daily_at(trig: dict) -> tuple[int, int] | None:
-    """daily 트리거의 (hh, mm). schedule.at "HH:MM" 또는 cron "M H * * *"."""
+    """daily 트리거의 (hh, mm). schedule.at "HH:MM" 또는 cron "M H * * *".
+
+    시(0-23)/분(0-59) 범위를 벗어나면 None 을 돌려준다(파싱은 됐어도 스케줄 불가).
+    → validate_trigger 가 거부하고 is_due 는 not-due 로 처리해, 범위초과 값이
+    is_due 의 datetime.replace(hour=25) 등에서 ValueError 를 던져 해당 트리거가
+    매 틱 격리만 되고 영원히 미발화(조용한 사망)하는 것을 막는다.
+    """
     sch = trig.get("schedule")
+    hh = mm = None
     if isinstance(sch, dict) and sch.get("at"):
         try:
-            hh, mm = str(sch["at"]).split(":")
-            return int(hh), int(mm)
+            hh_s, mm_s = str(sch["at"]).split(":")
+            hh, mm = int(hh_s), int(mm_s)
         except (ValueError, AttributeError):
             return None
-    if isinstance(sch, str):
+    elif isinstance(sch, str):
         parts = sch.split()
         if len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit():
-            return int(parts[1]), int(parts[0])  # "M H * * *" → (H, M)
+            hh, mm = int(parts[1]), int(parts[0])  # "M H * * *" → (H, M)
+    if hh is None:
+        return None
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return hh, mm
     return None
 
 
