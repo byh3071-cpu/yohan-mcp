@@ -10,7 +10,9 @@
 모드(STUDIO_PUBLISH_MODE):
 - dry_run(기본): 파일 안 씀. 렌더된 MDX 전문 + 타겟 경로 + unified diff 반환(ok, dry_run).
 - file: STUDIO_REPO_PATH 하위에 {slug}.mdx 실제 쓰기. **always_gate** — 명시적 승인(approved) 없으면 차단→드라이런 폴백.
-- pr: git 새 브랜치(publish/{slug}) → 파일 쓰기 → add/commit/push → PR(base=STUDIO_BASE_BRANCH). master 직푸시 금지.
+- pr: git base_branch 체크아웃 → 새 브랜치(publish/{slug}) 분기 → 파일 쓰기 → add/commit/push
+  → PR(base=STUDIO_BASE_BRANCH) → base_branch 원복. master 직푸시 금지. 발행 브랜치는 반드시
+  base_branch 에서 분기한다(HEAD 분기 금지 — 직전 publish 브랜치 잔류 시 PR 교차 오염).
 
 불변 원칙: 외부 연결/경로 없으면 graceful 폴백(드라이런), 예외로 죽지 않음.
 멱등: `<MEMORY_DIR>/ops/mcp-runtime/studio_published.jsonl` fold → 같은 slug+content-hash 면 no-op(already_published).
@@ -422,7 +424,15 @@ class StudioAdapter(BackendAdapter):
         return res.returncode != 0
 
     def _publish_pr(self, slug: str, target: Path, mdx: str) -> dict:
-        """git 새 브랜치 → 파일 쓰기 → add/commit/push → PR(base=base_branch). master 직푸시 금지.
+        """base_branch 체크아웃 → git 새 브랜치 분기 → 파일 쓰기 → add/commit/push
+        → PR(base=base_branch) → base_branch 원복. master 직푸시 금지.
+
+        분기 기점 고정(승인게이트 정합): 발행 브랜치는 반드시 base_branch 에서 분기한다.
+        과거엔 현재 HEAD 에서 `checkout -b` 했고 발행 후 원복도 없어, 1차 발행이 HEAD 를
+        publish/<이전slug> 에 남기면 2차 발행 브랜치가 그 위에서 분기 — PR#2 diff 에
+        이전 글의 커밋·파일이 누적 혼입됐다. PR#1 을 사람이 거부해도 PR#2 머지 시 거부된
+        글이 함께 발행되는 정합 결함('승인된 그 글만 나간다' 붕괴)이라 기점을 base 로 고정하고,
+        종료 시(성공·실패 무관) base_branch 로 원복해 HEAD 를 publish 브랜치에 남기지 않는다.
 
         재진입(재시도) 견고화: 1차에서 push 만 실패하면 로컬 브랜치 `publish/<slug>` 에
         발행 커밋이 남는다(orphan). 2차에 동일-content 로 재호출하면 기존 브랜치 checkout →
@@ -431,42 +441,56 @@ class StudioAdapter(BackendAdapter):
         (이미 발행 커밋 존재) commit 을 건너뛰고 곧장 push 를 재시도한다.
         """
         branch = f"publish/{slug}"
-        # 새 브랜치(존재하면 체크아웃) — 절대 base_branch 에 직접 쓰지 않는다
+        # 분기 기점 고정 — 발행 브랜치는 반드시 base_branch 에서 분기(HEAD 분기 금지).
+        # 파일 쓰기 전 단계라 여기서 실패하면(base 부재·더티 트리 등) 부작용 없이 예외가
+        # 상위 publish 로 올라가 드라이런 폴백된다 — 오염된 기점으로 발행하느니 미발행(fail-closed).
+        self._git("checkout", self.base_branch)
+        # 새 브랜치(이미 있으면 push 재시도로 보고 체크아웃) — 절대 base_branch 에 직접 쓰지 않는다
         try:
             self._git("checkout", "-b", branch)
         except subprocess.CalledProcessError:
             self._git("checkout", branch)
-        self._write_file(target, mdx)
-        rel = str(target.relative_to(self.repo_path)) if self.repo_path else str(target)
-        self._git("add", rel)
-        # 스테이지 변경이 있을 때만 커밋. 재진입이면 동일-content 라 스테이지가 비어 있고,
-        # 이때 commit 하면 "nothing to commit"(exit 1)으로 죽으므로 건너뛰고 기존 발행 커밋을 push.
-        if self._has_staged_changes():
-            self._git("commit", "-m", f"publish: {slug}")
-        pushed = False
-        pr_url = None
         try:
-            self._git("push", "-u", "origin", branch)
-            pushed = True
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            # 원격 없음·인증 실패·네트워크 정지(타임아웃) 등 — 브랜치/커밋은 남기고
-            # push 만 실패로 보고(죽지 않음). 타임아웃도 동일하게 pushed=False 재시도 가능 상태로 처리한다
-            # (상위 publish 가 side_effect="local_branch_committed" 로 orphan 브랜치를 알린다).
-            pr_url = f"push 실패: {exc.stderr or exc}"
-        if pushed:
-            try:  # gh 있으면 PR 생성(없으면 브랜치만 push)
-                res = subprocess.run(
-                    ["gh", "pr", "create", "--base", self.base_branch, "--head", branch,
-                     "--title", f"publish: {slug}", "--body", "yohan-mcp 자동 발행 초안"],
-                    cwd=self.repo_path, capture_output=True, text=True, check=True,
-                    timeout=_GIT_TIMEOUT,
-                    encoding="utf-8", errors="replace",
-                )
-                pr_url = (res.stdout or "").strip() or pr_url
-            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                # push 는 이미 성공 — gh 미설치·실패·정지(타임아웃)는 브랜치 push 만 완료로 처리(발행 유지).
-                pr_url = pr_url or "gh 미설치/실패 — 브랜치 push 만 완료"
-        return {"branch": branch, "base": self.base_branch, "pushed": pushed, "pr_url": pr_url}
+            self._write_file(target, mdx)
+            rel = str(target.relative_to(self.repo_path)) if self.repo_path else str(target)
+            self._git("add", rel)
+            # 스테이지 변경이 있을 때만 커밋. 재진입이면 동일-content 라 스테이지가 비어 있고,
+            # 이때 commit 하면 "nothing to commit"(exit 1)으로 죽으므로 건너뛰고 기존 발행 커밋을 push.
+            if self._has_staged_changes():
+                self._git("commit", "-m", f"publish: {slug}")
+            pushed = False
+            pr_url = None
+            try:
+                self._git("push", "-u", "origin", branch)
+                pushed = True
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                # 원격 없음·인증 실패·네트워크 정지(타임아웃) 등 — 브랜치/커밋은 남기고
+                # push 만 실패로 보고(죽지 않음). 타임아웃도 동일하게 pushed=False 재시도 가능 상태로 처리한다
+                # (상위 publish 가 side_effect="local_branch_committed" 로 orphan 브랜치를 알린다).
+                pr_url = f"push 실패: {exc.stderr or exc}"
+            if pushed:
+                try:  # gh 있으면 PR 생성(없으면 브랜치만 push)
+                    res = subprocess.run(
+                        ["gh", "pr", "create", "--base", self.base_branch, "--head", branch,
+                         "--title", f"publish: {slug}", "--body", "yohan-mcp 자동 발행 초안"],
+                        cwd=self.repo_path, capture_output=True, text=True, check=True,
+                        timeout=_GIT_TIMEOUT,
+                        encoding="utf-8", errors="replace",
+                    )
+                    pr_url = (res.stdout or "").strip() or pr_url
+                except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    # push 는 이미 성공 — gh 미설치·실패·정지(타임아웃)는 브랜치 push 만 완료로 처리(발행 유지).
+                    pr_url = pr_url or "gh 미설치/실패 — 브랜치 push 만 완료"
+            return {"branch": branch, "base": self.base_branch, "pushed": pushed, "pr_url": pr_url}
+        finally:
+            # 종료 시(성공·실패 무관) base_branch 원복 — HEAD 를 publish 브랜치에 남기면
+            # 레포를 만지는 다른 도구·사람이 오염된 상태를 본다. 원복은 베스트에포트로 삼킨다:
+            # 실패가 발행 결과(return)나 진행 중 예외를 덮으면 안 되고, 남은 HEAD 는
+            # 다음 발행 시작 시 base 체크아웃(위 분기 기점 고정)으로 어차피 재보정된다.
+            try:
+                self._git("checkout", self.base_branch)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                pass
 
     # ── Adapter 계약 ────────────────────────────────────────────
     async def search(self, query: str, opts: dict | None = None) -> list[dict]:

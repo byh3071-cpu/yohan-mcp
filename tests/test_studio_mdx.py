@@ -137,8 +137,14 @@ def _git_init(repo):
     for args in (
         ["init"], ["config", "user.email", "t@t.t"], ["config", "user.name", "t"],
         ["commit", "--allow-empty", "-m", "init"],
+        # 어댑터 기본 base_branch(master)와 일치하게 고정 — 머신 init.defaultBranch 무관.
+        # (발행 브랜치가 base_branch 에서 분기하므로 base 부재면 드라이런 폴백돼 버린다.)
+        ["branch", "-M", "master"],
     ):
-        subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True)
+        # encoding 명시 — cp949 로케일에서 git 의 UTF-8 출력(한글 사용자명 tmp 경로)로
+        # reader 스레드가 UnicodeDecodeError 경고를 뿜지 않게 한다(어댑터 _git 와 동일 규약).
+        subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True,
+                       encoding="utf-8", errors="replace")
 
 
 async def test_pr_mode_push_fail_not_published_and_journal_clean(tmp_path):
@@ -164,9 +170,11 @@ async def test_pr_mode_push_fail_not_published_and_journal_clean(tmp_path):
 def _git_add_bare_origin(repo, bare):
     """bare repo 를 origin 으로 등록(=원격 장애 복구 시뮬레이션)."""
     import subprocess
-    subprocess.run(["git", "init", "--bare", str(bare)], capture_output=True, text=True, check=True)
+    subprocess.run(["git", "init", "--bare", str(bare)], capture_output=True, text=True, check=True,
+                   encoding="utf-8", errors="replace")
     subprocess.run(["git", "remote", "add", "origin", str(bare)],
-                   cwd=repo, capture_output=True, text=True, check=True)
+                   cwd=repo, capture_output=True, text=True, check=True,
+                   encoding="utf-8", errors="replace")
 
 
 async def test_pr_mode_retry_reaches_push_after_origin_recovers(tmp_path):
@@ -204,6 +212,43 @@ async def test_pr_mode_retry_reaches_push_after_origin_recovers(tmp_path):
     # 멱등 저널이 push 성공 시에만 기록됨 → 재재호출은 already_published(no-op)
     res3 = await a.publish(_summary(), approved=True)
     assert res3["already_published"] is True and res3["published"] is False
+
+
+async def test_pr_mode_second_publish_branches_from_base_and_restores_head(tmp_path):
+    """회귀(승인게이트 정합): 다음 발행 브랜치는 base(master)에서 분기 + 발행 후 HEAD 원복.
+
+    버그였던 동작: `checkout -b` 가 현재 HEAD(=직전 publish/<slug1>)에서 분기하고 발행 후
+    원복도 없어 PR#2 diff 에 글 1·2 가 모두 실렸다 — PR#1 을 사람이 거부(reject)해도
+    PR#2 머지 시 거부된 글이 함께 발행됨('승인된 그 글만 나간다' 붕괴).
+    """
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    _git_add_bare_origin(repo, tmp_path / "origin.git")  # push 성공 경로(오염 재현 전제)
+    a = StudioAdapter(repo_path=str(repo), mode="pr",
+                      journal_path=tmp_path / "pub.jsonl", base_branch="master")
+
+    r1 = await a.publish(_summary(summary_id="sum_a", title="Alpha Post",
+                                  summary="본문 알파"), approved=True)
+    r2 = await a.publish(_summary(summary_id="sum_b", title="Beta Post",
+                                  summary="본문 베타"), approved=True)
+    assert r1["published"] is True and r1["pr"]["pushed"] is True
+    assert r2["published"] is True and r2["pr"]["pushed"] is True
+    assert r1["pr"]["branch"] != r2["pr"]["branch"]
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True,
+                              check=True, encoding="utf-8", errors="replace").stdout.strip()
+
+    b2 = r2["pr"]["branch"]
+    # PR#2(base..head)에는 자기 발행 커밋 정확히 1개 — 글 1(alpha) 커밋 혼입 금지
+    assert git("log", "--format=%s", f"master..{b2}").splitlines() == [f"publish: {r2['slug']}"]
+    # PR#2 diff 파일도 자기 것 1개뿐 — alpha-post.mdx 미포함
+    assert git("diff", "--name-only", f"master...{b2}").splitlines() == [
+        f"src/content/blog/{r2['slug']}.mdx"]
+    # 발행 종료 후 HEAD 는 base 로 원복 — publish 브랜치 잔류(다음 작업 오염) 금지
+    assert git("branch", "--show-current") == "master"
 
 
 # ── tool_publish 봉투 완전성(불변 봉투 + MDX 신호) ─────────────
