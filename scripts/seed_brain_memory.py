@@ -210,6 +210,20 @@ async def seed_memory(
             if manifest_path is not None:
                 _save_manifest(manifest_path, manifest)
         known: dict[str, dict] = manifest["files"]
+        # ── 외부 wipe 가드 (critic MAJOR, 2026-07-05): 매니페스트는 "과거에 적재했다"는
+        # 주장일 뿐 실제 포인트 존재 증거가 아니다. 컬렉션이 외부에서 초기화(volume wipe·
+        # 드롭 후 재생성 등)됐는데 매니페스트만 남으면 증분 시드가 전부 "무변경 스킵"으로
+        # 오판해 brain_memory 가 빈 채 exit 0 → 검색 silent 전멸. 매니페스트가 적재 이력을
+        # 주장하는데 실제 포인트가 0 이면 매니페스트를 통째 무효화하고 전량 처리한다.
+        if known:
+            actual_points = (await client.count(qdrant.collection)).count
+            if actual_points == 0:
+                print(
+                    f"⚠️ 매니페스트는 {len(known)}건 적재를 주장하나 컬렉션 '{qdrant.collection}' "
+                    "실제 포인트 0 — 외부 초기화 감지, 매니페스트 무효화 후 전량 시딩"
+                )
+                manifest["files"] = {}
+                known = manifest["files"]
         if manifest_path is not None:
             print(f"{'전량(--full)' if full else '증분'} 시딩 — 매니페스트 {manifest_path} (기존 {len(known)}건)")
 
