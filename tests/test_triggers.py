@@ -66,6 +66,12 @@ def test_validate_trigger_good_and_bad():
     bad4, r4 = validate_trigger({"id": "w", "type": "interval", "schedule": {"every_sec": 1},
                                  "target": {"chain": "no_such_chain"}})
     assert not bad4 and "chain" in r4
+    # 시/분 범위초과 daily(자정 오타 '24:00' 포함)는 검증 거부 —
+    # 과거엔 (True,'ok')로 통과 후 is_due 에서 ValueError → 트리거 영구 미발화(회귀 가드)
+    for sch in ({"at": "25:00"}, {"at": "24:00"}, {"at": "-1:00"}, "0 25 * * *", "61 9 * * *"):
+        bad, r = validate_trigger({"id": "oob", "type": "daily", "schedule": sch,
+                                   "target": {"chain": "ingest_summarize"}})
+        assert not bad, (sch, r)
 
 
 def test_repo_triggers_all_valid():
@@ -109,6 +115,21 @@ def test_due_daily(tmp_path):
     eng.state.merge("dl", {"last_fire_ts": after.isoformat()})
     assert eng.is_due(trig, datetime(2026, 6, 9, 3, 0, tzinfo=_KST)) is False   # 오늘 이미 발화
     assert eng.is_due(trig, datetime(2026, 6, 10, 2, 31, tzinfo=_KST)) is True  # 다음날
+
+
+def test_due_daily_out_of_range_not_due_no_crash(tmp_path):
+    """범위초과 시/분(자정 오타 '24:00' 포함)은 is_due 가 ValueError 없이 not-due(False)로 처리.
+
+    회귀: 과거 _daily_at 이 범위검증을 안 해 validate_trigger 는 통과하되
+    is_due 의 datetime.replace(hour=25) 등이 ValueError → tick 이 매번 격리만 하고
+    해당 트리거는 영원히 미발화(다른 트리거는 생존 → 조용한 사망).
+    """
+    eng = _engine(_ctx(tmp_path, []), tmp_path)
+    now = datetime(2026, 6, 9, 23, 59, tzinfo=_KST)
+    for sch in ({"at": "25:00"}, {"at": "24:00"}, {"at": "-1:00"}, "0 25 * * *", "61 9 * * *"):
+        trig = {"id": "oob", "type": "daily", "enabled": True, "schedule": sch,
+                "target": {"chain": "ingest_summarize"}}
+        assert eng.is_due(trig, now) is False, sch   # 크래시 없이 not-due
 
 
 # ── ③ 멱등(중복 발화 0) + ⑧ watermark 증분 ─────────────────────
