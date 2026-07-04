@@ -258,6 +258,41 @@ async def test_failed_run_retries_next_fire(tmp_path, monkeypatch):
     assert len([e for e in eng.runs.all() if e.get("processed") == 1]) == 1  # 중복 실행 0 유지
 
 
+# ── ⑥-c full_loop(run_protocol 경유)도 동일 — aborted run 재시도 ──
+async def test_full_loop_aborted_run_retries_next_fire(tmp_path, monkeypatch):
+    """run_protocol 기반 체인(full_loop)이 일시 장애로 abort 돼도 다음 발화에서 재시도한다.
+
+    회귀 가드: 결정적 run_id(protocol+params 해시) 탓에 재발화가 같은 run_id 로
+    들어오는데, 과거엔 엔진이 aborted 저널을 idempotent replay 해 장애 복구 후에도
+    체인이 영구 재실행 불능(트리거 좀비화)이었다 — ⑥-b 의 재시도 계약이 무효화됨.
+    """
+    calls = {"n": 0}
+
+    async def flaky(url, client=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("일시 네트워크 장애")
+        return await _fake_fetch(url)
+    monkeypatch.setattr(T, "_fetch_url", flaky)
+
+    trig = {"id": "flr", "type": "interval", "enabled": True, "schedule": {"every_sec": 1},
+            "target": {"chain": "full_loop"}, "params": {"url": "https://e.com/flr"},
+            "policy": {"publish_mode": "dry_run", "require_approval": False}}
+    eng = _engine(_ctx(tmp_path, [trig]), tmp_path)
+
+    r1 = await eng.fire(trig)
+    assert r1["data"]["status"] == "aborted"         # 1차: 장애 → step0(ingest) 중단
+    assert r1.get("idempotent_replay") is None
+
+    r2 = await eng.fire(trig)                        # 2차: 장애 복구 → 체인 재실행
+    assert r2.get("idempotent_replay") is None       # 저장된 aborted 봉투 replay 아님
+    assert r2["data"]["status"] == "completed"
+    assert calls["n"] == 2                           # fetch 가 실제로 재호출됨
+
+    r3 = await eng.fire(trig)                        # 3차: watermark 전진 → no_new
+    assert r3["data"]["skip_reason"] == "no_new"
+
+
 # ── ⑦ single-flight 락 ─────────────────────────────────────────
 def test_single_flight_lock_and_stale(tmp_path):
     fresh = lambda: datetime(2026, 6, 9, 10, 0, tzinfo=_KST)  # noqa: E731

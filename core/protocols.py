@@ -308,8 +308,10 @@ async def run_protocol(
 
     - policy(또는 ctx.policy)가 자동승인하면 게이트를 통과해 그대로 진행(봉투에 policy_rule).
     - 한도 초과/always_gate/매칭 없음이면 P4 승인큐로 폴백(pending 봉투, run_id).
-    멱등: 같은 run_id 가 이미 done/pending/aborted/rejected 면 저장된 봉투를 그대로 돌려준다
-    (완료 step 재실행 없음). resume=True 면 게이트 승인 후 저장된 컨텍스트로 재개한다.
+    멱등: 같은 run_id 가 이미 done/pending/rejected 면 저장된 봉투를 그대로 돌려준다
+    (완료 step 재실행 없음). aborted 는 종결이 아니라 재시도 가능 — 완료 step 은
+    건너뛰고 실패 step 부터 재개한다(트리거 재발화 '실패 prior 는 체인 재실행' 계약).
+    resume=True 면 게이트 승인 후 저장된 컨텍스트로 재개한다.
     """
     proto = PROTOCOLS.get(name)
     params = params or {}
@@ -324,14 +326,18 @@ async def run_protocol(
     run_id = run_id or _make_run_id(name, params)
     journal = ctx.runs_store.latest(run_id)
 
-    # 멱등 재실행: 종결/대기 상태면 저장된 봉투 그대로(완료 step 건너뜀)
+    # 멱등 재실행: 종결/대기 상태면 저장된 봉투 그대로(완료 step 건너뜀).
+    # aborted 는 종결이 아니다 — replay 하면 트리거 재발화의 '실패 prior 는 체인
+    # 재실행' 계약(core/triggers.py fire)이 무효화되어, 같은 params → 같은 run_id 인
+    # 재발화가 일시 장애 복구 후에도 영원히 저장된 실패 봉투만 받는다(트리거 좀비화).
+    # _abort 가 next_index=실패 step + 컨텍스트를 저널에 남기므로 거기서부터 재개한다.
     if journal and not resume:
         st = journal.get("status")
-        if st in ("done", "rejected", "aborted", "pending"):
+        if st in ("done", "rejected", "pending"):
             env = dict(journal.get("envelope") or {})
             env["idempotent_replay"] = True
             return env
-        if st == "running":  # 중단 복구 — 저장된 다음 step 부터 재개
+        if st in ("running", "aborted"):  # 중단/실패 복구 — 저장된 step 부터 재개(재시도)
             resume = True
 
     if resume and journal:

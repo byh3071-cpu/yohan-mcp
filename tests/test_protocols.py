@@ -110,6 +110,47 @@ async def test_idempotent_replay(tmp_path):
     assert second["data"]["result"]["id"] == first["data"]["result"]["id"]
 
 
+# ── 재시도: aborted run 재호출 = replay 가 아니라 실패 step 부터 재개 ─
+async def test_aborted_run_resumes_from_failed_step(tmp_path, monkeypatch):
+    """aborted 저널은 종결(replay 대상)이 아니라 재시도 가능 상태다.
+
+    회귀 가드: aborted 를 idempotent replay 하면 트리거 재발화의 '실패 prior 는
+    체인 재실행' 계약(core/triggers.py fire)이 무효화되어 일시 장애가 영구 장애로
+    굳는다. 재시도는 완료 step 을 건너뛰고(멱등) 실패 step 부터 재개한다.
+    """
+    search_calls = {"n": 0}
+    context_calls = {"n": 0}
+    real_search = T.tool_search
+    real_get_context = T.tool_get_context
+
+    async def counting_search(ctx_, query, opts=None):
+        search_calls["n"] += 1
+        return await real_search(ctx_, query, opts)
+
+    async def flaky_get_context(ctx_, query, opts=None):
+        context_calls["n"] += 1
+        if context_calls["n"] == 1:
+            raise RuntimeError("일시 장애")
+        return await real_get_context(ctx_, query, opts)
+
+    monkeypatch.setattr(T, "tool_search", counting_search)
+    monkeypatch.setattr(T, "tool_get_context", flaky_get_context)
+
+    ctx = _ctx(tmp_path)
+    first = await T.tool_run_action(ctx, "resource_to_decision", {"query": "재시도 검증"})
+    assert first["data"]["status"] == "aborted"
+    assert first["data"]["failed_step_index"] == 1
+
+    second = await T.tool_run_action(ctx, "resource_to_decision", {"query": "재시도 검증"})
+    assert second.get("idempotent_replay") is None    # aborted 봉투 replay 금지
+    assert second["data"]["status"] == "completed"    # 실패 step 부터 재개 → 완주
+    assert context_calls["n"] == 2                    # 실패 step 은 재실행됨
+    assert search_calls["n"] == 1                     # 완료 step 은 재실행 안 함(멱등)
+
+    third = await T.tool_run_action(ctx, "resource_to_decision", {"query": "재시도 검증"})
+    assert third.get("idempotent_replay") is True     # 완주 후엔 done 봉투 replay
+
+
 # ── 명시 run_id 멱등 키 ─────────────────────────────────────────
 async def test_explicit_run_id(tmp_path):
     ctx = _ctx(tmp_path)
