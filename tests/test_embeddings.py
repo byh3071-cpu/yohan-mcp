@@ -106,3 +106,15 @@ def test_get_embedder_auto_chain_to_hash(monkeypatch):
     monkeypatch.setattr(E, "OllamaEmbedder", boom)
     monkeypatch.setattr(E, "LocalEmbedder", boom)
     assert isinstance(get_embedder(), HashEmbedder)
+
+
+def test_ollama_timeout_env(monkeypatch, caplog):
+    """OLLAMA_TIMEOUT — 유효값 적용, 무효값(비수치/0 이하)은 기본 60초 폴백 + 경고."""
+    monkeypatch.delenv("OLLAMA_TIMEOUT", raising=False)
+    assert E._ollama_timeout() == 60.0
+    monkeypatch.setenv("OLLAMA_TIMEOUT", "300")
+    assert E._ollama_timeout() == 300.0
+    for bad in ("abc", "0", "-5", "nan"):
+        monkeypatch.setenv("OLLAMA_TIMEOUT", bad)
+        with caplog.at_level(logging.WARNING):
+            assert E._ollama_timeout() == 60.0

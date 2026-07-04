@@ -23,5 +23,5 @@ def _isolate_runtime(request, tmp_path, monkeypatch):
     # os.environ 에 남긴 QDRANT_COLLECTION/SEARCH_COLLECTIONS)을 막기 위해 삭제한다 —
     # search_collections/rtype 계산이 .env 값에 오염되면 유닛 단정이 흔들린다(:memory: 강제).
     if request.node.get_closest_marker("integration") is None:
-        for _k in ("QDRANT_URL", "QDRANT_COLLECTION", "QDRANT_SEARCH_COLLECTIONS"):
+        for _k in ("QDRANT_URL", "QDRANT_COLLECTION", "QDRANT_SEARCH_COLLECTIONS", "QDRANT_TYPE_WEIGHTS"):
             monkeypatch.delenv(_k, raising=False)
