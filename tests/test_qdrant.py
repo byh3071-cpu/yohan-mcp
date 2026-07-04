@@ -232,3 +232,37 @@ async def test_qdrant_health_dim_mismatch_branch():
     assert h["ok"] is False
     assert "차원 불일치" in h["detail"]
     await c.close()
+
+
+# ── search_collections 기본 목록 (MINOR I 풋건 수정) ─────────────────────
+def test_search_collections_default_includes_control_tower_and_brain():
+    from adapters.qdrant_adapter import (
+        BRAIN_MEMORY_COLLECTION,
+        CONTROL_TOWER_COLLECTIONS,
+        ONTOLOGY_TRIPLES_COLLECTION,
+    )
+    qa = QdrantAdapter(url=None, embedder=HashEmbedder())
+    for c in CONTROL_TOWER_COLLECTIONS:
+        assert c in qa.search_collections
+    assert BRAIN_MEMORY_COLLECTION in qa.search_collections
+    assert ONTOLOGY_TRIPLES_COLLECTION in qa.search_collections
+    assert qa.search_collections[0] == qa.collection  # 쓰기 컬렉션이 최우선
+
+
+def test_search_collections_env_appends_not_replaces(monkeypatch):
+    # 과거 풋건: QDRANT_SEARCH_COLLECTIONS 를 하나라도 설정하면 기본 컬렉션이 통째로
+    # 사라져 get_context 회수가 조용히 줄었다(MINOR I). env 는 대체가 아니라 추가여야 한다.
+    from adapters.qdrant_adapter import BRAIN_MEMORY_COLLECTION, CONTROL_TOWER_COLLECTIONS
+
+    monkeypatch.setenv("QDRANT_SEARCH_COLLECTIONS", "extra_demo_collection")
+    qa = QdrantAdapter(url=None, embedder=HashEmbedder())
+    assert "extra_demo_collection" in qa.search_collections
+    for c in CONTROL_TOWER_COLLECTIONS:
+        assert c in qa.search_collections
+    assert BRAIN_MEMORY_COLLECTION in qa.search_collections
+
+
+def test_search_collections_dedup_no_duplicates():
+    qa = QdrantAdapter(url=None, embedder=HashEmbedder(), collection="knowledge_base")
+    # collection 이 우연히 관제탑 컬렉션명과 겹쳐도 중복 없이 1회만 들어간다.
+    assert qa.search_collections.count("knowledge_base") == 1

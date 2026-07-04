@@ -173,3 +173,39 @@ async def test_count_ranking(tmp_path):
     qa = MemoryAdapter(base_dir=tmp_path)
     res = await qa.search("어텐션")
     assert res[0]["data"]["_path"].endswith("hi.md")  # 빈도 높은 노트가 상위
+
+
+# ── brain_memory 벡터 시딩용 _read_md_uncapped (스프린트 필수 코어 ②) ──────
+def test_read_md_uncapped_no_truncation(tmp_path):
+    long_body = "가나다라" * 2000  # 8000자 > _MD_BODY_MAX(4000)
+    p = tmp_path / "long.md"
+    p.write_text(f"---\nid: long\n---\n{long_body}", encoding="utf-8")
+    capped = MemoryAdapter._read_md(p)
+    uncapped = MemoryAdapter._read_md_uncapped(p)
+    assert len(capped["body"]) == 4000
+    assert uncapped["body"] == long_body
+    assert "_body_start_line" not in capped  # _read_md 계약 불변(엑스트라 키 없음)
+
+
+def test_read_md_uncapped_body_start_line_after_frontmatter(tmp_path):
+    p = tmp_path / "fm.md"
+    p.write_text("---\nid: x\ntitle: T\n---\n\n첫 본문 줄", encoding="utf-8")
+    rec = MemoryAdapter._read_md_uncapped(p)
+    # frontmatter 4줄(1~4) + 빈줄(5번째, strip 으로 사라짐) → 첫 비공백 본문줄은 파일 6번째 줄
+    assert rec["_body_start_line"] == 6
+    assert rec["body"] == "첫 본문 줄"
+
+
+def test_read_md_uncapped_no_frontmatter_starts_at_line_1(tmp_path):
+    p = tmp_path / "plain.md"
+    p.write_text("바로 본문 시작", encoding="utf-8")
+    rec = MemoryAdapter._read_md_uncapped(p)
+    assert rec["_body_start_line"] == 1
+
+
+def test_read_md_uncapped_broken_frontmatter_starts_at_line_1(tmp_path):
+    p = tmp_path / "broken.md"
+    p.write_text("---\n제목 아닌 텍스트\n---\n실제 본문", encoding="utf-8")
+    rec = MemoryAdapter._read_md_uncapped(p)
+    assert rec["_body_start_line"] == 1  # 파싱 실패 → 전문이 body, 1번째 줄부터
+    assert "실제 본문" in rec["body"]
