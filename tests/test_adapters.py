@@ -90,6 +90,46 @@ async def test_memory_path_traversal_blocked(tmp_path):
     assert not (tmp_path.parent / "evil.yaml").exists()
 
 
+# ── YOHA-4 회귀 — 매칭 blob 이 yaml.safe_dump 직렬화 부작용에 깨지면 안 됨 ──
+async def test_memory_search_multiword_across_dump_fold_point(tmp_path):
+    """원문에 실재하는 연속 다어절 질의가 safe_dump width=80 접기(공백→개행+들여쓰기)
+    지점에 걸쳐도 매칭되어야 한다 — 과거엔 접점 질의가 무음 0건(YOHA-4)."""
+    import re
+
+    import yaml
+
+    rationale = (
+        "벡터 검색 도입 근거는 다음과 같다. 기존 substring 매칭은 다어절 질의에 약했고 "
+        "실측 골든쿼리 리콜 측정에서 상위권 손실이 확인되어 RRF 결합으로 보완하기로 했다."
+    )
+    m = MemoryAdapter(base_dir=tmp_path)
+    await m.create(
+        "decision", {"decision_id": "d-fold", "title": "접기 재현", "rationale": rationale}
+    )
+
+    # 구 blob 레시피(safe_dump)가 실제로 접는 지점의 인접 어절 쌍을 질의로 채택
+    # (pyyaml 버전이 바뀌어 접점이 이동해도 항상 '진짜 접점'을 겨냥한다)
+    folded = yaml.safe_dump({"rationale": rationale}, allow_unicode=True)
+    pair = re.search(r"(\S+)\n  (\S+)", folded)
+    assert pair, "전제: 80자 초과 한 줄은 safe_dump 기본 width 에서 접혀야 함"
+    query = f"{pair.group(1)} {pair.group(2)}"
+    assert query in rationale  # 파일 원문(값)에 실재
+    assert query not in folded  # 구 레시피 blob 에선 접혀서 소실되던 질의
+
+    found = await m.search(query)
+    assert [r["id"] for r in found] == ["d-fold"]  # 무음 실패 금지
+    assert found[0]["score"] >= 1.0  # 빈도점수도 원문 기준
+
+
+async def test_memory_search_quoted_scalar_verbatim(tmp_path):
+    """같은 클래스 회귀 — 따옴표 강제 스칼라(': ' 포함)의 작은따옴표 이중화('')가
+    원문 매칭을 깨면 안 됨. blob 은 직렬화 출력이 아니라 값 원문이어야 한다."""
+    m = MemoryAdapter(base_dir=tmp_path)
+    await m.create("decision", {"decision_id": "d-quote", "title": "결론: 'A안' 채택"})
+    found = await m.search("'A안' 채택")  # 구 blob: ''A안'' 으로 변형되어 0건이던 질의
+    assert [r["id"] for r in found] == ["d-quote"]
+
+
 async def test_notion_update_mocked():
     captured = {}
 
