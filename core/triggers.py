@@ -137,6 +137,10 @@ def _daily_at(trig: dict) -> tuple[int, int] | None:
     → validate_trigger 가 거부하고 is_due 는 not-due 로 처리해, 범위초과 값이
     is_due 의 datetime.replace(hour=25) 등에서 ValueError 를 던져 해당 트리거가
     매 틱 격리만 되고 영원히 미발화(조용한 사망)하는 것을 막는다.
+
+    cron 은 지원 부분집합 "M H * * *"(일/월/요일 전부 '*') 밖이면 None — 부분집합 밖
+    입력('0 9 * * 1' 매주 월요일, '0 9 1 * *' 매월 1일 등)을 daily 로 오해석해
+    매일 발화(최대 7~30배 과발화)하는 것을 막는다. 범위초과 가드와 동일 취지.
     """
     sch = trig.get("schedule")
     hh = mm = None
@@ -148,7 +152,8 @@ def _daily_at(trig: dict) -> tuple[int, int] | None:
             return None
     elif isinstance(sch, str):
         parts = sch.split()
-        if len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit():
+        if (len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit()
+                and all(p == "*" for p in parts[2:])):
             hh, mm = int(parts[1]), int(parts[0])  # "M H * * *" → (H, M)
     if hh is None:
         return None
