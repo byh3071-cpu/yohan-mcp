@@ -108,10 +108,13 @@ class MemoryAdapter(BackendAdapter):
         return data
 
     @staticmethod
-    def _read_md(path: Path) -> dict | None:
-        """brain `.md`+frontmatter → 레코드 dict. 선두 `---` 블록=frontmatter, 나머지=body.
+    def _parse_md_common(path: Path) -> tuple[dict, str, int] | None:
+        """brain `.md`+frontmatter 공통 파서 — (frontmatter, 미절단 본문, 본문시작줄) 반환.
 
-        frontmatter 없으면 {"body": 전문}. 깨진 frontmatter 는 무시하고 본문은 살린다(graceful).
+        `_read_md`/`_read_md_uncapped` 가 공유하는 내부 헬퍼(공개 계약 아님 — 반환 shape 자유).
+        본문시작줄은 **원본 파일 기준 1-indexed** 줄번호로, frontmatter 블록 길이 +
+        본문 선두 공백줄(strip 으로 사라질 줄)을 반영한다 — 청킹 역링크(chunk_start_line)가
+        본문만 넘겨받고도 파일 기준 정확한 줄을 가리키게 하기 위함(core/chunking.py base_line).
         """
         try:
             text = path.read_text(encoding="utf-8")
@@ -119,6 +122,7 @@ class MemoryAdapter(BackendAdapter):
             return None
         fm: dict = {}
         body = text
+        body_start_line = 1
         lines = text.split("\n")
         if lines and lines[0].strip() == "---":
             for i in range(1, len(lines)):
@@ -132,9 +136,47 @@ class MemoryAdapter(BackendAdapter):
                     if isinstance(loaded, dict):
                         fm = loaded
                         body = "\n".join(lines[i + 1 :])
+                        body_start_line = i + 2  # 닫는 --- 다음 줄(0-idx i+1)의 1-idx 파일 줄번호
                     break
+        leading_blank = 0
+        for ln in body.split("\n"):
+            if ln.strip():
+                break
+            leading_blank += 1
+        return fm, body.strip(), body_start_line + leading_blank
+
+    @staticmethod
+    def _read_md(path: Path) -> dict | None:
+        """brain `.md`+frontmatter → 레코드 dict. 선두 `---` 블록=frontmatter, 나머지=body.
+
+        frontmatter 없으면 {"body": 전문}. 깨진 frontmatter 는 무시하고 본문은 살린다(graceful).
+        회수 봉투용 — 본문은 `_MD_BODY_MAX` 로 절단(토큰 폭증 방지). 전문이 필요하면
+        `_read_md_uncapped` 를 쓴다(브레인 벡터 시딩 전용, 이 메서드는 불변 유지).
+        """
+        parsed = MemoryAdapter._parse_md_common(path)
+        if parsed is None:
+            return None
+        fm, body, _start_line = parsed
         rec = dict(fm)
-        rec["body"] = body.strip()[:_MD_BODY_MAX]  # 상한(토큰 폭증 방지)
+        rec["body"] = body[:_MD_BODY_MAX]  # 상한(토큰 폭증 방지)
+        return rec
+
+    @staticmethod
+    def _read_md_uncapped(path: Path) -> dict | None:
+        """brain_memory 벡터 시딩 전용(scripts/seed_brain_memory.py) — 본문 상한 없이 전문 반환.
+
+        `_read_md` 와 동일 파싱이되 `_MD_BODY_MAX` 절단을 적용하지 않는다(회수 경로 `_read_md`
+        는 완전히 불변). 긴 본문은 청킹(core/chunking.py)이 안전한 크기로 나누므로 여기서
+        미리 자를 필요가 없다. 추가로 `_body_start_line`(원본 파일 1-indexed 줄번호, 본문의
+        첫 줄이 파일의 몇 번째 줄인지)을 반환해 청크 역링크 계산에 쓸 수 있게 한다.
+        """
+        parsed = MemoryAdapter._parse_md_common(path)
+        if parsed is None:
+            return None
+        fm, body, start_line = parsed
+        rec = dict(fm)
+        rec["body"] = body
+        rec["_body_start_line"] = start_line
         return rec
 
     def _read_md_cached(self, path: Path) -> dict | None:

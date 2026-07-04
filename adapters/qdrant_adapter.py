@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 COLLECTION = "yohan_resources"
 # 관제탑(yohan-control-tower)이 적재하는 읽기전용 4컬렉션 — get_context 검색 대상(bge-m3 1024d 동일 모델).
 CONTROL_TOWER_COLLECTIONS = ["knowledge_base", "system_rules", "semantic_cache", "execution_history"]
+# yohan-mcp 자신이 적재하는 brain 지식 벡터 컬렉션(scripts/seed_brain_memory.py) — 기본 검색 대상 편입.
+BRAIN_MEMORY_COLLECTION = "brain_memory"
+ONTOLOGY_TRIPLES_COLLECTION = "ontology_triples"
+BRAIN_MEMORY_COLLECTIONS = [BRAIN_MEMORY_COLLECTION, ONTOLOGY_TRIPLES_COLLECTION]
 _URL_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # RFC 4122 URL 네임스페이스
 
 
@@ -33,9 +37,15 @@ class QdrantAdapter(BackendAdapter):
     def __init__(self, client=None, url: str | None = None, collection: str | None = None, embedder=None) -> None:
         self.url = url if url is not None else os.getenv("QDRANT_URL")
         self.collection = collection or os.getenv("QDRANT_COLLECTION", COLLECTION)
-        # 검색 대상 = 쓰기 컬렉션(레거시 호환) + 관제탑 4컬렉션. env QDRANT_SEARCH_COLLECTIONS 로 override.
+        # 검색 대상 = 쓰기 컬렉션(레거시 호환) + 관제탑 4컬렉션 + brain 2컬렉션(brain_memory·
+        # ontology_triples), 이 기본 목록은 env 유무와 무관하게 항상 유지한다. env
+        # QDRANT_SEARCH_COLLECTIONS 는 대체(replace)가 아니라 **추가(append)** — 예전엔 env 를
+        # 하나라도 설정하면 기본 컬렉션이 통째로 사라져 get_context 회수가 조용히 줄어드는
+        # 풋건이 있었다(MINOR I). 격리가 필요하면 호출자가 생성 후 `.search_collections` 를
+        # 직접 덮어써 override 한다(test_integration_qdrant.py 처럼).
         sc = os.getenv("QDRANT_SEARCH_COLLECTIONS")
-        extra = [c.strip() for c in sc.split(",") if c.strip()] if sc else list(CONTROL_TOWER_COLLECTIONS)
+        env_extra = [c.strip() for c in sc.split(",") if c.strip()] if sc else []
+        extra = [*CONTROL_TOWER_COLLECTIONS, *BRAIN_MEMORY_COLLECTIONS, *env_extra]
         seen: set[str] = set()
         self.search_collections: list[str] = []
         for c in [self.collection, *extra]:
