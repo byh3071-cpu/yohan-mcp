@@ -132,6 +132,30 @@ def test_due_daily_out_of_range_not_due_no_crash(tmp_path):
         assert eng.is_due(trig, now) is False, sch   # 크래시 없이 not-due
 
 
+def test_cron_outside_subset_rejected_not_daily(tmp_path):
+    """부분집합 밖 cron(일/월/요일 제한)은 검증 거부 + not-due — daily 오해석 금지.
+
+    회귀: 과거 _daily_at 이 parts[2:](일/월/요일)를 안 봐서 '0 9 * * 1'(매주 월요일),
+    '0 9 1 * *'(매월 1일)이 (True,'ok')로 통과 후 daily 로 오해석 → 매일 발화
+    (의도 대비 최대 7~30배 과발화: 무인 ingest/summary 생성·승인큐 적재).
+    """
+    eng = _engine(_ctx(tmp_path, []), tmp_path)
+    wed = datetime(2026, 7, 1, 10, 0, tzinfo=_KST)   # 수요일 10:00 (cron 시각 지난 뒤)
+    thu = datetime(2026, 7, 2, 10, 0, tzinfo=_KST)   # 목요일
+    for sch in ("0 9 * * 1", "0 9 1 * *", "0 9 * 6 *", "0 9 1-15 * *", "0 9 */2 * *"):
+        trig = {"id": "sub", "type": "daily", "enabled": True, "schedule": sch,
+                "target": {"chain": "ingest_summarize"}}
+        ok, reason = validate_trigger(trig)
+        assert not ok and "M H * * *" in reason, (sch, reason)
+        assert eng.is_due(trig, wed) is False, sch   # 수요일에 발화 안 함
+        assert eng.is_due(trig, thu) is False, sch   # 다음날도 발화 안 함(매일 발화 회귀)
+    # 지원 부분집합("M H * * *")은 계속 통과 — 가드가 정상 daily 를 깨지 않음
+    good = {"id": "dy", "type": "daily", "enabled": True, "schedule": "0 9 * * *",
+            "target": {"chain": "ingest_summarize"}}
+    assert validate_trigger(good) == (True, "ok")
+    assert eng.is_due(good, wed) is True and eng.is_due(good, thu) is True
+
+
 # ── ③ 멱등(중복 발화 0) + ⑧ watermark 증분 ─────────────────────
 async def test_idempotent_and_watermark(tmp_path, monkeypatch):
     monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
