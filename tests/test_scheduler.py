@@ -32,6 +32,11 @@ _TRIGGERS = {
             "id": "decision_demo", "kind": "manual", "protocol": "resource_to_decision",
             "params": {"query": "테스트 결정"},
         },
+        {   # P7 chain-스타일 — protocol 키 없음(리포 triggers.json 의 hourly_ingest 형)
+            "id": "chain_demo", "type": "interval", "schedule": {"every_sec": 3600},
+            "target": {"chain": "ingest_summarize"},
+            "params": {"url": "https://example.com/chain"},
+        },
     ]
 }
 
@@ -59,7 +64,7 @@ async def test_list_triggers(tmp_path):
     ctx = _ctx(tmp_path)
     env = await T.tool_list_triggers(ctx)
     ids = [t["id"] for t in env["data"]["triggers"]]
-    assert set(ids) == {"auto_demo", "strict_demo", "decision_demo"}
+    assert set(ids) == {"auto_demo", "strict_demo", "decision_demo", "chain_demo"}
     auto = next(t for t in env["data"]["triggers"] if t["id"] == "auto_demo")
     assert auto["kind"] == "manual" and auto["has_policy"] is True
 
@@ -105,6 +110,38 @@ async def test_run_trigger_params_override(tmp_path):
     assert env["data"]["status"] == "completed"
     # override 가 트리거 기본 params 를 덮어 결정 초안에 반영
     assert "오버라이드 결정" in env["data"]["result"]["data"]["title"]
+
+
+async def test_run_trigger_chain_style(tmp_path, monkeypatch):
+    """P7 chain-스타일(target.chain, protocol 키 없음) → 크래시 없이 인라인 체인 완주.
+
+    회귀 가드: trig["protocol"] 직접 접근 KeyError — 봉투 계약 위반이었다.
+    """
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+    ctx = _ctx(tmp_path)
+    env = await T.tool_run_trigger(ctx, "chain_demo")
+    assert env["data"]["status"] == "completed"
+    assert env["data"]["chain"] == "ingest_summarize"
+    assert env["trigger"]["id"] == "chain_demo"
+    # 실행 이력에 해소된 chain/protocol 기록(protocol 은 인라인 체인이라 None)
+    runs = ctx.scheduler.runlog.all()
+    assert runs[-1]["trigger_id"] == "chain_demo" and runs[-1]["status"] == "completed"
+    assert runs[-1]["chain"] == "ingest_summarize" and runs[-1]["protocol"] is None
+
+
+async def test_run_trigger_repo_chain_triggers(tmp_path, monkeypatch):
+    """리포 커밋 triggers.json 의 chain 트리거 2종이 run_trigger 에서 봉투를 돌려준다.
+
+    shipped config 그대로의 재현 — hourly_ingest 는 인라인 체인 완주,
+    nightly_full_loop 는 require_approval 정책이라 승인큐 폴백(무인 실발행 0).
+    """
+    monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
+    ctx = _ctx(tmp_path)
+    ctx.scheduler.triggers_path = Scheduler().triggers_path  # ROOT/triggers.json
+    env = await T.tool_run_trigger(ctx, "hourly_ingest")
+    assert env["data"]["status"] == "completed"
+    env = await T.tool_run_trigger(ctx, "nightly_full_loop")
+    assert env["data"]["status"] == "pending_approval"
 
 
 # ── Scheduler 단위 ──────────────────────────────────────────────

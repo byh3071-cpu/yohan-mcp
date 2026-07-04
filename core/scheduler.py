@@ -7,6 +7,7 @@
 호스트는 아직 미정이다. 여기까지는 호스트·외부 스케줄러 의존성 0 으로 PC 에서 테스트된다.
 
     Trigger = {id, kind:"cron"|"webhook"|"manual", protocol, params, policy?, schedule?, desc?}
+            | {id, type:"interval"|"daily"|"webhook", schedule, target:{chain}, ...}  # P7 chain-스타일
 
 - 트리거 **정의**는 `triggers.json`(스키마 불변, 리포에 커밋).
 - 트리거 **실행 이력**(런타임 상태)은 `memory/trigger_runs.jsonl`(gitignore).
@@ -112,8 +113,12 @@ async def run_trigger(ctx, trigger_id: str, params: dict | None = None) -> dict:
 
     트리거에 policy 가 있으면 그 정책으로 게이트를 평가한다(감사 로그는 ctx.policy 와 공유).
     실행 결과 봉투에 trigger 메타를 덧붙이고, 실행 이력을 trigger_runs.jsonl 에 남긴다.
+
+    P7 chain-스타일 트리거(target.chain, protocol 키 없음)도 P7 엔진과 같은 규칙으로
+    해석한다 — 체인/프로토콜 해소는 core.triggers(_chain_of/_protocol_of)에 위임(단일 소스).
     """
     from core import tools as T  # 지연 임포트: tools ↔ scheduler 순환 방지
+    from core import triggers as TR  # 지연 임포트: chain/protocol 해소를 P7 과 단일화
 
     sched: Scheduler = ctx.scheduler
     trig = sched.get(trigger_id)
@@ -131,13 +136,21 @@ async def run_trigger(ctx, trigger_id: str, params: dict | None = None) -> dict:
         shared_log = getattr(getattr(ctx, "policy", None), "log", None)
         engine = PolicyEngine(trig["policy"], log=shared_log)
 
-    env = await T.tool_run_action(ctx, trig["protocol"], merged, policy=engine)
+    # chain/protocol 해소 — trig["protocol"] 직접 접근은 커밋된 chain-스타일 트리거
+    # (protocol 키 없음)에서 KeyError 크래시였다(실패도 봉투로 반환하는 계약 위반).
+    chain = TR._chain_of(trig)
+    proto = TR._protocol_of(trig)
+    if proto is None:  # ingest_summarize — 인라인 체인(내부 작업, always_gate 비대상)
+        env = await TR._chain_ingest_summarize(ctx, merged)
+    else:
+        env = await T.tool_run_action(ctx, proto, merged, policy=engine)
 
     status = env.get("data", {}).get("status") if isinstance(env.get("data"), dict) else None
     sched.runlog.record({
         "trigger_id": trigger_id,
         "kind": trig.get("kind"),
-        "protocol": trig.get("protocol"),
+        "chain": chain,
+        "protocol": proto,
         "run_id": (env.get("data") or {}).get("run_id"),
         "status": status,
     })
