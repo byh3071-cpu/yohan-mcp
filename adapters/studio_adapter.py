@@ -42,6 +42,11 @@ _DEFAULT_SUBDIR = "src/content/blog"
 # 실발행 경로 템플릿(문서/근거용 — 실제 경로는 _target_path 가 OS-safe 하게 합성).
 _PUBLISH_PATH = "{STUDIO_REPO_PATH}/src/content/blog/{slug}.mdx"
 
+# git/gh 서브프로세스 시간 상한(초). httpx 경로(studio 10s·notion 15s·ollama 60s)와 같은
+# '모든 외부 IO 는 상한' 원칙 — push/gh 가 네트워크 정지·자격증명 프롬프트로 멈춰도
+# 워커 스레드가 영구 블록되지 않게 한다. 느린 네트워크 대응용으로 env 로 조정 가능.
+_GIT_TIMEOUT = float(os.getenv("STUDIO_GIT_TIMEOUT", "120"))
+
 # frontmatter 필수/선택 필드 (yohan-studio 글 스키마)
 _FM_REQUIRED = ("title", "description", "date", "tags", "category", "published")
 _FM_OPTIONAL = ("thumbnail", "relatedProjects", "source_urls")
@@ -395,10 +400,11 @@ class StudioAdapter(BackendAdapter):
         return str(target)
 
     def _git(self, *args: str) -> subprocess.CompletedProcess:
-        """git 서브프로세스 — cwd=repo_path. 실패 시 CalledProcessError 로 상위에서 폴백 처리."""
+        """git 서브프로세스 — cwd=repo_path. 실패 시 CalledProcessError,
+        정지(네트워크·자격증명 프롬프트) 시 _GIT_TIMEOUT 초 후 TimeoutExpired 로 상위에서 폴백 처리."""
         return subprocess.run(
             ["git", *args], cwd=self.repo_path,
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=True, timeout=_GIT_TIMEOUT,
         )
 
     def _has_staged_changes(self) -> bool:
@@ -407,7 +413,7 @@ class StudioAdapter(BackendAdapter):
         check=False 로 돌려 CalledProcessError 를 유발하지 않는다(정상적 '변경 있음' 신호이므로)."""
         res = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
-            cwd=self.repo_path, capture_output=True, text=True,
+            cwd=self.repo_path, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
         )
         return res.returncode != 0
 
@@ -438,8 +444,10 @@ class StudioAdapter(BackendAdapter):
         try:
             self._git("push", "-u", "origin", branch)
             pushed = True
-        except subprocess.CalledProcessError as exc:
-            # 원격 없음 등 — 브랜치/커밋은 남기고 push 만 실패로 보고(죽지 않음)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            # 원격 없음·인증 실패·네트워크 정지(타임아웃) 등 — 브랜치/커밋은 남기고
+            # push 만 실패로 보고(죽지 않음). 타임아웃도 동일하게 pushed=False 재시도 가능 상태로 처리한다
+            # (상위 publish 가 side_effect="local_branch_committed" 로 orphan 브랜치를 알린다).
             pr_url = f"push 실패: {exc.stderr or exc}"
         if pushed:
             try:  # gh 있으면 PR 생성(없으면 브랜치만 push)
@@ -447,9 +455,11 @@ class StudioAdapter(BackendAdapter):
                     ["gh", "pr", "create", "--base", self.base_branch, "--head", branch,
                      "--title", f"publish: {slug}", "--body", "yohan-mcp 자동 발행 초안"],
                     cwd=self.repo_path, capture_output=True, text=True, check=True,
+                    timeout=_GIT_TIMEOUT,
                 )
                 pr_url = (res.stdout or "").strip() or pr_url
-            except (FileNotFoundError, subprocess.CalledProcessError):
+            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                # push 는 이미 성공 — gh 미설치·실패·정지(타임아웃)는 브랜치 push 만 완료로 처리(발행 유지).
                 pr_url = pr_url or "gh 미설치/실패 — 브랜치 push 만 완료"
         return {"branch": branch, "base": self.base_branch, "pushed": pushed, "pr_url": pr_url}
 
