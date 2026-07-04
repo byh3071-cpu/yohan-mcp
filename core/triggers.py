@@ -324,6 +324,18 @@ async def _chain_ingest_summarize(ctx, params: dict) -> dict:
     built = P._build_summary_from_ingest({"ingest": {"output": ing}}, params)
     summary = built["data"]
     created = await T.tool_create(ctx, "summary", summary)
+    if created.get("data") is None:  # 검증 실패/백엔드 장애 — ingest 가드와 동형(graceful)
+        # completed 로 위장하면 fire() 가 watermark 를 전진시켜 같은 입력이 영구
+        # no_new 스킵됨('실패는 전진 안 함' 원칙 무효화) → aborted 로 보고해
+        # 다음 발화에서 체인을 재실행하게 한다. 유일 산출물(summary) 실패 = 체인 실패.
+        return V.make_envelope(
+            {"status": "aborted", "chain": "ingest_summarize", "stage": "summary_create",
+             "resource_id": ing["data"].get("resource_id")},
+            sources_used=ing["provenance"]["sources_used"] + created["provenance"]["sources_used"],
+            schema_valid=False,
+            reasoning_steps=["RESOURCE 수집", "SUMMARY create 실패 → 체인 중단"],
+            errors=created.get("errors"), aborted=True,
+        )
     return V.make_envelope(
         {
             "status": "completed", "chain": "ingest_summarize",
