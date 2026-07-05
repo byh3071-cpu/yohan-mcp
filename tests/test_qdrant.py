@@ -98,11 +98,32 @@ async def test_qdrant_empty_key_rejected():
 
 async def test_qdrant_search_missing_collection_logs_warning(caplog):
     # 컬렉션 생성 전 검색 → query_points 가 컬렉션 미존재로 예외 → search() except(continue) 경로.
+    # search_collections 전체(쓰기 컬렉션+관제탑4+brain2)가 미존재이므로 "총체적 실패" 분기 —
+    # 1회 집계 WARNING 이 남는다(test_qdrant_search_partial_missing_collections_no_warning 과 대비).
     qa = _adapter()
     with caplog.at_level(logging.WARNING):
         res = await qa.search("어텐션", {"top_k": 5})
     assert res == []  # graceful 폴백(continue) 유지 — 빈 결과
     assert any("실패" in r.message or r.levelno == logging.WARNING for r in caplog.records)
+    await qa.aclose()
+
+
+async def test_qdrant_search_partial_missing_collections_no_warning(caplog):
+    """일부 컬렉션만 없을 때(부분 성공) — WARNING 없이 조용히 skip(노이즈 제거).
+
+    실사용 재현(#qdrant-legacy-skip 배경): 레거시 쓰기 컬렉션(yohan_resources 등)이 드롭돼도
+    brain_memory 등 다른 컬렉션이 살아있으면 검색 자체는 정상 성공한다. 이때 개별 컬렉션의
+    404 는 노이즈일 뿐이므로 WARNING 을 내지 않아야 한다 — 전체가 회수 실패했을 때만 집계
+    경고를 내는 test_qdrant_search_missing_collection_logs_warning 과 대비되는 케이스.
+    """
+    qa = _adapter()
+    await qa.create("resource", RESOURCE)  # self.collection(yohan_resources)만 존재하게 시딩
+    with caplog.at_level(logging.WARNING):
+        res = await qa.search("어텐션", {"top_k": 5})
+    assert res and res[0]["data"]["resource_id"] == "r1"  # 존재하는 컬렉션에서 부분 성공 회수
+    # 나머지 6개(관제탑4 + brain_memory + ontology_triples)는 이 :memory: 인스턴스에 미존재하지만
+    # 전체 실패가 아니므로(위 결과 존재) WARNING 로그가 전혀 없어야 한다(노이즈 제거 확인).
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
     await qa.aclose()
 
 
