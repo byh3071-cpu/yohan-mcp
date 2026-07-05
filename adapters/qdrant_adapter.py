@@ -229,13 +229,19 @@ class QdrantAdapter(BackendAdapter):
         client = self._get_client()
         vec = (await self._embed([query or ""]))[0]
         records: list[dict] = []
+        failed: list[str] = []
         for coll in self.search_collections:
             try:
                 res = await client.query_points(coll, query=vec, limit=fetch_k, with_payload=True)
             except Exception as exc:
-                # 컬렉션 미존재/차원불일치(bge-m3 미설치 등) — 건너뛰고 계속.
-                # 진단은 health_check(status 도구)가 '차원 불일치 … bge-m3 pull 필요'로 표면화.
-                logger.warning("Qdrant 컬렉션 '%s' 검색 실패: %s: %s", coll, type(exc).__name__, exc)
+                # 컬렉션 미존재(레거시 삭제 등)/차원불일치(bge-m3 미설치 등) — 건너뛰고 계속.
+                # 개별 실패는 DEBUG(기본 비표시)로만 남긴다: search_collections 는 레거시 쓰기
+                # 컬렉션(예: 드롭된 yohan_resources)까지 포함해 항상 검색을 시도하는 구조라,
+                # 다른 컬렉션이 살아있는 한 이 실패는 매 질의 노이즈일 뿐 실질적 문제가 아니다
+                # (#qdrant-legacy-skip). 검색 자체가 총체적으로 비어버린 경우에만 아래에서
+                # 1회 집계 경고로 표면화한다 — 개별 컬렉션 진단은 health_check 가 상시 표면화.
+                logger.debug("Qdrant 컬렉션 '%s' 검색 실패(스킵): %s: %s", coll, type(exc).__name__, exc)
+                failed.append(coll)
                 continue
             # 레거시(yohan_resources)=resource, 관제탑 컬렉션=컬렉션명(스키마 없는 벡터청크 — 검증 제외).
             rtype = "resource" if coll == self.collection else coll
@@ -253,6 +259,15 @@ class QdrantAdapter(BackendAdapter):
                 if score is not None and score > 0:
                     score *= self._type_weight(payload)
                 records.append(make_record(rid, rtype, self.name, payload, score=score))
+        if not records and failed:
+            # 검색 대상 컬렉션 중 하나라도 성공했으면(records 존재) 개별 실패는 조용히 넘어간다.
+            # 그러나 결과가 통째로 0건이면(전 컬렉션 실패 가능성 포함) 원인 단서 없이 빈 결과만
+            # 돌려주는 건 위험하므로 1회 집계 경고로 표면화 — "실패가 총 실패를 유발했다"가
+            # 아니라 "결과 0건 + 그 시점에 회수 실패한 컬렉션 목록"을 사실 그대로 보고한다.
+            logger.warning(
+                "Qdrant 검색 결과 0건 — 회수 실패 컬렉션: %s (연결/차원/시딩 확인 필요, health_check 참고)",
+                ", ".join(failed),
+            )
         # 컬렉션 간 병합 — score 내림차순이 곧 RRF 입력 순위(base.py 계약). None 은 맨 뒤.
         # U3 가중이 이미 곱해진 score 로 정렬하므로 type 부스트/감쇠가 RRF 입력 순위에 반영된다.
         records.sort(key=lambda r: r["score"] if r["score"] is not None else float("-inf"), reverse=True)
