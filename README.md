@@ -458,4 +458,4 @@ python -m pytest -q                  # 전체 테스트
 python scripts/validate_schemas.py   # 스키마 정합성
 ```
 
-> 테스트는 `python -m pytest` 로 실행한다. ROOT 회귀는 수정돼 수집은 정상(153 collected)이다. 단 E4-01 SoT 리팩터로 `run_action`/approval 영속화 경로 테스트 일부가 실패하는 선재 이슈(이번 변경과 무관)가 있어 이슈 #7에서 추적 중이다. 통과 개수는 직접 실행해 확인해라.
+> 테스트는 `python -m pytest` 로 실행한다. 기준(2026-07): `pytest -m "not integration"` 292 collected / 291 passed / 1 deselected. E4-01 SoT 리팩터의 저널 공유 오염 회귀는 `tests/conftest.py` autouse 격리로 해소됐다(#7 closed). `integration` 마커는 실 Qdrant(`QDRANT_URL`)가 있을 때만 돈다.

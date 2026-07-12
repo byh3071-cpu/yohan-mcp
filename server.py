@@ -157,7 +157,7 @@ async def publish(summary: dict | str) -> dict:
 
 @mcp.tool()
 async def ingest(source: str, data: dict | None = None) -> dict:
-    """수집 파이프라인 (P3 예정 stub, 입력 스키마 검증)."""
+    """URL 수집 파이프라인 — Notion RESOURCE + Qdrant 벡터 + memory ingest 로그 3중 적재 (멱등)."""
     return await T.tool_ingest(ctx, source, data)
 
 
