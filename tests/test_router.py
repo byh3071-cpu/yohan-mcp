@@ -199,3 +199,73 @@ async def test_router_top_k_negative_returns_all_fused():
     assert len(default_out["results"]) == 5
     # 음수(6) > 기본(5) — 음수가 기본값으로 클램프됐다면 둘 다 5라 구분 불가했을 것
     assert len(out["results"]) > len(default_out["results"])
+
+
+# ── per-page cap — 페이지 독식 방지(#21). 융합 이후·top_k 절단 이전 표출 다양화 ──
+def page_chunks(page, n):
+    """같은 notion_page_id 의 청크 n개 — 청크 고유 id(point_id 상당)로 식별."""
+    return [make_record(f"{page}-pt{i}", "knowledge_base", "qdrant",
+                        {"notion_page_id": page, "chunk_index": i}) for i in range(n)]
+
+
+async def test_per_page_cap_router_default_off():
+    # router 자체 기본은 무제한 — cap 기본값은 tool_get_context 표출 경로만 주입한다.
+    # raw search(tool_search·protocol search step)의 회수가 조용히 줄면 안 되기 때문(스코프 격리).
+    a = FakeAdapter("qdrant", page_chunks("P", 5))
+    r = SmartRouter({"qdrant": a}, k=60)
+    out = await r.search("q", {"top_k": 10})
+    assert len(out["results"]) == 5  # opts 에 per_page_cap 없음 → cap 미적용
+
+
+async def test_per_page_cap_blocks_page_monopoly():
+    # cap=3: 롱페이지 5청크가 상위를 독식해도 표출은 3개까지,
+    # 밀려났던 타 페이지 청크가 top_k 안으로 들어온다.
+    a = FakeAdapter("qdrant", page_chunks("P", 5) + page_chunks("Q", 1))
+    r = SmartRouter({"qdrant": a}, k=60)
+    out = await r.search("q", {"top_k": 5, "per_page_cap": 3})
+    pages = [x["data"]["notion_page_id"] for x in out["results"]]
+    assert pages.count("P") == 3
+    assert "Q" in pages  # cap 없었으면 P 5청크에 밀려 top_k 밖이던 결과
+    # 남는 것은 페이지 내 최상위 청크(입력이 점수순이므로 하위 청크가 제외됨)
+    p_chunks = [x["data"]["chunk_index"] for x in out["results"] if x["data"]["notion_page_id"] == "P"]
+    assert p_chunks == [0, 1, 2]
+
+
+async def test_per_page_cap_backfill_fills_top_k():
+    # cap 은 후보를 죽이는 절단이 아니라 자리 재배분 — 초과분이 빠진 슬롯을
+    # 타 페이지가 backfill 해 top_k 를 채운다(다양화의 실효).
+    a = FakeAdapter("qdrant", page_chunks("P", 5) + page_chunks("Q", 3) + page_chunks("R", 1))
+    r = SmartRouter({"qdrant": a}, k=60)
+    out = await r.search("q", {"top_k": 5, "per_page_cap": 3})
+    pages = [x["data"]["notion_page_id"] for x in out["results"]]
+    assert len(out["results"]) == 5  # top_k 충족(미달 아님)
+    assert pages.count("P") == 3 and pages.count("Q") == 2
+
+
+async def test_per_page_cap_allows_top_k_shortfall():
+    # cap 후 남은 후보가 top_k 미만이면 미달 그대로 반환(무의미한 패딩 금지).
+    a = FakeAdapter("qdrant", page_chunks("P", 5))
+    r = SmartRouter({"qdrant": a}, k=60)
+    out = await r.search("q", {"top_k": 5, "per_page_cap": 2})
+    assert len(out["results"]) == 2
+    assert [x["data"]["chunk_index"] for x in out["results"]] == [0, 1]
+
+
+async def test_per_page_cap_zero_disables():
+    # 0=무제한 — #20 회수 보존 경로(기존 동작과 동일). 회수 검증 테스트가 이 스위치를 쓴다.
+    a = FakeAdapter("qdrant", page_chunks("P", 5))
+    r = SmartRouter({"qdrant": a}, k=60)
+    out = await r.search("q", {"top_k": 5, "per_page_cap": 0})
+    assert len(out["results"]) == 5
+
+
+async def test_per_page_cap_skips_records_without_page_id():
+    # 페이지 개념 없는 결과(brain_memory 등 notion_page_id 부재)는 cap 대상이 아니다 —
+    # None 을 한 버킷으로 묶으면 정상 결과가 대량 탈락하기 때문. 전부 통과해야 한다.
+    no_page = [make_record(f"m{i}", "brain_memory", "qdrant", {"path": f"rules/r{i}.md"}) for i in range(4)]
+    a = FakeAdapter("qdrant", page_chunks("P", 3) + no_page)
+    r = SmartRouter({"qdrant": a}, k=60)
+    out = await r.search("q", {"top_k": 10, "per_page_cap": 1})
+    pages = [x["data"].get("notion_page_id") for x in out["results"]]
+    assert pages.count("P") == 1  # page 있는 결과만 cap
+    assert len([p for p in pages if p is None]) == 4  # page 없는 결과는 전량 생존

@@ -67,7 +67,8 @@ async def test_integration_get_context_multichunk_on_real_server(tmp_path):
 
         adapters = {"memory": MemoryAdapter(base_dir=tmp_path), "qdrant": qa}
         ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator())
-        env = await T.tool_get_context(ctx, QUERY, {"top_k": 20})
+        # per_page_cap:0 — 이 테스트의 보장 대상은 회수(붕괴 0, 청크 전량)라 표출 다양화(#21)를 끈다
+        env = await T.tool_get_context(ctx, QUERY, {"top_k": 20, "per_page_cap": 0})
 
         matches = env["data"]["matches"]
         ids = [m["id"] for m in matches]

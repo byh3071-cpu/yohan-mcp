@@ -55,7 +55,8 @@ async def test_get_context_vector_multichunk_not_collapsed(tmp_path):
     adapters = {"memory": MemoryAdapter(base_dir=tmp_path), "qdrant": qa}
     ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator())
 
-    env = await T.tool_get_context(ctx, QUERY, {"top_k": 20})
+    # per_page_cap:0 — 이 테스트의 보장 대상은 회수(붕괴 0, 청크 전량)라 표출 다양화(#21)를 끈다
+    env = await T.tool_get_context(ctx, QUERY, {"top_k": 20, "per_page_cap": 0})
 
     # 표준봉투 형태
     assert set(env) >= {"data", "verification", "provenance"}
@@ -72,6 +73,23 @@ async def test_get_context_vector_multichunk_not_collapsed(tmp_path):
     # 관제탑 컬렉션 → type = 컬렉션명(스키마 없는 벡터청크)
     assert all(m["type"] == "knowledge_base" for m in matches)
     assert "qdrant" in env["provenance"]["sources_used"]
+    await qa.aclose()
+
+
+async def test_get_context_default_per_page_cap_injected(tmp_path):
+    # tool_get_context 는 opts 미지정 시 per_page_cap 기본(3)을 주입한다(#21 배선 핀).
+    # 같은 페이지 6청크 → 표출 3개로 cap, 타 페이지 3청크는 그대로. 배선이 끊기면 6이 돼 실패.
+    qa = await _seed_qdrant()
+    adapters = {"memory": MemoryAdapter(base_dir=tmp_path), "qdrant": qa}
+    ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator())
+
+    env = await T.tool_get_context(ctx, QUERY, {"top_k": 20})
+
+    page_counts = {}
+    for m in env["data"]["matches"]:
+        page_counts[m["data"]["notion_page_id"]] = page_counts.get(m["data"]["notion_page_id"], 0) + 1
+    assert page_counts[PAGE_A] == 3  # 6청크 → 기본 cap 3 (독식 방지)
+    assert page_counts[PAGE_B] == N_B  # cap 이하 페이지는 영향 없음
     await qa.aclose()
 
 
@@ -148,7 +166,8 @@ async def test_get_context_vector_and_reverse_recall_coexist(tmp_path):
     adapters = {"notion": notion, "memory": MemoryAdapter(base_dir=tmp_path), "qdrant": qa}
     ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator())
 
-    env = await T.tool_get_context(ctx, QUERY, {"top_k": 20, "project": "yohan-mcp", "tags": ["MCP"]})
+    env = await T.tool_get_context(
+        ctx, QUERY, {"top_k": 20, "per_page_cap": 0, "project": "yohan-mcp", "tags": ["MCP"]})
     await client.aclose()
 
     d = env["data"]

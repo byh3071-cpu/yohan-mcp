@@ -29,7 +29,7 @@ from adapters.n8n_adapter import N8nAdapter
 from adapters.notion_adapter import NotionAdapter
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.studio_adapter import StudioAdapter
-from core.router import SmartRouter
+from core.router import PER_PAGE_CAP_DEFAULT, SmartRouter
 from core.schema_validator import SchemaValidator
 from core.links import LinkStore
 from core.approval import ApprovalQueue
@@ -432,7 +432,10 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
     → devlog(과거 경험) → patterns(재사용 가능 패턴). PHASE 3.
     opts: {project?, category?, tags?} — Dev Log/패턴 회수 키. 없으면 해당 회수는 빈 배열.
     """
-    opts = opts or {}
+    # per_page_cap 기본 주입(#21) — 페이지 독식 방지는 get_context 표출 경로에만 적용한다.
+    # raw search(tool_search·protocol search step)는 router 기본(무제한)이라 회수가 조용히
+    # 줄지 않는다. 호출자가 명시하면(0=끔 포함) 그 값이 우선.
+    opts = {"per_page_cap": PER_PAGE_CAP_DEFAULT, **(opts or {})}
     res = await ctx.router.search(query, opts)
     matches = res["results"]
     matched_types = {r.get("type") for r in matches}

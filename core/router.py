@@ -13,6 +13,9 @@ import asyncio
 from adapters.base import BackendAdapter
 
 RRF_K = 60
+# get_context 표출 기본값(#21) — tool_get_context 가 opts 에 주입한다. router 자체 기본은
+# 무제한(cap 미적용): raw search(tool_search·protocol step)의 회수를 조용히 줄이지 않기 위함.
+PER_PAGE_CAP_DEFAULT = 3
 
 
 class SmartRouter:
@@ -59,6 +62,13 @@ class SmartRouter:
             ranked_lists.append((name, records))
 
         fused = self._rrf_fuse(ranked_lists)
+        # 페이지 독식 방지(per-page cap) — 융합 '이후'·top_k 절단 '이전'의 표출 다양화(#21).
+        # 식별은 청크(#20 회수 보존), 표출 제어는 페이지: 한 notion_page_id 의 cap 초과
+        # 청크만 표출에서 제외해 롱페이지가 top_k 를 독식하지 못하게 한다.
+        # opts 에 없으면(None 포함) 무제한 — 기본 cap 은 tool_get_context 만 주입한다. ≤0=무제한.
+        cap = int(opts.get("per_page_cap") or 0)
+        if cap > 0:
+            fused = self._cap_per_page(fused, cap)
         # top_k 절단은 RRF 융합 '이후'에만 수행한다 — 백엔드/어댑터가 랭킹 전에 후보를 버리면
         # 융합·다양화 이전에 유효 후보가 폐기되어 재현율/다양성이 급감한다(선절단 금지).
         top_k = int(opts.get("top_k", 5))
@@ -76,6 +86,28 @@ class SmartRouter:
             return [], f"{name}: search 미구현(P2.5 예정) — skip"
         except Exception as exc:  # 백엔드 장애가 전체 검색을 깨지 않게
             return [], f"{name}: {type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _cap_per_page(results: list[dict], cap: int) -> list[dict]:
+        """notion_page_id 당 최대 cap 개만 남기고 초과 청크를 표출에서 제외.
+
+        page_id 는 data 안에 있다(qdrant 관제탑 컬렉션 청크). page_id 가 없는
+        결과(memory·notion 백엔드 등)는 페이지 개념이 없으므로 cap 을 적용하지
+        않고 그대로 통과시킨다 — None 을 한 버킷으로 묶으면 정상 결과가 대량
+        탈락하기 때문. 입력이 점수순이므로 남는 것은 페이지별 최상위 청크다.
+        """
+        counts: dict[str, int] = {}
+        kept: list[dict] = []
+        for rec in results:
+            page_id = (rec.get("data") or {}).get("notion_page_id")
+            if page_id is None:
+                kept.append(rec)
+                continue
+            seen = counts.get(page_id, 0)
+            if seen < cap:
+                counts[page_id] = seen + 1
+                kept.append(rec)
+        return kept
 
     def _rrf_fuse(self, ranked_lists: list[tuple[str, list[dict]]]) -> list[dict]:
         """여러 백엔드의 순위 리스트를 RRF 로 합산해 내림차순 정렬.
