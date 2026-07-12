@@ -22,23 +22,23 @@
     },
     {
       "id": "morning_publish",
-      "kind": "cron",
+      "type": "daily",
       "enabled": true,
-      "schedule": "57 8 * * *",
-      "protocol": "ingest_summarize_publish",
+      "schedule": { "at": "08:57", "tz": "Asia/Seoul" },
+      "target": { "chain": "full_loop", "params": { "url": "https://example.com/today" } },
       "params": { "url": "https://example.com/today" },
       "policy": {
         "auto_approve_when": ["dry_run_high_quality"],
         "always_gate": ["external_publish"],
         "max_publishes_per_day": 5
       },
-      "desc": "(legacy) 매일 아침 수집→요약→발행. 드라이런 고품질만 자동, 외부 실발행은 사람 승인."
+      "desc": "매일 아침 수집→요약→발행. 드라이런 고품질만 자동, 외부 실발행은 사람 승인."
     },
     {
       "id": "auto_publish_demo",
-      "kind": "manual",
+      "type": "manual",
       "enabled": true,
-      "protocol": "ingest_summarize_publish",
+      "target": { "chain": "full_loop", "params": { "url": "https://example.com/demo" } },
       "params": { "url": "https://example.com/demo" },
       "policy": {
         "auto_approve_when": ["dry_run_high_quality"],
@@ -49,11 +49,10 @@
     },
     {
       "id": "strict_publish",
-      "kind": "webhook",
       "type": "webhook",
       "enabled": true,
       "event": { "name": "publish_request" },
-      "protocol": "ingest_summarize_publish",
+      "target": { "chain": "full_loop", "params": { "url": "https://example.com/hook" } },
       "params": { "url": "https://example.com/hook" },
       "policy": {
         "auto_approve_when": [],
@@ -64,9 +63,9 @@
     },
     {
       "id": "draft_decision",
-      "kind": "manual",
+      "type": "manual",
       "enabled": true,
-      "protocol": "resource_to_decision",
+      "target": { "chain": "resource_to_decision", "params": { "query": "이번 주 의사결정 후보" } },
       "params": { "query": "이번 주 의사결정 후보" },
       "desc": "수동 트리거 — 검색→컨텍스트→DECISION 초안(게이트 없음, 가역)."
     }

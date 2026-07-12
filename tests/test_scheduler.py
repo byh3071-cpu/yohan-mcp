@@ -200,3 +200,38 @@ def test_repo_triggers_json_loads():
     sched = Scheduler()  # ROOT/triggers.json
     ids = [t["id"] for t in sched.list()]
     assert "auto_publish_demo" in ids and "strict_publish" in ids
+
+
+def test_repo_triggers_json_all_new_form():
+    """리포 triggers.json 은 전부 신형(type/target.chain) — legacy 필드(kind/protocol) 0.
+
+    legacy 4건 마이그레이션의 의미 보존 단언: 변환 전 해석(chain/type/스케줄/정책)과 동일.
+    Scheduler.list() 는 type/target/policy 를 표면화하지 않으므로 원본 파일을 직접 검사한다.
+    """
+    from pathlib import Path
+
+    from core.triggers import _chain_of, _daily_at, _protocol_of, _trigger_type, validate_trigger
+
+    raw = json.loads((Path(__file__).resolve().parents[1] / "triggers.json").read_text("utf-8"))
+    by = {t["id"]: t for t in raw["triggers"]}
+    for tid, t in by.items():
+        assert "kind" not in t and "protocol" not in t, f"{tid}: legacy 필드 잔존"
+        assert t.get("type") in {"interval", "daily", "webhook", "manual"}, tid
+        assert (t.get("target") or {}).get("chain"), f"{tid}: target.chain 없음"
+        ok, reason = validate_trigger(t)
+        assert ok, f"{tid}: {reason}"
+    # morning_publish — legacy cron "57 8 * * *" 과 동일 해석: daily 08:57 KST, full_loop
+    mp = by["morning_publish"]
+    assert _trigger_type(mp) == "daily" and _daily_at(mp) == (8, 57)
+    assert _chain_of(mp) == "full_loop" and _protocol_of(mp) == "ingest_summarize_publish"
+    assert mp["policy"]["max_publishes_per_day"] == 5  # 명시 정책 무손실(프리셋 환산 금지)
+    # strict_publish — 보안 게이트 보존: 모든 발행 무조건 사람 승인
+    sp = by["strict_publish"]
+    assert _trigger_type(sp) == "webhook" and sp["event"]["name"] == "publish_request"
+    assert sp["policy"]["always_gate"] == ["is_publish"]
+    assert sp["policy"]["max_publishes_per_day"] == 0
+    # draft_decision/auto_publish_demo — chain·타입 동등
+    assert _chain_of(by["draft_decision"]) == "resource_to_decision"
+    assert _trigger_type(by["draft_decision"]) == "manual"
+    assert _chain_of(by["auto_publish_demo"]) == "full_loop"
+    assert _trigger_type(by["auto_publish_demo"]) == "manual"
