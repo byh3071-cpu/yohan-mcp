@@ -47,6 +47,29 @@ _MULTI_FIELDS = {"tags", "key_insights", "related_terms", "alternatives"}
 _URL_FIELDS = {"source_url", "url", "cover_image"}
 _NUMBER_FIELDS = {"confidence", "price"}
 
+# 실 Notion DB 프로퍼티 보정 — 스키마 필드명(영문)과 실DB 프로퍼티명(한국어)이 다르다.
+# 값: (실 프로퍼티명, notion 타입). 프로퍼티명 None 은 페이지 프로퍼티로 보내지 않음
+# ("children" = 본문 블록으로 적재, "skip" = 미전송 — 멱등키는 CreateStore 가 로컬 보장).
+# 여기 없는 타입/필드는 기존 휴리스틱(필드명 = 프로퍼티명) 폴백.
+_PROP_OVERRIDES: dict[str, dict[str, tuple[str | None, str]]] = {
+    "resource": {
+        "title": ("이름", "title"),
+        "source_url": ("원본 URL", "url"),
+        "resource_type": ("유형", "select"),
+        "domain": ("카테고리", "select"),
+        "status": ("상태", "status"),
+        "captured_at": ("수집일", "date"),
+        "raw_content": (None, "children"),
+        "resource_id": (None, "skip"),
+    },
+}
+# 스키마 enum → 실DB 옵션 번역(확실한 대응만). Notion status 타입은 select 와 달리
+# 미존재 옵션을 자동 생성하지 못해 미번역 값은 API 400 으로 명시 실패한다(무음 오기록 방지).
+_VALUE_MAP: dict[tuple[str, str], dict[str, str]] = {
+    ("resource", "status"): {"신규": "미처리", "완료": "요약완료"},
+    ("resource", "domain"): {"기타": "일반", "AI": "AI/자동화"},
+}
+
 
 class NotionAdapter(BackendAdapter):
     name = "notion"
@@ -81,9 +104,30 @@ class NotionAdapter(BackendAdapter):
     # ── property 매핑 ──────────────────────────────────────────
     def _to_notion_properties(self, type_: str, data: dict) -> dict:
         title_field = _TITLE_FIELD.get(type_, "title")
+        over = _PROP_OVERRIDES.get(type_, {})
         props: dict = {}
         for key, val in data.items():
             if val is None:
+                continue
+            if key in over:
+                name, ptype = over[key]
+                if name is None:  # children/skip — 페이지 프로퍼티 아님
+                    continue
+                v = _VALUE_MAP.get((type_, key), {}).get(str(val), val)
+                if ptype == "title":
+                    props[name] = {"title": [{"text": {"content": str(v)}}]}
+                elif ptype == "select":
+                    props[name] = {"select": {"name": str(v)}}
+                elif ptype == "status":
+                    props[name] = {"status": {"name": str(v)}}
+                elif ptype == "url":
+                    props[name] = {"url": str(v)}
+                elif ptype == "date":
+                    props[name] = {"date": {"start": str(v)}}
+                elif ptype == "number":
+                    props[name] = {"number": v}
+                else:
+                    props[name] = {"rich_text": [{"text": {"content": str(v)}}]}
                 continue
             if key == title_field:
                 props[key] = {"title": [{"text": {"content": str(val)}}]}
@@ -100,6 +144,20 @@ class NotionAdapter(BackendAdapter):
             else:
                 props[key] = {"rich_text": [{"text": {"content": str(val)}}]}
         return props
+
+    def _to_notion_children(self, type_: str, data: dict) -> list[dict]:
+        """본문 블록 대상 필드(raw_content 등) → paragraph 블록. rich_text 2000자 제한 분할."""
+        blocks: list[dict] = []
+        for key, (name, ptype) in _PROP_OVERRIDES.get(type_, {}).items():
+            if ptype != "children" or not data.get(key):
+                continue
+            text = str(data[key])
+            for i in range(0, len(text), 1900):
+                blocks.append({
+                    "object": "block", "type": "paragraph",
+                    "paragraph": {"rich_text": [{"text": {"content": text[i:i + 1900]}}]},
+                })
+        return blocks
 
     def _from_notion_page(self, type_: str, page: dict) -> dict:
         """Notion page → 평문 data dict (best-effort)."""
@@ -239,6 +297,9 @@ class NotionAdapter(BackendAdapter):
             raise ValueError(f"{type_} DB ID 미설정({_DB_ENV.get(type_)})")
         client = self._get_client()
         payload = {"parent": {"database_id": db_id}, "properties": self._to_notion_properties(type_, data)}
+        children = self._to_notion_children(type_, data)
+        if children:
+            payload["children"] = children
         resp = await client.post("/pages", json=payload)
         resp.raise_for_status()
         page = resp.json()

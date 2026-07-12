@@ -198,6 +198,47 @@ async def test_notion_create_mocked():
     await client.aclose()
 
 
+def test_notion_resource_props_map_to_real_db_schema():
+    """resource 생성 매핑 — 실 RESOURCE DB(한국어 프로퍼티) 정합 핀.
+
+    스키마 필드명(영문)을 그대로 프로퍼티명으로 보내면 실DB 에서 전 필드
+    validation_error(400). 구조 매핑 + status/select 옵션 번역을 고정한다.
+    """
+    n = NotionAdapter(token="t")
+    data = {
+        "resource_id": "res_x", "title": "제목", "source_url": "https://e.com/a",
+        "resource_type": "아티클", "domain": "기타", "status": "신규",
+        "raw_content": "본문", "captured_at": "2026-07-13T01:00:00+09:00",
+    }
+    props = n._to_notion_properties("resource", data)
+    assert set(props) == {"이름", "원본 URL", "유형", "카테고리", "상태", "수집일"}
+    assert props["이름"]["title"][0]["text"]["content"] == "제목"
+    assert props["원본 URL"] == {"url": "https://e.com/a"}
+    assert props["유형"] == {"select": {"name": "아티클"}}
+    assert props["카테고리"] == {"select": {"name": "일반"}}   # 기타 → 실DB 옵션 번역
+    assert props["상태"] == {"status": {"name": "미처리"}}     # 신규 → status 는 자동생성 불가라 필수
+    assert props["수집일"] == {"date": {"start": "2026-07-13T01:00:00+09:00"}}
+    # resource_id 는 대응 프로퍼티 없음 — 미전송(멱등키는 CreateStore 로컬), raw_content 는 본문 블록으로
+    children = n._to_notion_children("resource", data)
+    assert len(children) == 1
+    assert children[0]["paragraph"]["rich_text"][0]["text"]["content"] == "본문"
+
+
+def test_notion_children_split_long_text():
+    # Notion rich_text 2000자 제한 — 1900자 단위 분할
+    n = NotionAdapter(token="t")
+    blocks = n._to_notion_children("resource", {"raw_content": "a" * 4000})
+    assert len(blocks) == 3
+    assert sum(len(b["paragraph"]["rich_text"][0]["text"]["content"]) for b in blocks) == 4000
+
+
+def test_notion_non_overridden_type_keeps_heuristic():
+    # 매핑 미등록 타입(summary)은 기존 휴리스틱(필드명 = 프로퍼티명) 유지 — 회귀 방지
+    n = NotionAdapter(token="t")
+    props = n._to_notion_properties("summary", {"summary_id": "s1", "title": "요약", "domain": "AI"})
+    assert "title" in props and props["domain"] == {"select": {"name": "AI"}}
+
+
 async def test_notion_search_mocked():
     def handler(request):
         return httpx.Response(200, json={"results": [{
