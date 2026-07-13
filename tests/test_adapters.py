@@ -232,6 +232,17 @@ def test_notion_children_split_long_text():
     assert sum(len(b["paragraph"]["rich_text"][0]["text"]["content"]) for b in blocks) == 4000
 
 
+def test_notion_property_rich_text_split_over_2000():
+    # 프로퍼티 경로(children 불가)의 rich_text/title 도 2000자 초과 시 배열 분할 — 400 방지
+    n = NotionAdapter(token="t")
+    long = "가" * 5000
+    props = n._to_notion_properties("summary", {"summary_id": "s1", "title": long, "body": long})
+    for arr in (props["title"]["title"], props["body"]["rich_text"]):
+        assert len(arr) == 3  # ceil(5000/1900)
+        assert all(len(e["text"]["content"]) <= 2000 for e in arr)
+        assert "".join(e["text"]["content"] for e in arr) == long
+
+
 def test_notion_non_overridden_type_keeps_heuristic():
     # 매핑 미등록 타입(summary)은 기존 휴리스틱(필드명 = 프로퍼티명) 유지 — 회귀 방지
     n = NotionAdapter(token="t")
