@@ -188,20 +188,35 @@ class NotionAdapter(BackendAdapter):
         types = [opts["type"]] if opts.get("type") else list(_DB_ENV.keys())
         client = self._get_client()
         q = (query or "").lower()
+        # 매칭 상한(있으면 조기 종료). 없으면 DB 전체를 스캔 — 10행 컷으로 초과분이
+        # 조용히 회수 0 이 되던 결함 방지(summary_id 해소도 전체 스캔에 의존).
+        limit = int(opts.get("limit") or 0)
         records: list[dict] = []
         for type_ in types:
             db_id = self.db_ids.get(type_)
             if not db_id:
                 continue
-            resp = await client.post(f"/databases/{db_id}/query", json={"page_size": 10})
-            resp.raise_for_status()
-            for page in resp.json().get("results", []):
-                data = self._from_notion_page(type_, page)
-                blob = " ".join(str(v) for v in data.values()).lower()
-                if q and q not in blob:
-                    continue
-                rid = str(data.get(_ID_FIELD.get(type_, "id"), page.get("id", "")))
-                records.append(make_record(rid, type_, self.name, data))
+            cursor = None
+            while True:
+                body: dict = {"page_size": 100}
+                if cursor:
+                    body["start_cursor"] = cursor
+                resp = await client.post(f"/databases/{db_id}/query", json=body)
+                resp.raise_for_status()
+                j = resp.json()
+                for page in j.get("results", []):
+                    data = self._from_notion_page(type_, page)
+                    blob = " ".join(str(v) for v in data.values()).lower()
+                    if q and q not in blob:
+                        continue
+                    rid = str(data.get(_ID_FIELD.get(type_, "id"), page.get("id", "")))
+                    records.append(make_record(rid, type_, self.name, data))
+                if limit and len(records) >= limit:
+                    return records[:limit]
+                if j.get("has_more") and j.get("next_cursor"):
+                    cursor = j["next_cursor"]
+                else:
+                    break
         return records
 
     async def fetch_all(self, type_: str, limit: int | None = None) -> list[dict]:

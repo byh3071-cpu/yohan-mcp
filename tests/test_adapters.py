@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """Adapter — health_check 형태 + memory 실CRUD + notion 모킹 테스트."""
+import json
+
 import httpx
 import pytest
 
@@ -254,4 +256,46 @@ async def test_notion_search_mocked():
     a.db_ids = {k: "db" for k in a.db_ids}
     res = await a.search("알파", {"type": "summary"})
     assert res and res[0]["id"] == "s1" and res[0]["data"]["title"] == "알파"
+    await client.aclose()
+
+
+async def test_notion_search_paginates_past_first_page():
+    """10행 초과분 회수 결함 회귀 핀 — page_size/start_cursor 를 존중하는 목.
+
+    타깃이 120번째 행(첫 페이지 밖, 커서 2페이지째)이라 과거 page_size:10
+    단발 쿼리로는 조용히 회수 0. 커서 페이지네이션으로 반드시 회수돼야 한다.
+    """
+    dataset = [{
+        "id": f"p{i}",
+        "properties": {
+            "summary_id": {"type": "rich_text", "rich_text": [{"plain_text": f"s{i}"}]},
+            "title": {"type": "title",
+                      "title": [{"plain_text": "타깃요약" if i == 120 else "잡음"}]},
+        },
+    } for i in range(150)]
+
+    def handler(request):
+        body = json.loads(request.content or b"{}")
+        size = int(body.get("page_size", 100))
+        start = int(body.get("start_cursor") or 0)
+        chunk = dataset[start:start + size]
+        nxt = start + size
+        has_more = nxt < len(dataset)
+        return httpx.Response(200, json={
+            "results": chunk,
+            "has_more": has_more,
+            "next_cursor": str(nxt) if has_more else None,
+        })
+
+    client = httpx.AsyncClient(base_url="https://api.notion.com/v1",
+                               transport=httpx.MockTransport(handler))
+    a = NotionAdapter(client=client, token="t")
+    a.db_ids = {k: "db" for k in a.db_ids}
+    res = await a.search("타깃요약", {"type": "summary"})
+    assert [r["id"] for r in res] == ["s120"]
+    # limit 조기 종료: 매칭이 두 건이어도 상한만큼만 (전건 스캔 비용 제어)
+    a2 = NotionAdapter(client=client, token="t")
+    a2.db_ids = {k: "db" for k in a2.db_ids}
+    res2 = await a2.search("", {"type": "summary", "limit": 5})
+    assert len(res2) == 5
     await client.aclose()
