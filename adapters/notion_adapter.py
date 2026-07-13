@@ -20,6 +20,19 @@ from adapters.base import BackendAdapter, _Timer, health, make_record
 API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
+# Notion 은 rich_text/title 객체당 text.content 를 2000자로 제한한다. 배열 원소를
+# 2000자 미만(1900)으로 쪼개면 한 프로퍼티에 그 이상도 실을 수 있다(children 불가한
+# 프로퍼티 경로용 — 본문 블록은 _to_notion_children 이 따로 분할).
+_RICH_TEXT_LIMIT = 1900
+
+
+def _rich_text(val: object) -> list[dict]:
+    """긴 문자열을 2000자 제한 밑(1900) 단위 rich_text/title 배열로 분할."""
+    s = str(val)
+    if not s:
+        return [{"text": {"content": ""}}]
+    return [{"text": {"content": s[i:i + _RICH_TEXT_LIMIT]}} for i in range(0, len(s), _RICH_TEXT_LIMIT)]
+
 # 타입 → DB ID 환경변수 이름
 _DB_ENV = {
     "resource": "NOTION_RESOURCE_DB_ID",
@@ -115,7 +128,7 @@ class NotionAdapter(BackendAdapter):
                     continue
                 v = _VALUE_MAP.get((type_, key), {}).get(str(val), val)
                 if ptype == "title":
-                    props[name] = {"title": [{"text": {"content": str(v)}}]}
+                    props[name] = {"title": _rich_text(v)}
                 elif ptype == "select":
                     props[name] = {"select": {"name": str(v)}}
                 elif ptype == "status":
@@ -127,10 +140,10 @@ class NotionAdapter(BackendAdapter):
                 elif ptype == "number":
                     props[name] = {"number": v}
                 else:
-                    props[name] = {"rich_text": [{"text": {"content": str(v)}}]}
+                    props[name] = {"rich_text": _rich_text(v)}
                 continue
             if key == title_field:
-                props[key] = {"title": [{"text": {"content": str(val)}}]}
+                props[key] = {"title": _rich_text(val)}
             elif key in _SELECT_FIELDS:
                 props[key] = {"select": {"name": str(val)}}
             elif key in _MULTI_FIELDS and isinstance(val, list):
@@ -142,7 +155,7 @@ class NotionAdapter(BackendAdapter):
             elif key.endswith("_at"):
                 props[key] = {"date": {"start": str(val)}}
             else:
-                props[key] = {"rich_text": [{"text": {"content": str(val)}}]}
+                props[key] = {"rich_text": _rich_text(val)}
         return props
 
     def _to_notion_children(self, type_: str, data: dict) -> list[dict]:
@@ -152,10 +165,10 @@ class NotionAdapter(BackendAdapter):
             if ptype != "children" or not data.get(key):
                 continue
             text = str(data[key])
-            for i in range(0, len(text), 1900):
+            for i in range(0, len(text), _RICH_TEXT_LIMIT):
                 blocks.append({
                     "object": "block", "type": "paragraph",
-                    "paragraph": {"rich_text": [{"text": {"content": text[i:i + 1900]}}]},
+                    "paragraph": {"rich_text": [{"text": {"content": text[i:i + _RICH_TEXT_LIMIT]}}]},
                 })
         return blocks
 
