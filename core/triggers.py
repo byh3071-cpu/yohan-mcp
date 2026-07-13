@@ -95,15 +95,14 @@ def _pid_alive(pid) -> bool:
 
 # ── 트리거 타입/체인/정책 해소 ──────────────────────────────────────
 def _trigger_type(trig: dict) -> str:
-    """type 명시 우선, 없으면 kind/schedule 로 추론(interval|daily|webhook|manual)."""
+    """type 명시 우선, 없으면 schedule 형태로 추론(interval|daily|manual).
+
+    legacy kind 추론은 제거됨 — kind/protocol 트리거는 validate_trigger 가
+    명시 에러로 거부한다(단일 스키마화, 무음 오해석 방지).
+    """
     t = trig.get("type")
     if t:
         return t
-    kind = trig.get("kind")
-    if kind == "webhook":
-        return "webhook"
-    if kind == "manual":
-        return "manual"
     sch = trig.get("schedule")
     if isinstance(sch, dict):
         return "interval" if "every_sec" in sch else "daily"
@@ -113,14 +112,8 @@ def _trigger_type(trig: dict) -> str:
 
 
 def _chain_of(trig: dict) -> str:
-    """target.chain 우선, 없으면 legacy protocol 매핑."""
-    tgt = trig.get("target") or {}
-    if tgt.get("chain"):
-        return tgt["chain"]
-    proto = trig.get("protocol")
-    if proto == "ingest_summarize_publish":
-        return "full_loop"
-    return proto or "full_loop"
+    """target.chain — 신형 스키마 단일 해석(legacy protocol 폴백 제거)."""
+    return (trig.get("target") or {}).get("chain") or "full_loop"
 
 
 def _protocol_of(trig: dict) -> str | None:
@@ -170,6 +163,9 @@ def validate_trigger(trig: dict) -> tuple[bool, str]:
         return False, "트리거가 dict 아님"
     if not trig.get("id"):
         return False, "id 누락"
+    if "kind" in trig or "protocol" in trig:
+        # 무음 오해석 대신 명시 거부 — 마이그레이션 누락이 조용히 다른 의미로 돌지 않게
+        return False, "legacy 형식(kind/protocol) — type/target.chain 으로 마이그레이션 필요"
     typ = _trigger_type(trig)
     if typ == "interval":
         sch = trig.get("schedule")
@@ -392,6 +388,14 @@ async def dispatch_declared_trigger(ctx, trig: dict, params: dict) -> dict:
     않아 같은 dry_run 선언이 진입점에 따라 실발행으로 갈렸다(YOHA-5 회귀 방지).
     """
     from core import tools as T  # 지연 임포트: triggers ↔ tools 순환 방지
+    # 선언 검증을 실행 직전에도 강제 — 엔진 load 검증을 우회하는 진입점(run_trigger 등)에서
+    # legacy(kind/protocol)·무효 선언이 기본 체인으로 무음 오해석되는 것을 차단.
+    ok, reason = validate_trigger(trig)
+    if not ok:
+        return T._envelope(
+            {"status": "invalid_trigger", "trigger_id": trig.get("id")},
+            None, [], errors=[f"트리거 선언 무효: {reason}"],
+        )
     chain = _chain_of(trig)
     if chain == "ingest_summarize":
         return await _chain_ingest_summarize(ctx, params)

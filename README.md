@@ -318,10 +318,10 @@ python scripts/validate_schemas.py
 | 필드 | 값 | 설명 |
 | --- | --- | --- |
 | `id` | 문자열(필수) | 트리거 고유 ID |
-| `type` | `interval`·`daily`·`webhook`·`manual` | 트리거 종류(신). 레거시 `kind`: `cron`·`webhook`·`manual` |
+| `type` | `interval`·`daily`·`webhook`·`manual` | 트리거 종류. 레거시 `kind` 는 거부됨(마이그레이션 필요) |
 | `enabled` | 불리언(기본 true) | 비활성화 스위치 |
 | `schedule` | interval=`{every_sec}` · daily=`{at:"HH:MM", tz?}` 또는 cron `"M H * * *"` | 발화 주기 |
-| `target` | `{chain, params?}` | 실행 대상(신). 레거시: `protocol` + `params` |
+| `target` | `{chain, params?}` | 실행 대상. 레거시 `protocol` 은 거부됨(마이그레이션 필요) |
 | `event` | `{name}` | webhook 매핑 이벤트명 |
 | `policy` | `{require_approval}` 또는 `{auto_approve_when[], always_gate[], max_publishes_per_day}` | 게이트 정책 |
 | `params` | 객체 | 프로토콜 입력 |

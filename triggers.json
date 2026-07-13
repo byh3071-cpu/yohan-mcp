@@ -1,5 +1,5 @@
 {
-  "$comment": "P7 트리거 정의(스키마 불변, 리포 커밋). type=interval|daily|webhook|manual(legacy kind 호환). cron 풀파서 없음 — every_sec/at(HH:MM)/cron부분집합 'M H * * *'. 실발화는 TriggerEngine(core/triggers.py): cron계열 tick + webhook HMAC. 무인이어도 publish 는 always_gate(require_approval) 유지. 상태/이력/락은 data/(gitignore).",
+  "$comment": "P7 트리거 정의(스키마 불변, 리포 커밋). type=interval|daily|webhook|manual — legacy kind/protocol 은 거부됨(마이그레이션 필요). cron 풀파서 없음 — every_sec/at(HH:MM)/cron부분집합 'M H * * *'. 실발화는 TriggerEngine(core/triggers.py): cron계열 tick + webhook HMAC. 무인이어도 publish 는 always_gate(require_approval) 유지. 상태/이력/락은 data/(gitignore).",
   "triggers": [
     {
       "id": "hourly_ingest",

@@ -6,7 +6,8 @@
 실제 cron 타이머·웹훅 수신 같은 **구동(데이터 플레인)은 P5-B(배포)** 에서 주입하며,
 호스트는 아직 미정이다. 여기까지는 호스트·외부 스케줄러 의존성 0 으로 PC 에서 테스트된다.
 
-    Trigger = {id, kind:"cron"|"webhook"|"manual", protocol, params, policy?, schedule?, desc?}
+    Trigger = {id, type:"interval"|"daily"|"webhook"|"manual", target:{chain, params?},
+               params?, policy?, schedule?, event?, desc?}  # legacy kind/protocol 은 거부
 
 - 트리거 **정의**는 `triggers.json`(스키마 불변, 리포에 커밋).
 - 트리거 **실행 이력**(런타임 상태)은 `memory/trigger_runs.jsonl`(gitignore).
@@ -23,9 +24,6 @@ from core.paths import resolve_mcp_runtime_dir
 
 ROOT = Path(__file__).resolve().parent.parent
 _KST = timezone(timedelta(hours=9))
-
-_KINDS = ("cron", "webhook", "manual")
-
 
 def _now_iso() -> str:
     return datetime.now(_KST).isoformat(timespec="seconds")
@@ -90,8 +88,8 @@ class Scheduler:
         for t in self.load():
             out.append({
                 "id": t.get("id"),
-                "kind": t.get("kind"),
-                "protocol": t.get("protocol"),
+                "type": t.get("type"),
+                "chain": (t.get("target") or {}).get("chain"),
                 "schedule": t.get("schedule"),
                 "has_policy": bool(t.get("policy")),
                 "desc": t.get("desc"),
@@ -134,13 +132,13 @@ async def run_trigger(ctx, trigger_id: str, params: dict | None = None) -> dict:
     status = env.get("data", {}).get("status") if isinstance(env.get("data"), dict) else None
     sched.runlog.record({
         "trigger_id": trigger_id,
-        "kind": trig.get("kind"),
+        "type": trig.get("type"),
         "protocol": TR._protocol_of(trig) or TR._chain_of(trig),
         "run_id": (env.get("data") or {}).get("run_id"),
         "status": status,
     })
     # 봉투에 트리거 출처 표기(불변 봉투 키 보존)
-    env["trigger"] = {"id": trigger_id, "kind": trig.get("kind")}
+    env["trigger"] = {"id": trigger_id, "type": trig.get("type")}
     return env
 
 

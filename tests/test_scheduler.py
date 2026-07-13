@@ -14,22 +14,25 @@ from core.schema_validator import SchemaValidator
 from core import tools as T
 from core.tools import ToolContext
 
-# 격리된 트리거 정의(테스트 전용) — auto/strict/manual 3종
+# 격리된 트리거 정의(테스트 전용) — auto/strict/manual 3종 (신형 type/target.chain)
 _TRIGGERS = {
     "triggers": [
         {
-            "id": "auto_demo", "kind": "manual", "protocol": "ingest_summarize_publish",
+            "id": "auto_demo", "type": "manual",
+            "target": {"chain": "full_loop"},
             "params": {"url": "https://example.com/auto"},
             "policy": {"auto_approve_when": ["dry_run_high_quality"],
                        "always_gate": ["external_publish"], "max_publishes_per_day": 20},
         },
         {
-            "id": "strict_demo", "kind": "webhook", "protocol": "ingest_summarize_publish",
+            "id": "strict_demo", "type": "webhook", "event": {"name": "publish_request"},
+            "target": {"chain": "full_loop"},
             "params": {"url": "https://example.com/strict"},
             "policy": {"auto_approve_when": [], "always_gate": ["is_publish"]},
         },
         {
-            "id": "decision_demo", "kind": "manual", "protocol": "resource_to_decision",
+            "id": "decision_demo", "type": "manual",
+            "target": {"chain": "resource_to_decision"},
             "params": {"query": "테스트 결정"},
         },
     ]
@@ -61,7 +64,7 @@ async def test_list_triggers(tmp_path):
     ids = [t["id"] for t in env["data"]["triggers"]]
     assert set(ids) == {"auto_demo", "strict_demo", "decision_demo"}
     auto = next(t for t in env["data"]["triggers"] if t["id"] == "auto_demo")
-    assert auto["kind"] == "manual" and auto["has_policy"] is True
+    assert auto["type"] == "manual" and auto["chain"] == "full_loop" and auto["has_policy"] is True
 
 
 async def test_run_trigger_unknown(tmp_path):
@@ -80,7 +83,7 @@ async def test_run_trigger_auto_approve(tmp_path, monkeypatch):
     env = await T.tool_run_trigger(ctx, "auto_demo")
     assert env["data"]["status"] == "completed"
     assert env["data"]["auto_approved"] is True
-    assert env["trigger"] == {"id": "auto_demo", "kind": "manual"}
+    assert env["trigger"] == {"id": "auto_demo", "type": "manual"}
     # 실행 이력 기록됨
     runs = ctx.scheduler.runlog.all()
     assert runs and runs[-1]["trigger_id"] == "auto_demo" and runs[-1]["status"] == "completed"
@@ -96,6 +99,18 @@ async def test_run_trigger_strict_gate(tmp_path, monkeypatch):
     assert env["data"]["status"] == "pending_approval"
     assert env["data"]["policy_decision"]["rule"] == "is_publish"
     assert len(ctx.approvals_store.list_pending()) == 1
+
+
+async def test_run_trigger_rejects_legacy_form(tmp_path):
+    """legacy(kind/protocol) 선언은 기본 체인 무음 오해석 대신 명시 거부(단일 해석 지점)."""
+    legacy = {"triggers": [{
+        "id": "old_one", "kind": "manual", "protocol": "resource_to_decision",
+        "params": {"query": "q"},
+    }]}
+    ctx = _ctx(tmp_path, triggers=legacy)
+    env = await T.tool_run_trigger(ctx, "old_one")
+    assert env["data"]["status"] == "invalid_trigger"
+    assert any("마이그레이션" in e for e in env["errors"])
 
 
 async def test_run_trigger_params_override(tmp_path):
@@ -188,7 +203,7 @@ async def test_run_trigger_honors_declared_publish_mode_dry_run(tmp_path, monkey
 # ── Scheduler 단위 ──────────────────────────────────────────────
 def test_scheduler_get_and_missing_file(tmp_path):
     ctx = _ctx(tmp_path)
-    assert ctx.scheduler.get("auto_demo")["protocol"] == "ingest_summarize_publish"
+    assert ctx.scheduler.get("auto_demo")["target"]["chain"] == "full_loop"
     assert ctx.scheduler.get("nope") is None
     # 파일 없으면 빈 목록(예외 없음)
     empty = Scheduler(triggers_path=tmp_path / "missing.json")

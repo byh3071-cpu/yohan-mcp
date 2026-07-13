@@ -470,7 +470,7 @@ async def test_tick_fires_due_only(tmp_path, monkeypatch):
     monkeypatch.setattr(T, "_fetch_url", _fake_fetch)
     triggers = [
         _iv("due_iv", "https://e.com/d"),
-        {"id": "man", "kind": "manual", "protocol": "resource_to_decision",
+        {"id": "man", "type": "manual", "target": {"chain": "resource_to_decision"},
          "params": {"query": "x"}},                       # manual → tick 제외
         {"id": "wh", "type": "webhook", "event": {"name": "e"},
          "target": {"chain": "ingest_summarize"}},        # webhook → tick 제외
