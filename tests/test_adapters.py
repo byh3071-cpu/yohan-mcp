@@ -252,6 +252,89 @@ def test_notion_non_overridden_type_keeps_heuristic():
     assert "title" in props and props["domain"] == {"select": {"name": "AI"}}
 
 
+def _resource_page() -> dict:
+    """실 RESOURCE DB(한국어 프로퍼티·옵션) 응답을 그대로 흉내낸 페이지."""
+    return {
+        "id": "1f2a3b4c-5d6e-7f80-9012-3456789abcde",
+        "properties": {
+            "이름": {"type": "title", "title": [{"plain_text": "테스트 아티클"}]},
+            "원본 URL": {"type": "url", "url": "https://example.com/a"},
+            "유형": {"type": "select", "select": {"name": "아티클"}},
+            "카테고리": {"type": "select", "select": {"name": "일반"}},
+            "상태": {"type": "status", "status": {"name": "미처리"}},
+            "수집일": {"type": "date", "date": {"start": "2026-07-16T00:00:00+09:00"}},
+        },
+    }
+
+
+def test_notion_resource_read_reverses_real_db_props():
+    """읽기 역매핑 핀 — 한국어 프로퍼티/옵션 → 스키마 필드명/enum 복원.
+
+    쓰기만 번역하고 읽기 역매핑이 없으면 data 키가 한국어라 스키마 검증
+    (additionalProperties:false) 실패 + source_url 유실로 시딩이 전건 스킵된다.
+    """
+    n = NotionAdapter(token="t")
+    data = n._from_notion_page("resource", _resource_page())
+    assert data == {
+        "title": "테스트 아티클",
+        "source_url": "https://example.com/a",
+        "resource_type": "아티클",
+        "domain": "기타",          # 일반 → 스키마 enum 역번역
+        "status": "신규",          # 미처리 → 스키마 enum 역번역 (status 타입 읽기)
+        "captured_at": "2026-07-16T00:00:00+09:00",
+    }
+
+
+def test_notion_resource_round_trip_write_read():
+    """쓰기 → 읽기 왕복 — 역매핑이 쓰기 테이블의 정확한 역방향인지 고정."""
+    n = NotionAdapter(token="t")
+    src = {
+        "title": "제목", "source_url": "https://e.com/a", "resource_type": "아티클",
+        "domain": "기타", "status": "신규", "captured_at": "2026-07-13T01:00:00+09:00",
+    }
+    props = n._to_notion_properties("resource", src)
+    # _to_notion_properties 출력(쓰기 페이로드)을 Notion 이 돌려주는 형태로 되읽기
+    page = {"id": "p1", "properties": {
+        "이름": {"type": "title", "title": [{"text": {"content": "제목"}}]},
+        "원본 URL": {"type": "url", **props["원본 URL"]},
+        "유형": {"type": "select", **props["유형"]},
+        "카테고리": {"type": "select", **props["카테고리"]},
+        "상태": {"type": "status", **props["상태"]},
+        "수집일": {"type": "date", **props["수집일"]},
+    }}
+    assert n._from_notion_page("resource", page) == src
+
+
+def test_notion_read_reverse_map_skips_non_property_fields():
+    """name None(children/skip) 필드는 역매핑 대상 아님 — 오염 방지."""
+    from adapters.notion_adapter import _REVERSE_PROPS
+    assert "raw_content" not in _REVERSE_PROPS["resource"].values()
+    assert "resource_id" not in _REVERSE_PROPS["resource"].values()
+
+
+def test_notion_devlog_read_keeps_korean_keys():
+    """역매핑 미등록 타입(devlog)은 한국어 키 유지 — devlog_query 회귀 방지."""
+    n = NotionAdapter(token="t")
+    page = {"id": "p1", "properties": {
+        "이름": {"type": "title", "title": [{"plain_text": "세션A"}]},
+        "교훈": {"type": "rich_text", "rich_text": [{"plain_text": "배운점"}]},
+    }}
+    assert n._from_notion_page("devlog", page) == {"이름": "세션A", "교훈": "배운점"}
+
+
+async def test_notion_fetch_all_yields_seedable_keys():
+    """시딩 회귀 핀 — fetch_all 결과가 qdrant point_id 키(source_url)를 갖는다."""
+    def handler(request):
+        return httpx.Response(200, json={"results": [_resource_page()], "has_more": False})
+
+    client = httpx.AsyncClient(base_url="https://api.notion.com/v1", transport=httpx.MockTransport(handler))
+    a = NotionAdapter(client=client, token="t")
+    a.db_ids = {"resource": "db"}
+    rows = await a.fetch_all("resource")
+    assert rows and rows[0]["source_url"] == "https://example.com/a"
+    await client.aclose()
+
+
 async def test_notion_search_mocked():
     def handler(request):
         return httpx.Response(200, json={"results": [{
