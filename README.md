@@ -166,7 +166,7 @@ FastMCP 진입점. **도구 16개 + Resources + Prompts** 를 등록한다. impo
 
 ### 검색·융합 (RRF)
 
-`search`/`get_context` 는 라우터가 활성 백엔드를 골라 병렬 호출한 뒤 **RRF(k=60)** 로 순위 융합한다. 융합 키는 `타입::id` 라 서로 다른 엔티티를 오융합하지 않는다. Qdrant 는 쓰기 컬렉션(`yohan_resources`)에 더해 **yohan-control-tower 의 읽기전용 4컬렉션**(`knowledge_base`·`system_rules`·`semantic_cache`·`execution_history`, 동일 bge-m3 1024d)까지 검색한다. `QDRANT_SEARCH_COLLECTIONS`(CSV) 로 덮어쓸 수 있다.
+`search`/`get_context` 는 라우터가 활성 백엔드를 골라 병렬 호출한 뒤 **RRF(k=60)** 로 순위 융합한다. 융합 키는 `타입::id` 라 서로 다른 엔티티를 오융합하지 않는다. Qdrant 는 쓰기 컬렉션(`yohan_resources`)에 더해 **yohan-control-tower 의 읽기전용 4컬렉션**(`knowledge_base`·`system_rules`·`semantic_cache`·`execution_history`, 동일 bge-m3 1024d)과 **brain 2컬렉션**(`brain_memory`·`ontology_triples`)까지 검색한다 — 기본 7컬렉션. `QDRANT_SEARCH_COLLECTIONS`(CSV) 는 이 기본 목록을 **덮어쓰지 않고 추가(append)만** 한다(env 를 설정하면 기본 컬렉션이 통째로 사라져 회수가 조용히 줄던 풋건 방지 — MINOR I). 검색 대상을 특정 컬렉션으로 **격리**하려면 어댑터 생성 후 `.search_collections` 를 직접 덮어써라(`tests/test_integration_qdrant.py` 참고).
 
 ---
 
@@ -404,7 +404,7 @@ python scripts/validate_schemas.py
 | --- | --- | --- |
 | `QDRANT_URL` | (없음→`:memory:`) | 예: `http://localhost:6333` |
 | `QDRANT_COLLECTION` | `yohan_resources` | 쓰기 컬렉션 |
-| `QDRANT_SEARCH_COLLECTIONS` | (쓰기+관제탑 4) | 검색 대상 컬렉션 CSV override |
+| `QDRANT_SEARCH_COLLECTIONS` | (없음) | 기본 검색셋(쓰기 + 관제탑 4 + brain 2)에 **추가**할 컬렉션 CSV — override 아님(격리는 `.search_collections` 직접 설정) |
 | `EMBED_BACKEND` (구 `EMBEDDING_BACKEND`) | `auto` | `auto`·`ollama`·`local`·`openai`·`hash` |
 | `EMBEDDING_MODEL` | 백엔드별 상이 | ollama=`bge-m3`, openai=`text-embedding-3-small`, local=`paraphrase-multilingual-MiniLM-L12-v2` |
 | `OLLAMA_URL` | `http://localhost:11434` | ollama 서버 |

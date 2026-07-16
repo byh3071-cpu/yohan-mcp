@@ -259,11 +259,26 @@ class QdrantAdapter(BackendAdapter):
                 if score is not None and score > 0:
                     score *= self._type_weight(payload)
                 records.append(make_record(rid, rtype, self.name, payload, score=score))
+        if failed and len(failed) == len(self.search_collections):
+            # 전 컬렉션 회수 실패 = 검색이 아예 수행되지 못한 상태(예: 임베더가 hash(384)로
+            # 폴백해 1024d 컬렉션 전부 차원불일치, qdrant 연결 불가 등). 이때 빈 리스트를
+            # 돌려주면 router 는 이를 '정상 성공 + 결과 0건'으로 집계해 errors={} ·
+            # sources_used 에 'qdrant' 포함 · schema_valid=True 봉투를 만든다 — 호출 에이전트가
+            # "검색은 정상인데 관련 자료가 없다"로 오독하고, 근거 없이 qdrant 를 provenance 로
+            # 주장하게 된다(봉투 계약 위반). router._safe_search 는 백엔드 예외를 errors 로
+            # 승격하는 채널을 이미 갖고 있으므로, 총체적 실패만 raise 로 그 채널에 태운다.
+            # 부분 실패(하나라도 성공)는 기존대로 스킵 — 레거시 컬렉션 404 노이즈 억제 유지.
+            raise RuntimeError(
+                "Qdrant 검색 대상 컬렉션 전부 회수 실패(%d/%d): %s "
+                "(연결/임베딩 차원/시딩 확인 필요, health_check 참고)"
+                % (len(failed), len(self.search_collections), ", ".join(failed))
+            )
         if not records and failed:
-            # 검색 대상 컬렉션 중 하나라도 성공했으면(records 존재) 개별 실패는 조용히 넘어간다.
-            # 그러나 결과가 통째로 0건이면(전 컬렉션 실패 가능성 포함) 원인 단서 없이 빈 결과만
-            # 돌려주는 건 위험하므로 1회 집계 경고로 표면화 — "실패가 총 실패를 유발했다"가
-            # 아니라 "결과 0건 + 그 시점에 회수 실패한 컬렉션 목록"을 사실 그대로 보고한다.
+            # 여기까지 왔다면 일부 컬렉션은 성공했다(전 컬렉션 실패는 위에서 raise). 성공한
+            # 컬렉션의 회수가 0건이면서 다른 컬렉션이 실패한 상태 — 검색 자체는 유효하므로
+            # 예외로 승격하지 않되, 원인 단서 없이 빈 결과만 돌려주는 건 위험하므로 1회 집계
+            # 경고로 표면화한다. "실패가 총 실패를 유발했다"가 아니라 "결과 0건 + 그 시점에
+            # 회수 실패한 컬렉션 목록"을 사실 그대로 보고한다.
             logger.warning(
                 "Qdrant 검색 결과 0건 — 회수 실패 컬렉션: %s (연결/차원/시딩 확인 필요, health_check 참고)",
                 ", ".join(failed),
