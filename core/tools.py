@@ -35,6 +35,7 @@ from core.links import LinkStore
 from core.approval import ApprovalQueue
 from core.policy import PolicyEngine
 from core import core_rules as CR
+from core import agent_roster as AR
 from core import protocols as P
 from core import scheduler as S
 from core import verify as V
@@ -483,6 +484,12 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
             CR.inject_core_rules(env, enabled=True, capabilities=opts.get("capabilities"))
         except Exception as exc:
             logger.warning("코어룰셋 주입 실패: %s: %s", type(exc).__name__, exc)
+    # Goal 8 — agent-roster digest (기본 on; YOHAN_SKIP_ROSTER_DIGEST / opts.skip_roster 로 끔)
+    if AR.should_inject_roster(opts):
+        try:
+            AR.inject_agent_roster(env, enabled=True)
+        except Exception as exc:
+            logger.warning("agent-roster 주입 실패: %s: %s", type(exc).__name__, exc)
     return env
 
 
@@ -497,6 +504,14 @@ async def tool_get_core_ruleset(ctx: ToolContext, capabilities=None) -> dict:
     digest["source"] = source
     data = {"core_rules_digest": digest, "available_tools": CR.available_tools(capabilities)}
     return _envelope(data, True, [f"core-ruleset:{source}"])
+
+
+async def tool_get_agent_roster(ctx: ToolContext) -> dict:
+    """brain agent-roster 축소 digest (Goal 8). 모델 표 전문 없음."""
+    roster, source = AR.load_agent_roster(use_cache=False)
+    digest = AR.build_roster_digest(roster)
+    digest["source"] = source
+    return _envelope({"agent_roster_digest": digest}, True, [f"agent-roster:{source}"])
 
 
 # ── stub 도구 (P3/P4 예정) ──────────────────────────────────────

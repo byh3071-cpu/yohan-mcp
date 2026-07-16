@@ -29,6 +29,7 @@ _TOOL_REGISTRY: list[dict] = [
     {"name": "search", "purpose": "통합 검색(RRF 융합)", "gated": False},
     {"name": "get_context", "purpose": "질의 관련 엔티티+관계+역방향 회수", "gated": False},
     {"name": "get_core_ruleset", "purpose": "코어 독트린 다이제스트", "gated": False},
+    {"name": "get_agent_roster", "purpose": "에이전트 편성표 축소 digest", "gated": False},
     {"name": "status", "purpose": "백엔드 헬스 요약", "gated": False},
     {"name": "policy", "purpose": "정책·일일한도 조회", "gated": False},
     {"name": "list_triggers", "purpose": "트리거 카탈로그(읽기)", "gated": False},

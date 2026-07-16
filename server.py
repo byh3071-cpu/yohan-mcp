@@ -80,6 +80,12 @@ async def get_core_ruleset(capabilities: list[str] | None = None) -> dict:
 
 
 @mcp.tool()
+async def get_agent_roster() -> dict:
+    """brain agent-roster 축소 digest (Goal 8). get_context에도 기본 부착. 모델 표 전문 없음."""
+    return await T.tool_get_agent_roster(ctx)
+
+
+@mcp.tool()
 async def run_action(action: str, params: dict | None = None) -> dict:
     """프로토콜(순차 step 체인) 실행 (P4 — 자율성 L2, Protocol Engine 위임).
 
