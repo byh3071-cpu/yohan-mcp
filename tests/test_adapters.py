@@ -226,6 +226,65 @@ def test_notion_resource_props_map_to_real_db_schema():
     assert children[0]["paragraph"]["rich_text"][0]["text"]["content"] == "본문"
 
 
+def test_notion_resource_read_maps_back_to_schema_fields():
+    """resource 읽기 역매핑 — 쓰기(_PROP_OVERRIDES/_VALUE_MAP)의 역이 성립하는지 핀.
+
+    역매핑이 없으면 되읽은 data 가 한국어 키/옵션이라 additionalProperties:false
+    스키마에 전부 걸려 tool_search 의 schema_valid 가 False 로 오염된다.
+    """
+    from core.schema_validator import SchemaValidator
+
+    n = NotionAdapter(token="t")
+    page = {"id": "page-1", "properties": {
+        "이름": {"type": "title", "title": [{"plain_text": "어텐션 정리"}]},
+        "원본 URL": {"type": "url", "url": "https://e.com/a"},
+        "유형": {"type": "select", "select": {"name": "아티클"}},
+        "카테고리": {"type": "select", "select": {"name": "일반"}},
+        # 실DB '상태' 는 select 가 아니라 status 타입 — 분기 누락 시 통째로 유실됐다
+        "상태": {"type": "status", "status": {"name": "미처리"}},
+        "수집일": {"type": "date", "date": {"start": "2026-07-13T01:00:00+09:00"}},
+    }}
+    data = n._from_notion_page("resource", page)
+    assert set(data) == {"title", "source_url", "resource_type", "domain", "status", "captured_at"}
+    assert data["title"] == "어텐션 정리"
+    assert data["source_url"] == "https://e.com/a"
+    assert data["resource_type"] == "아티클"
+    assert data["domain"] == "기타"    # 일반 → 스키마 enum 역번역
+    assert data["status"] == "신규"    # 미처리 → 스키마 enum 역번역
+    assert data["captured_at"] == "2026-07-13T01:00:00+09:00"
+    # 되읽은 data 가 그대로 schema_valid 계산에 들어간다(core/tools.py tool_search)
+    assert SchemaValidator().validate_partial("resource", data) == (True, [])
+
+
+def test_notion_reverse_index_is_injective():
+    """역인덱스 단사성 핀 — 충돌하면 마지막 항목이 이겨 무음 오해석이 된다.
+
+    _VALUE_MAP 주석이 선언한 '무음 오기록 방지' 목표를 읽기 방향에도 건다.
+    """
+    from adapters.notion_adapter import _PROP_OVERRIDES, _REVERSE_PROPS, _REVERSE_VALUE_MAP, _VALUE_MAP
+
+    for type_, over in _PROP_OVERRIDES.items():
+        names = [name for name, _pt in over.values() if name is not None]
+        assert len(names) == len(set(names)), f"{type_}: 실DB 프로퍼티명 충돌"
+        assert set(_REVERSE_PROPS[type_]) == set(names)
+    for key, m in _VALUE_MAP.items():
+        assert len(m) == len(set(m.values())), f"{key}: 실DB 옵션값 충돌"
+        assert _REVERSE_VALUE_MAP[key] == {v: k for k, v in m.items()}
+
+
+def test_notion_read_keeps_raw_names_for_unmapped_types():
+    """_PROP_OVERRIDES 없는 타입(devlog/pattern)은 한국어 키 그대로 — 역매핑 무영향.
+
+    devlog_query/pattern_query 는 '이름'·'교훈' 등 한국어 키로 뽑아 쓴다.
+    """
+    n = NotionAdapter(token="t")
+    page = {"id": "p", "properties": {
+        "이름": {"type": "title", "title": [{"plain_text": "세션로그"}]},
+        "교훈": {"type": "rich_text", "rich_text": [{"plain_text": "역매핑 필요"}]},
+    }}
+    assert n._from_notion_page("devlog", page) == {"이름": "세션로그", "교훈": "역매핑 필요"}
+
+
 def test_notion_children_split_long_text():
     # Notion rich_text 2000자 제한 — 1900자 단위 분할
     n = NotionAdapter(token="t")

@@ -83,6 +83,20 @@ _VALUE_MAP: dict[tuple[str, str], dict[str, str]] = {
     ("resource", "domain"): {"기타": "일반", "AI": "AI/자동화"},
 }
 
+# ── 역방향(읽기) 인덱스 — 위 쓰기 매핑의 정확한 역 ──────────────
+# 쓰기만 번역하고 읽기를 안 하면 되읽은 data 가 한국어 키/옵션이라
+# additionalProperties:false 스키마에 전부 걸려 schema_valid 를 오염시킨다.
+# 아래 두 인덱스는 _PROP_OVERRIDES/_VALUE_MAP 에서 파생 — 수동 중복 정의 금지
+# (한쪽만 고쳐 방향이 다시 갈라지는 것을 막는다).
+# name=None(children/skip) 은 애초에 Notion 에 안 실리므로 역매핑 대상 아님.
+_REVERSE_PROPS: dict[str, dict[str, str]] = {
+    type_: {name: field for field, (name, _pt) in over.items() if name is not None}
+    for type_, over in _PROP_OVERRIDES.items()
+}
+_REVERSE_VALUE_MAP: dict[tuple[str, str], dict[str, str]] = {
+    key: {dbval: schemaval for schemaval, dbval in m.items()} for key, m in _VALUE_MAP.items()
+}
+
 
 class NotionAdapter(BackendAdapter):
     name = "notion"
@@ -173,24 +187,38 @@ class NotionAdapter(BackendAdapter):
         return blocks
 
     def _from_notion_page(self, type_: str, page: dict) -> dict:
-        """Notion page → 평문 data dict (best-effort)."""
+        """Notion page → 평문 data dict (_to_notion_properties 의 역).
+
+        실DB 프로퍼티명(한국어) → 스키마 필드명(영문), 실DB 옵션값 → 스키마 enum
+        으로 되돌린다. 역매핑이 없는 프로퍼티는 이름을 그대로 쓴다 — 쓰기측의
+        '필드명 = 프로퍼티명' 휴리스틱 폴백과 대칭이며, _PROP_OVERRIDES 가 없는
+        타입(devlog/pattern 등)은 한국어 키를 그대로 받는다(호출부 계약 유지).
+        """
+        rprops = _REVERSE_PROPS.get(type_, {})
         out: dict = {}
         for key, prop in (page.get("properties") or {}).items():
+            field = rprops.get(key, key)
             ptype = prop.get("type")
-            if ptype == "title":
-                out[key] = "".join(t.get("plain_text", t.get("text", {}).get("content", "")) for t in prop["title"])
-            elif ptype == "rich_text":
-                out[key] = "".join(t.get("plain_text", t.get("text", {}).get("content", "")) for t in prop["rich_text"])
-            elif ptype == "select":
-                out[key] = (prop.get("select") or {}).get("name")
+            if ptype in ("title", "rich_text"):
+                val = "".join(
+                    t.get("plain_text", t.get("text", {}).get("content", ""))
+                    for t in (prop.get(ptype) or [])
+                )
+            elif ptype in ("select", "status"):
+                # status 는 select 와 형태가 같은데 분기가 없어 통째로 유실됐다(상태 미회수).
+                val = (prop.get(ptype) or {}).get("name")
             elif ptype == "multi_select":
-                out[key] = [o.get("name") for o in prop.get("multi_select", [])]
-            elif ptype == "number":
-                out[key] = prop.get("number")
-            elif ptype == "url":
-                out[key] = prop.get("url")
+                val = [o.get("name") for o in prop.get("multi_select", [])]
+            elif ptype in ("number", "url"):
+                val = prop.get(ptype)
             elif ptype == "date":
-                out[key] = (prop.get("date") or {}).get("start")
+                val = (prop.get("date") or {}).get("start")
+            else:
+                continue
+            rev = _REVERSE_VALUE_MAP.get((type_, field))
+            if rev and isinstance(val, str):
+                val = rev.get(val, val)
+            out[field] = val
         return out
 
     # ── 검색 ────────────────────────────────────────────────────
