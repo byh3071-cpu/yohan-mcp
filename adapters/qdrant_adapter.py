@@ -230,6 +230,8 @@ class QdrantAdapter(BackendAdapter):
         vec = (await self._embed([query or ""]))[0]
         records: list[dict] = []
         failed: list[str] = []
+        causes: list[str] = []
+        searched = 0  # 질의가 '성공한' 컬렉션 수 — 회수 0건과 회수 실패를 가르는 유일한 기준
         for coll in self.search_collections:
             try:
                 res = await client.query_points(coll, query=vec, limit=fetch_k, with_payload=True)
@@ -238,11 +240,13 @@ class QdrantAdapter(BackendAdapter):
                 # 개별 실패는 DEBUG(기본 비표시)로만 남긴다: search_collections 는 레거시 쓰기
                 # 컬렉션(예: 드롭된 yohan_resources)까지 포함해 항상 검색을 시도하는 구조라,
                 # 다른 컬렉션이 살아있는 한 이 실패는 매 질의 노이즈일 뿐 실질적 문제가 아니다
-                # (#qdrant-legacy-skip). 검색 자체가 총체적으로 비어버린 경우에만 아래에서
-                # 1회 집계 경고로 표면화한다 — 개별 컬렉션 진단은 health_check 가 상시 표면화.
+                # (#qdrant-legacy-skip). 그러나 '전 컬렉션 실패'는 노이즈가 아니라 백엔드
+                # 전면 붕괴이므로 아래에서 예외로 전파한다 — 개별 컬렉션 진단은 health_check.
                 logger.debug("Qdrant 컬렉션 '%s' 검색 실패(스킵): %s: %s", coll, type(exc).__name__, exc)
                 failed.append(coll)
+                causes.append(f"{coll}: {type(exc).__name__}: {exc}")
                 continue
+            searched += 1
             # 레거시(yohan_resources)=resource, 관제탑 컬렉션=컬렉션명(스키마 없는 벡터청크 — 검증 제외).
             rtype = "resource" if coll == self.collection else coll
             for p in res.points:
@@ -259,11 +263,21 @@ class QdrantAdapter(BackendAdapter):
                 if score is not None and score > 0:
                     score *= self._type_weight(payload)
                 records.append(make_record(rid, rtype, self.name, payload, score=score))
+        if failed and searched == 0:
+            # 전 컬렉션 회수 실패 = 이 백엔드는 질의에 '답한 적이 없다'. 여기서 []를 돌려주면
+            # 호출자(router)는 qdrant 를 sources_used 에 정상 등재하고 errors 를 비운 채
+            # ok=True/count=0 봉투를 만든다 — 소비 에이전트가 '관련 지식 없음'과 '벡터 백엔드
+            # 전면 붕괴'(차원 드리프트·연결 단절 등)를 구분할 수 없는 거짓 보고다. 예외로
+            # 전파해야 router._safe_search 가 errors["qdrant"] 로 실어 봉투에 표면화하고
+            # sources_used 에서 qdrant 가 빠져 봉투가 사실과 일치한다.
+            # (컬렉션이 하나라도 응답했으면 0건은 '진짜 0건'이므로 아래 경고 경로로 간다.)
+            raise RuntimeError(
+                f"Qdrant 회수 전면 실패 — 검색 대상 {len(failed)}개 컬렉션 전부 실패"
+                f"(연결/차원/시딩 확인 필요, health_check 참고): {'; '.join(causes)}"
+            )
         if not records and failed:
-            # 검색 대상 컬렉션 중 하나라도 성공했으면(records 존재) 개별 실패는 조용히 넘어간다.
-            # 그러나 결과가 통째로 0건이면(전 컬렉션 실패 가능성 포함) 원인 단서 없이 빈 결과만
-            # 돌려주는 건 위험하므로 1회 집계 경고로 표면화 — "실패가 총 실패를 유발했다"가
-            # 아니라 "결과 0건 + 그 시점에 회수 실패한 컬렉션 목록"을 사실 그대로 보고한다.
+            # 하나 이상 성공했는데 결과가 0건 — 회수 자체는 유효하므로 실패가 아니지만, 실패한
+            # 컬렉션 목록은 0건의 단서일 수 있어 1회 집계 경고로만 표면화한다.
             logger.warning(
                 "Qdrant 검색 결과 0건 — 회수 실패 컬렉션: %s (연결/차원/시딩 확인 필요, health_check 참고)",
                 ", ".join(failed),

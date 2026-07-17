@@ -96,15 +96,30 @@ async def test_qdrant_empty_key_rejected():
     await qa.aclose()
 
 
-async def test_qdrant_search_missing_collection_logs_warning(caplog):
-    # 컬렉션 생성 전 검색 → query_points 가 컬렉션 미존재로 예외 → search() except(continue) 경로.
-    # search_collections 전체(쓰기 컬렉션+관제탑4+brain2)가 미존재이므로 "총체적 실패" 분기 —
-    # 1회 집계 WARNING 이 남는다(test_qdrant_search_partial_missing_collections_no_warning 과 대비).
+async def test_qdrant_search_all_collections_failed_raises():
+    """전 컬렉션 회수 실패는 빈 결과가 아니라 예외 — 거짓 성공 봉투 방지.
+
+    컬렉션 생성 전 검색 → query_points 가 전부 컬렉션 미존재로 예외 → 성공 컬렉션 0.
+    []를 돌려주면 router 가 qdrant 를 sources_used 에 등재하고 errors 를 비운 채
+    ok=True/count=0 을 만들어, 소비자가 '지식 없음'과 '백엔드 붕괴'를 구분할 수 없다.
+    (부분 실패는 test_qdrant_search_partial_missing_collections_no_warning 이 담당.)
+    """
     qa = _adapter()
-    with caplog.at_level(logging.WARNING):
-        res = await qa.search("어텐션", {"top_k": 5})
-    assert res == []  # graceful 폴백(continue) 유지 — 빈 결과
-    assert any("실패" in r.message or r.levelno == logging.WARNING for r in caplog.records)
+    with pytest.raises(RuntimeError, match="회수 전면 실패"):
+        await qa.search("어텐션", {"top_k": 5})
+    await qa.aclose()
+
+
+async def test_qdrant_search_all_collections_failed_surfaces_in_router_envelope():
+    """어댑터 예외가 router 봉투에서 errors 로 표면화되고 sources_used 에서 빠진다."""
+    from core.router import SmartRouter
+
+    qa = _adapter()
+    router = SmartRouter({"qdrant": qa})
+    res = await router.search("어텐션", {"backends": ["qdrant"], "top_k": 5})
+    assert res["results"] == []
+    assert "qdrant" not in res["sources_used"]  # 붕괴한 백엔드를 '사용됨'으로 등재하지 않음
+    assert "회수 전면 실패" in res["errors"]["qdrant"]
     await qa.aclose()
 
 
