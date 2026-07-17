@@ -6,6 +6,7 @@ import pytest
 
 from adapters.qdrant_adapter import QdrantAdapter
 from core.embeddings import HashEmbedder
+from core.router import SmartRouter
 
 RESOURCE = {
     "resource_id": "r1",
@@ -96,15 +97,31 @@ async def test_qdrant_empty_key_rejected():
     await qa.aclose()
 
 
-async def test_qdrant_search_missing_collection_logs_warning(caplog):
-    # 컬렉션 생성 전 검색 → query_points 가 컬렉션 미존재로 예외 → search() except(continue) 경로.
-    # search_collections 전체(쓰기 컬렉션+관제탑4+brain2)가 미존재이므로 "총체적 실패" 분기 —
-    # 1회 집계 WARNING 이 남는다(test_qdrant_search_partial_missing_collections_no_warning 과 대비).
+async def test_qdrant_search_total_failure_raises():
+    """전 컬렉션 회수 실패는 빈 결과가 아니라 예외로 표면화한다.
+
+    컬렉션 생성 전 검색 → query_points 가 컬렉션 미존재로 전부 예외 → 회수 전멸.
+    예전엔 여기서 빈 리스트를 돌려줬고(개별 실패는 DEBUG, 0건 집계 WARNING 만), 그 결과
+    router 봉투가 errors={} · sources_used=['qdrant'] · count=0 이 되어 "검색 정상 + 자료
+    없음"으로 위장됐다(회수 전멸이 정상 응답과 구분 불가 + 근거 없는 provenance 주장).
+    router._safe_search 가 예외를 errors 로 승격하는 채널을 갖고 있으므로 총체적 실패만
+    raise 로 태운다 — 부분 실패 스킵은
+    test_qdrant_search_partial_missing_collections_no_warning 이 지킨다.
+    """
     qa = _adapter()
-    with caplog.at_level(logging.WARNING):
-        res = await qa.search("어텐션", {"top_k": 5})
-    assert res == []  # graceful 폴백(continue) 유지 — 빈 결과
-    assert any("실패" in r.message or r.levelno == logging.WARNING for r in caplog.records)
+    with pytest.raises(RuntimeError, match="전부 회수 실패"):
+        await qa.search("어텐션", {"top_k": 5})
+    await qa.aclose()
+
+
+async def test_qdrant_search_total_failure_surfaces_in_envelope():
+    """어댑터 raise 가 router 봉투의 errors/sources_used 에 실제로 반영되는지(계약 종단 확인)."""
+    qa = _adapter()
+    router = SmartRouter({"qdrant": qa})
+    env = await router.search("어텐션", {"top_k": 5})
+    assert env["results"] == []
+    assert "qdrant" not in env["sources_used"]   # 근거 없는 provenance 주장 금지
+    assert "전부 회수 실패" in env["errors"]["qdrant"]  # 실패가 봉투에 표면화
     await qa.aclose()
 
 
