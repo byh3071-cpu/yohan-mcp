@@ -97,6 +97,25 @@ _REVERSE_VALUE_MAP: dict[tuple[str, str], dict[str, str]] = {
     key: {dbval: schemaval for schemaval, dbval in m.items()} for key, m in _VALUE_MAP.items()
 }
 
+# 패턴 DB 카테고리 — 호출 규약 코드값(css/env/…) → 실DB `카테고리` select 옵션(한국어).
+# select 옵션은 자동 생성되지 않으므로 미대응 코드값을 그대로 필터에 실으면 Notion 이
+# 빈 결과가 아니라 400(validation_error)을 반환해 회수가 무음 0건이 된다(get_context 가 삼킴).
+# pattern_query 는 여기서 번역·allowlist 대조하고, 코드값도 실DB 옵션도 아니면 ValueError 로
+# 명시 실패한다 — _VALUE_MAP 주석의 '무음 오기록 방지'와 동일 원칙(호출자는 봉투 errors 로 인지).
+_PATTERN_CATEGORY_MAP: dict[str, str] = {
+    "css": "CSS/렌더링",
+    "env": "환경변수/설정",
+    "browser-api": "브라우저API",
+    "build": "빌드/번들",
+    "auth": "인증/보안",
+    "ux": "UX/UI",
+    "test": "테스트",
+    "state": "상태관리",
+    "mcp": "MCP/연동",
+    "git": "Git/배포",
+}
+_PATTERN_CATEGORY_OPTIONS = frozenset(_PATTERN_CATEGORY_MAP.values())
+
 
 class NotionAdapter(BackendAdapter):
     name = "notion"
@@ -321,6 +340,8 @@ class NotionAdapter(BackendAdapter):
 
         카테고리=category(있으면) + 태그 contains any of tags(있으면), 발견일 DESC, LIMIT.
         필터 둘 다 없으면 최근순. 토큰/DB ID 없으면 [] (graceful).
+        category 는 코드값(css/env/…) 또는 실DB 옵션(한국어)을 받아 select 옵션으로 대조한다.
+        어느 쪽에도 없으면 ValueError — 무검증 주입 시 Notion 400 → 무음 0건이 되는 것을 방지.
         반환 필드: {패턴명, 증상, 원인, 해결, 적용 조건}.
         """
         if not self.token or not self.pattern_db_id:
@@ -328,7 +349,17 @@ class NotionAdapter(BackendAdapter):
         client = self._get_client()
         conds: list[dict] = []
         if category:
-            conds.append({"property": "카테고리", "select": {"equals": category}})
+            db_category = _PATTERN_CATEGORY_MAP.get(category)
+            if db_category is None:
+                if category in _PATTERN_CATEGORY_OPTIONS:
+                    db_category = category  # 이미 실DB 옵션이면 통과
+                else:
+                    raise ValueError(
+                        f"pattern 카테고리 '{category}' 미대응 — 코드값 "
+                        f"{sorted(_PATTERN_CATEGORY_MAP)} 또는 실DB 옵션 "
+                        f"{sorted(_PATTERN_CATEGORY_OPTIONS)} 중 하나여야 함"
+                    )
+            conds.append({"property": "카테고리", "select": {"equals": db_category}})
         if tags:
             conds.append({"or": [{"property": "태그", "multi_select": {"contains": t}} for t in tags]})
         body: dict = {"sorts": [{"property": "발견일", "direction": "descending"}], "page_size": limit}
