@@ -117,6 +117,32 @@ async def test_pattern_query_mocked_filters_and_maps():
     assert tag_or == [{"property": "태그", "multi_select": {"contains": "MCP"}}]
 
 
+async def test_pattern_query_translates_code_category_to_db_option():
+    """코드값(git 등)은 실DB select 옵션(Git/배포)으로 번역돼 나가야 한다(400 방지)."""
+    captured = {}
+
+    def handler(request):
+        captured["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={"results": []})
+
+    client = httpx.AsyncClient(base_url="https://api.notion.com/v1", transport=httpx.MockTransport(handler))
+    a = NotionAdapter(client=client, token="t")
+    a.pattern_db_id = "patterndb"
+    await a.pattern_query(category="git")
+    await client.aclose()
+    assert captured["body"]["filter"] == {"property": "카테고리", "select": {"equals": "Git/배포"}}
+
+
+async def test_pattern_query_unknown_category_raises():
+    """코드값도 실DB 옵션도 아니면 명시 실패(무검증 주입 → Notion 400 무음 0건 방지)."""
+    import pytest
+
+    a = NotionAdapter(token="t")
+    a.pattern_db_id = "patterndb"
+    with pytest.raises(ValueError):
+        await a.pattern_query(category="존재하지않는카테고리")
+
+
 async def test_pattern_query_no_filter_omits_filter_key():
     captured = {}
 
@@ -223,3 +249,6 @@ async def test_get_context_logs_warning_when_devlog_and_pattern_query_fail(tmp_p
     warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("devlog" in m.lower() for m in warn_msgs)
     assert any("pattern" in m.lower() for m in warn_msgs)
+    # 회수 전멸은 봉투 errors 에도 실려야 함 — '패턴 0건'과 구분 가능
+    assert "notion:devlog" in env["errors"]
+    assert "notion:pattern" in env["errors"]

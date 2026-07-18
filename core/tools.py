@@ -451,6 +451,9 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
     category, tags = opts.get("category"), opts.get("tags")
     devlog: list[dict] = []
     patterns: list[dict] = []
+    # 회수 실패는 봉투 errors 에 실어 '패턴 0건'과 '회수 전멸'을 구분 가능하게 한다
+    # (안 실으면 호출자가 무음 0건과 예외 삼킴을 구분 못 함). router search errors 에 합류.
+    errors = dict(res["errors"])
     devlog_q = getattr(notion, "devlog_query", None)
     pattern_q = getattr(notion, "pattern_query", None)
     if devlog_q and project:
@@ -459,12 +462,14 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         except Exception as exc:
             logger.warning("devlog 회수 실패: %s: %s", type(exc).__name__, exc)
             devlog = []  # 회수 실패가 컨텍스트 전체를 죽이지 않음
+            errors["notion:devlog"] = f"{type(exc).__name__}: {exc}"
     if pattern_q and (category or tags):
         try:
             patterns = await pattern_q(category, tags)
         except Exception as exc:
             logger.warning("pattern 회수 실패: %s: %s", type(exc).__name__, exc)
             patterns = []
+            errors["notion:pattern"] = f"{type(exc).__name__}: {exc}"
     sources = list(res["sources_used"])
     if devlog:
         sources.append("notion:devlog")
@@ -475,7 +480,7 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
          "devlog": devlog, "patterns": patterns, "count": len(matches)},
         True,
         sources,
-        errors=res["errors"],
+        errors=errors,
     )
     # ADR-008 P0 — brain 코어룰셋 주입(옵트인·멱등). 기본 off라 미옵트인 호출자는 봉투 불변.
     # 주입 실패가 정상 회수 봉투를 죽이지 않게 방어(devlog/pattern 회수와 동일 격리).
