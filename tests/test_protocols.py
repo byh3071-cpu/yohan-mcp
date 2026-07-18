@@ -165,3 +165,62 @@ async def test_unknown_protocol_envelope(tmp_path):
     assert env["data"]["status"] == "unknown_protocol"
     assert "ingest_summarize_publish" in env["data"]["known_protocols"]
     assert env["errors"]
+
+
+# ── #57: _step_failed 가 errors + 회수전멸을 실패로 판정 ──────────────
+def test_step_failed_errors_with_empty_retrieval():
+    """errors 있고 count==0 → 실패('성공+0건' 위장 차단)."""
+    env = {"data": {"matches": [], "count": 0}, "errors": {"qdrant": "전멸"}}
+    assert P._step_failed(env) is True
+
+
+def test_step_failed_errors_with_partial_results():
+    """errors 있어도 결과 있으면(부분성공) 실패 아님 — qdrant 부분실패 스킵과 정합."""
+    env = {"data": {"matches": [{"x": 1}], "count": 1}, "errors": {"qdrant": "일부"}}
+    assert P._step_failed(env) is False
+
+
+def test_step_failed_no_errors_empty_ok():
+    """errors 없으면 count==0 이어도 실패 아님(하위호환 — 진짜 0건 검색)."""
+    assert P._step_failed({"data": {"matches": [], "count": 0}}) is False
+
+
+def test_step_failed_data_none():
+    assert P._step_failed({"data": None}) is True
+    assert P._step_failed("nope") is True
+
+
+def test_step_failed_non_retrieval_with_errors():
+    """create 류(count/matches 부재)는 errors 만으론 실패 안 함(과실패 방지)."""
+    env = {"data": {"id": "x", "created": True}, "errors": {"n8n": "warn"}}
+    assert P._step_failed(env) is False
+
+
+def test_retrieval_empty():
+    assert P._retrieval_empty({"count": 0}) is True
+    assert P._retrieval_empty({"count": 3}) is False
+    assert P._retrieval_empty({"matches": []}) is True
+    assert P._retrieval_empty({"matches": [1]}) is False
+    assert P._retrieval_empty({"id": "x"}) is False
+    assert P._retrieval_empty("nope") is False
+
+
+def test_step_failed_errors_empty_but_sources_contributed():
+    """errors + count==0 이어도 어떤 백엔드가 기여했으면(sources_used 비어있지 않음)
+    실패 아님 — 백엔드 부재(benign)와 전멸(fatal)을 sources_used 로 가른다(#57)."""
+    env = {
+        "data": {"matches": [], "count": 0},
+        "provenance": {"sources_used": ["memory"]},
+        "errors": {"qdrant": "일부 실패"},
+    }
+    assert P._step_failed(env) is False
+
+
+def test_step_failed_total_failure_no_sources():
+    """qdrant 전멸 시그니처 — errors + count==0 + sources_used=[] → 실패(#54/#57 실측)."""
+    env = {
+        "data": {"matches": [], "count": 0},
+        "provenance": {"sources_used": []},
+        "errors": {"qdrant": "7/7 회수 실패"},
+    }
+    assert P._step_failed(env) is True
