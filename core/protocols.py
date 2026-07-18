@@ -258,9 +258,35 @@ async def _dispatch(ctx, tool: str, params: dict) -> dict:
     raise ValueError(f"프로토콜이 모르는 step tool: {tool!r}")
 
 
+def _retrieval_empty(data) -> bool:
+    """회수형 봉투 데이터가 사실상 비었는지 — count==0 또는 알려진 결과 리스트가 전부 빔.
+
+    비회수형(create 등, count/결과키 부재)은 판단 근거가 없으므로 False(과실패 방지).
+    """
+    if not isinstance(data, dict):
+        return False
+    if "count" in data:
+        return not data.get("count")
+    present = [data[k] for k in ("matches", "results", "items") if k in data]
+    return bool(present) and all(not v for v in present)
+
+
 def _step_failed(env: dict) -> bool:
-    """엔진의 하드 실패 기준 — 결과 데이터가 없으면(None) 실패로 본다."""
-    return not isinstance(env, dict) or env.get("data") is None
+    """엔진의 하드 실패 기준 — 결과 데이터가 없으면(None) 실패로 본다.
+
+    또한 백엔드 errors 가 있는데 회수 결과가 전멸(count==0/빈 목록)이면 실패로 본다 —
+    errors 를 무시하고 '성공 + 결과 0건'으로 위장해 프로토콜이 부실 컨텍스트로 전진하던
+    문제(#57). 부분 성공(하나라도 결과 있음)은 실패 아님 — qdrant 부분 실패 스킵과 정합.
+    """
+    if not isinstance(env, dict) or env.get("data") is None:
+        return True
+    # errors 있고 · 회수 전멸(count==0) · 어떤 백엔드도 기여 못 함(sources_used 빔)일 때만 실패.
+    # sources_used 조건이 '백엔드 부재(benign)'와 '시도했으나 전멸(fatal)'을 가른다 —
+    # 부분 성공(sources_used 비어있지 않음)이나 단순 무결과(errors 없음)는 실패 아님.
+    if not (env.get("errors") and _retrieval_empty(env.get("data"))):
+        return False
+    sources = (env.get("provenance") or {}).get("sources_used") or []
+    return not sources
 
 
 # ── 봉투 누적 헬퍼 ──────────────────────────────────────────────────
