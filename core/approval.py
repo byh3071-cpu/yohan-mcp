@@ -106,15 +106,20 @@ class ApprovalQueue:
     def _pending_event(self, run_id: str, step_index: int | None = None) -> dict | None:
         """그 run_id 의 pending 게이트 원본 이벤트(payload 보유)를 찾는다.
 
-        step_index 가 주어지면 그 step 의 pending 이벤트만, 없으면 가장 최근 pending.
+        fold 적용: raw 스캔이 아니라 `_latest_by_key`(이벤트 접기)를 경유해
+        (run_id, step_index) 의 **현재 상태**가 pending 인 게이트만 본다. 종결(approve/reject)
+        후 같은 게이트에 재도달하면 현재 상태가 pending 이 아니므로 잡히지 않아,
+        enqueue 가 새 payload 로 재적재할 수 있다(좀비 게이트 방지).
+        step_index 가 주어지면 그 step 의 게이트만, 없으면 현재 pending 중 가장 최근(ts).
         """
         found = None
-        for ev in self.all():
-            if ev.get("run_id") != run_id or ev.get("status") != _PENDING:
+        for (rid, sidx), ev in self._latest_by_key().items():
+            if rid != run_id or ev.get("status") != _PENDING:
                 continue
-            if step_index is not None and ev.get("step_index") != step_index:
+            if step_index is not None and sidx != step_index:
                 continue
-            found = ev  # 최신 우선(시간순 마지막)
+            if found is None or ev.get("ts", "") >= found.get("ts", ""):
+                found = ev  # 현재 pending 중 최신(ts) 우선
         return found
 
     # ── 사람 결정 ────────────────────────────────────────────────
