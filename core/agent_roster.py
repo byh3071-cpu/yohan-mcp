@@ -4,6 +4,7 @@
 brain SoT만 읽는다. 모델/effort 표 전문은 digest에 넣지 않는다.
 기본: get_context에 부착. YOHAN_SKIP_ROSTER_DIGEST=1 이면 스킵.
 """
+
 from __future__ import annotations
 
 import logging
@@ -53,6 +54,7 @@ def build_roster_digest(roster: dict | None) -> dict:
     concurrency = roster.get("concurrency") or {}
     quota = roster.get("quota_fallback") or {}
     precedence = roster.get("precedence") or {}
+    always = roster.get("conductor_always_on") or {}
     return {
         "version": roster.get("version"),
         "status": roster.get("status"),
@@ -67,16 +69,36 @@ def build_roster_digest(roster: dict | None) -> dict:
         "precedence_order": precedence.get("order"),
         "orca_enforcer": (roster.get("orca_patterns") or {}).get("enforcer"),
         "ask_when_uncertain": (roster.get("intent") or {}).get("ask_when_uncertain"),
+        # 상시 지휘자(v0.4.0) — 패턴명만. size_criteria 표 전문은 digest 제외(토큰 미니멀).
+        "conductor_always_on": (
+            {
+                "enabled": always.get("enabled"),
+                "routing": {
+                    k: (v or {}).get("pattern")
+                    for k, v in (always.get("routing") or {}).items()
+                },
+                "declaration_format": always.get("declaration_format"),
+            }
+            if always
+            else None
+        ),
     }
 
 
 def should_inject_roster(opts: dict | None = None) -> bool:
     """기본 on. opts.skip_roster / YOHAN_SKIP_ROSTER_DIGEST 로 끔."""
     opts = opts or {}
-    if os.getenv("YOHAN_SKIP_ROSTER_DIGEST", "").strip().lower() in ("1", "true", "yes", "on"):
+    if os.getenv("YOHAN_SKIP_ROSTER_DIGEST", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
         return False
     skip = opts.get("skip_roster")
-    if skip is True or (isinstance(skip, str) and skip.strip().lower() in ("1", "true", "yes", "on")):
+    if skip is True or (
+        isinstance(skip, str) and skip.strip().lower() in ("1", "true", "yes", "on")
+    ):
         return False
     return True
 

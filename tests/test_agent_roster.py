@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Goal 8 — agent-roster digest 테스트."""
+
 import textwrap
 
 import pytest
@@ -35,6 +36,15 @@ _ROSTER_YAML = textwrap.dedent("""\
       order:
         - repo_RULES_or_CLAUDE_LIVE
         - agent-roster_defaults
+    conductor_always_on:
+      enabled: true
+      declaration_format: "라우팅: <S|M|L> — <계획>"
+      size_criteria:
+        S: { touched_files: "<=2", SHOULD_NOT_APPEAR_IN_DIGEST: true }
+      routing:
+        S: { pattern: solo_conductor }
+        M: { pattern: subagent_tiering }
+        L: { pattern: orca_pipeline }
     orca_patterns:
       enforcer: "C:\\\\test\\\\orca-enforcement.ps1"
     cli_fleet:
@@ -62,6 +72,10 @@ def test_load_and_digest_active(tmp_path):
     assert digest["concurrency"]["parallel"] == "worktree_only"
     assert "SHOULD_NOT_APPEAR_IN_DIGEST" not in str(digest)
     assert "cli_fleet" not in digest
+    # 상시 지휘자(v0.4.0): 패턴명만 digest에, size_criteria 표 전문은 제외
+    assert digest["conductor_always_on"]["enabled"] is True
+    assert digest["conductor_always_on"]["routing"]["L"] == "orca_pipeline"
+    assert digest["conductor_always_on"]["routing"]["S"] == "solo_conductor"
 
 
 def test_graceful_none(tmp_path):
