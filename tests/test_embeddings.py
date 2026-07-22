@@ -118,3 +118,79 @@ def test_ollama_timeout_env(monkeypatch, caplog):
         monkeypatch.setenv("OLLAMA_TIMEOUT", bad)
         with caplog.at_level(logging.WARNING):
             assert E._ollama_timeout() == 60.0
+
+
+# ── embed_lenient — 상류 NaN 버그 내성 (ollama#16625) ────────────
+def _nan_bug_ollama(poison: set[str], dim=1024, calls=None):
+    """`poison` 에 든 텍스트가 배치에 하나라도 있으면 500 을 내는 mock — 실 ollama 거동."""
+    import json
+
+    def handler(request):
+        body = json.loads(request.content)
+        texts = body["input"]
+        if calls is not None:
+            calls.append(list(texts))
+        if any(t in poison for t in texts):
+            return httpx.Response(500, json={"error": "failed to encode response: json: unsupported value: NaN"})
+        return httpx.Response(200, json={"embeddings": [[float(len(t) + 1)] + [0.1] * (dim - 1) for t in texts]})
+
+    return httpx.Client(base_url="http://fake", transport=httpx.MockTransport(handler))
+
+
+def test_embed_lenient_passthrough_when_healthy():
+    e = OllamaEmbedder(client=_nan_bug_ollama(poison=set()))
+    out = E.embed_lenient(e, ["가", "나", "다"])
+    assert len(out) == 3
+    assert all(v is not None for v in out)
+    assert out == e.embed(["가", "나", "다"])  # 정상 경로는 embed 와 동일 결과
+
+
+def test_embed_lenient_isolates_poison_and_salvages():
+    """독 청크 하나가 배치 전체를 죽이지 못하고, 슬래시 치환으로 구제된다."""
+    bad = "**원문:** [열기](http://karpathy.github.io/2026/02/12/microgpt/)"
+    e = OllamaEmbedder(client=_nan_bug_ollama(poison={bad}))
+    out = E.embed_lenient(e, ["앞 청크", bad, "뒤 청크"])
+    assert len(out) == 3
+    assert all(v is not None for v in out)  # 구제 성공 — 스킵된 청크 없음
+
+
+def test_embed_lenient_returns_none_when_unsalvageable():
+    """변형으로도 못 살리면 그 항목만 None — 나머지는 정상 반환(순서 보존)."""
+    bad = "죽는 텍스트"  # 슬래시가 없어 변형해도 그대로 → 구제 불가
+    e = OllamaEmbedder(client=_nan_bug_ollama(poison={bad}))
+    out = E.embed_lenient(e, ["앞", bad, "뒤"])
+    assert len(out) == 3
+    assert out[1] is None
+    assert out[0] is not None and out[2] is not None
+
+
+def test_embed_lenient_preserves_order_with_multiple_poison():
+    b1, b2 = "독1", "독2"
+    e = OllamaEmbedder(client=_nan_bug_ollama(poison={b1, b2}))
+    out = E.embed_lenient(e, ["a", b1, "b", b2, "c"])
+    assert [v is None for v in out] == [False, True, False, True, False]
+
+
+def test_embed_lenient_reraises_non_nan_errors():
+    """접속불가·타임아웃 등은 삼키지 않는다 — 삼키면 빈 인덱스로 조용히 성공한다."""
+
+    class Down:
+        def embed(self, texts):
+            raise httpx.ConnectError("서버 다운")
+
+    with pytest.raises(httpx.ConnectError):
+        E.embed_lenient(Down(), ["아무거나"])
+
+
+def test_embed_lenient_bisects_instead_of_one_by_one():
+    """정상 배치는 호출 1번, 오염 배치만 이분 탐색 — 낱개 재시도로 퇴화하지 않는다."""
+    calls: list[list[str]] = []
+    e = OllamaEmbedder(client=_nan_bug_ollama(poison=set(), calls=calls))
+    calls.clear()
+    E.embed_lenient(e, [f"청크{i}" for i in range(32)])
+    assert len(calls) == 1  # 건강한 배치는 단 한 번
+
+
+def test_embed_lenient_empty():
+    e = OllamaEmbedder(client=_nan_bug_ollama(poison=set()))
+    assert E.embed_lenient(e, []) == []

@@ -159,6 +159,79 @@ class OllamaEmbedder:
         return self._embed_batch(items)
 
 
+# ── 상류 모델 버그 내성 ──────────────────────────────────────────
+#
+# bge-m3(F16 GGUF)는 특정 토큰 시퀀스에서 attention 수치가 터져 NaN 임베딩을 뱉고,
+# Go 의 encoding/json 이 NaN 을 직렬화 못 해 ollama 가 500 을 낸다(ollama#16625, 미해결).
+# 완전 결정적이고 내용 의존이라 재시도로는 절대 안 풀린다. 실측 — brain 청크 1,115개 중
+# 2개(0.18%)가 여기 걸렸고, 둘 다 RSS 인제스터가 붙이는 `**원문:** [열기](URL)` 푸터였다:
+#   **원문:** [열기](http://karpathy.github.io/2026/02/12/microgpt/)   18토큰·60자
+# 이 한 청크가 배치 전체를 죽여 전량 시딩이 167/355 에서 4회 연속 멈췄다.
+#
+# 상류 권장 우회는 슬래시/쉼표 제거다. 위 두 건 모두 슬래시를 공백으로 바꾸면 통과한다.
+
+_SALVAGE_TRANSFORMS: tuple[tuple[str, "object"], ...] = (
+    ("슬래시→공백", lambda s: s.replace("/", " ")),
+    ("쉼표→공백", lambda s: s.replace("/", " ").replace(",", " ")),
+)
+
+
+def _is_nan_bug_error(exc: Exception) -> bool:
+    """ollama 의 NaN 500 인가? 접속불가·타임아웃·404 등은 여기 해당하지 않는다.
+
+    이걸 구분 못 하면 서버가 죽었을 때 전 청크를 낱개로 재시도하다 전부 None 을 반환해
+    빈 인덱스로 조용히 성공하는 최악의 실패모드가 된다 — 그런 오류는 그대로 터뜨려야 한다.
+    """
+    resp = getattr(exc, "response", None)
+    return resp is not None and getattr(resp, "status_code", None) == 500
+
+
+def _embed_one_lenient(embedder, text: str) -> list[float] | None:
+    """한 건 임베딩. NaN 버그면 우회 변형으로 구제 시도, 끝내 실패하면 None."""
+    try:
+        return embedder.embed([text])[0]
+    except Exception as exc:
+        if not _is_nan_bug_error(exc):
+            raise
+    for label, transform in _SALVAGE_TRANSFORMS:
+        salvaged = transform(text)
+        if salvaged == text:
+            continue
+        try:
+            vec = embedder.embed([salvaged])[0]
+        except Exception as exc:
+            if not _is_nan_bug_error(exc):
+                raise
+            continue
+        # 저장되는 본문은 원문 그대로고 벡터만 변형본에서 나온다 — 검색 정확도가 조금 흔들리지만
+        # 청크를 통째로 잃는 것보다 낫다.
+        logger.warning("임베딩 NaN 버그 우회(%s): %r", label, text[:80])
+        return vec
+    logger.error("임베딩 실패 — 우회 불가, 이 청크는 색인에서 빠진다: %r", text[:80])
+    return None
+
+
+def embed_lenient(embedder, texts) -> list[list[float] | None]:
+    """`embedder.embed` 의 내성 버전 — 상류 NaN 버그로 죽는 항목만 None 이 된다.
+
+    반환 길이는 입력과 항상 같고 순서도 보존한다(호출자가 인덱스로 짝지을 수 있게).
+    정상 배치는 한 번의 embed 호출로 끝나고, 실패했을 때만 이분 탐색으로 범인을 좁힌다.
+    ollama 외 임베더(hash/local/openai)는 애초에 이 예외를 안 내므로 사실상 통과 경로다.
+    """
+    items = list(texts)
+    if not items:
+        return []
+    try:
+        return list(embedder.embed(items))
+    except Exception as exc:
+        if not _is_nan_bug_error(exc):
+            raise
+    if len(items) == 1:
+        return [_embed_one_lenient(embedder, items[0])]
+    mid = len(items) // 2
+    return embed_lenient(embedder, items[:mid]) + embed_lenient(embedder, items[mid:])
+
+
 def _l2_normalize(vec: list[float]) -> list[float]:
     """COSINE 거리는 크기에 불변이지만, hash 임베더와 일관되게 단위벡터로 정규화."""
     norm = math.sqrt(sum(float(v) * float(v) for v in vec))

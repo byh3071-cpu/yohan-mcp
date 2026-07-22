@@ -39,6 +39,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -61,6 +62,7 @@ from adapters.qdrant_adapter import (
     QdrantAdapter,
 )
 from core.chunking import chunk_markdown
+from core.embeddings import embed_lenient
 from core.paths import ROOT, resolve_memory_dir
 from core.triple_map import parse_triple_map, sentence_for_triple
 
@@ -157,6 +159,24 @@ def _title_of(rel_path: str, fm: dict) -> str:
     return str(fm.get("title") or fm.get("id") or Path(rel_path).stem)
 
 
+# 인제스터(src/ingest/{rss-feed,geeknews,url}.ts)가 모든 수집 문서 끝에 붙이는 원문 역링크.
+# 지식 내용이 0인데다 같은 URL 이 frontmatter `source_url` 에 이미 있어 색인에선 순수 노이즈고,
+# 실제로 상류 bge-m3 NaN 버그(ollama#16625)를 유발한 청크 2건이 전부 이 푸터였다.
+# `\s` 는 개행까지 먹어 줄을 통째로 삼킨다(= 뒤쪽 줄번호 밀림) — 개행 뺀 공백만 허용.
+_SOURCE_FOOTER_RE = re.compile(
+    r"^\*\*원문:\*\*[ \t]*\[열기\]\([^)\n]*\)[ \t]*$", re.MULTILINE
+)
+
+
+def _blank_source_footers(body: str) -> str:
+    """원문 역링크 줄을 빈 줄로 치환 — 색인에서만 빼고 원본 파일은 건드리지 않는다.
+
+    줄을 지우지 않고 비우는 이유: 푸터가 본문 중간에 낄 수 있는데(url.ts 는 두 번 붙인다)
+    삭제하면 뒤쪽 줄 번호가 전부 밀려 chunk_start_line 역링크가 어긋난다.
+    """
+    return _SOURCE_FOOTER_RE.sub("", body)
+
+
 async def seed_memory(
     *,
     limit: int | None = None,
@@ -242,6 +262,7 @@ async def seed_memory(
         skipped_files = 0
         n_new = n_reembed = n_unchanged = 0
         stale_chunks: list[dict] = []
+        unembeddable: list[dict] = []  # 상류 NaN 버그로 색인 못 한 청크(ollama#16625)
         pending_meta: list[tuple[str, dict]] = []
         pending_texts: list[str] = []
         staged_entries: dict[str, dict] = {}  # 전 청크가 pending 에 들어간 파일만 스테이징
@@ -249,12 +270,22 @@ async def seed_memory(
         async def _flush() -> None:
             nonlocal pending_meta, pending_texts, total_chunks
             if pending_texts:
-                vecs = await asyncio.to_thread(qdrant.embedder.embed, pending_texts)
-                points = [
-                    models.PointStruct(id=pid, vector=vecs[i], payload=payload)
-                    for i, (pid, payload) in enumerate(pending_meta)
-                ]
-                await client.upsert(qdrant.collection, points=points)
+                # embed 가 아니라 embed_lenient — 상류 bge-m3 NaN 버그(ollama#16625)로 죽는
+                # 청크 하나가 배치 전체를, 나아가 전량 시딩을 죽이지 못하게. 못 살린 청크는
+                # None 으로 오고 색인에서 빠진다(아래에서 명시 보고).
+                vecs = await asyncio.to_thread(
+                    embed_lenient, qdrant.embedder, pending_texts
+                )
+                points = []
+                for i, (pid, payload) in enumerate(pending_meta):
+                    if vecs[i] is None:
+                        unembeddable.append(
+                            {"path": payload["path"], "chunk_index": payload["chunk_index"]}
+                        )
+                        continue
+                    points.append(models.PointStruct(id=pid, vector=vecs[i], payload=payload))
+                if points:  # 배치 전원이 임베딩 불가면 upsert 할 게 없다
+                    await client.upsert(qdrant.collection, points=points)
                 total_chunks += len(points)
                 pending_meta = []
                 pending_texts = []
@@ -288,7 +319,7 @@ async def seed_memory(
             body = rec.get("body", "")
             title = _title_of(rel, rec)
             base_line = int(rec.get("_body_start_line", 1))
-            chunks = chunk_markdown(body, base_line=base_line)
+            chunks = chunk_markdown(_blank_source_footers(body), base_line=base_line)
             if prev is None:
                 n_new += 1
             else:
@@ -336,6 +367,15 @@ async def seed_memory(
                     f"(chunk{s['new_chunks']}..{s['old_chunks'] - 1} 잔존)"
                 )
 
+        if unembeddable:
+            # 조용히 넘어가면 "시딩은 됐는데 그 문서만 영영 안 잡히는" 상태가 된다 — 반드시 보인다.
+            print(
+                f"임베딩 불가 청크 {len(unembeddable)}건 — 색인에서 빠짐"
+                " (상류 bge-m3 NaN 버그 ollama#16625, 우회 변형으로도 실패):"
+            )
+            for u in unembeddable:
+                print(f"  - {u['path']} #chunk{u['chunk_index']}")
+
         processed = len(files) - skipped_files - n_unchanged
         print(
             f"완료 — 파일 {processed}건 처리(신규 {n_new}·재임베딩 {n_reembed}·"
@@ -354,6 +394,7 @@ async def seed_memory(
             "unchanged_files": n_unchanged,
             "deleted": deleted,
             "stale_chunks": stale_chunks,
+            "unembeddable": unembeddable,
             "manifest": str(manifest_path) if manifest_path is not None else None,
         }
     finally:
