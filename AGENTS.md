@@ -42,7 +42,7 @@
 - `load_dotenv()`는 기본 `override=False` — 서브프로세스 spawn 시 비어있는 환경변수(예: `QDRANT_URL`)가 `.env` 값을 가려 의도치 않은 접속 대상(예: `:memory:`)으로 빠질 수 있다. 값이 실제로 반영됐는지 확인 후 실행한다.
 - 머지 전 적대적 코드리뷰 게이트는 생략하지 않는다 — 파괴적 footgun(예: 데모 시드가 실제 컬렉션을 드롭·오차원 생성)과 테스트 위양성(top_k=0 동어반복, id stem 충돌, env 누출)을 다수 걸러낸 실적이 있다.
 
-<!-- YOHAN-ROSTER-CARD:BEGIN (managed by yohan-brain ops/propagation ??SoT瑜?怨좎퀜?? 吏곸젒?섏젙 湲덉?) -->
+<!-- YOHAN-ROSTER-CARD:BEGIN (managed by yohan-brain ops/propagation — SoT를 고쳐라, 직접수정 금지) -->
 ## 상시 지휘자 — 라우팅 카드 (yohan ecosystem)
 
 > SoT: yohan-brain `memory/core/agent-roster.yaml` `conductor_always_on` (v0.4+, status=active면 obey).
