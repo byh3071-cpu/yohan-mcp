@@ -68,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
     retry = commands.add_parser("retry", help="조치 완료 후 허용된 작업 한 건을 다시 대기열에 넣기")
     retry.add_argument("job_id")
 
+    invalidate_review = commands.add_parser(
+        "invalidate-review",
+        help="타임스탬프가 불완전한 레거시 검토를 조치 필요 상태로 격리",
+    )
+    invalidate_review.add_argument("job_id")
+
     approve = commands.add_parser("approve", help="검토 항목을 brain에 write-once 승인 적재")
     approve.add_argument("job_id")
     approve.add_argument("--stdin", action="store_true", help="{humanNote} JSON을 stdin으로 받기")
@@ -82,7 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    needs_queue = args.command in {"process", "reviews", "retry", "approve", "defer", "reject"}
+    needs_queue = args.command in {
+        "process",
+        "reviews",
+        "retry",
+        "invalidate-review",
+        "approve",
+        "defer",
+        "reject",
+    }
     service = KnowledgeService.from_env(require_queue=needs_queue)
     if args.command == "inventory":
         return service.inventory(force=args.force)
@@ -94,6 +108,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         return service.reviews()
     if args.command == "retry":
         return service.retry(args.job_id)
+    if args.command == "invalidate-review":
+        return service.invalidate_review(args.job_id)
     if args.command == "approve":
         payload = _stdin_payload() if args.stdin else {"humanNote": ""}
         return service.approve(args.job_id, payload["humanNote"])

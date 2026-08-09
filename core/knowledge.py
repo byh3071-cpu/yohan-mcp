@@ -1335,6 +1335,7 @@ class NotebookRegistry:
 class Queue(Protocol):
     def claim(self, worker_id: str, limit: int) -> list[dict[str, Any]]: ...
     def retry(self, job_id: str) -> dict[str, Any]: ...
+    def invalidate_review(self, job_id: str) -> dict[str, Any]: ...
     def checkpoint(self, job: Mapping[str, Any], **fields: Any) -> dict[str, Any]: ...
     def complete(self, job: Mapping[str, Any], status: str, **fields: Any) -> dict[str, Any]: ...
     def reviews(self) -> list[dict[str, Any]]: ...
@@ -1445,6 +1446,19 @@ class FocusFeedQueue:
                 },
             ),
             "retry",
+        )
+
+    def invalidate_review(self, job_id: str) -> dict[str, Any]:
+        return self._single(
+            self._request(
+                "POST",
+                "/rest/v1/rpc/invalidate_knowledge_review",
+                body={
+                    "p_user_id": self.owner_user_id,
+                    "p_job_id": job_id,
+                },
+            ),
+            "invalidate review",
         )
 
     def checkpoint(self, job: Mapping[str, Any], **fields: Any) -> dict[str, Any]:
@@ -2627,6 +2641,30 @@ class KnowledgeService:
             recovering_approval = job.get("status") == "approving"
             if recovering_approval:
                 quality_warnings.append("승인 적재 복구가 필요합니다. 같은 승인 intent로 재시도하세요.")
+            approval_blockers: list[str] = []
+            try:
+                self._validate_approval_contract(job)
+            except KnowledgeError as error:
+                approval_blockers.append(safe_error(error, 300))
+            attempt_count = int(job.get("attempt_count") or 0)
+            missing_timestamps = self._missing_public_caption_timestamps(job)
+            reprocess_blockers: list[str] = []
+            if job.get("status") != "review_required":
+                reprocess_blockers.append("승인 적재 복구 중인 항목은 재처리로 전환할 수 없습니다.")
+            metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            legacy_recovery_used = metadata.get("_legacy_review_recovery_v1") is True
+            if attempt_count > 3 or legacy_recovery_used:
+                reprocess_blockers.append("레거시 검토의 1회 복구 한도에 도달했습니다.")
+            if not missing_timestamps:
+                reprocess_blockers.append("공개 자막 타임스탬프 누락 유형이 아닙니다.")
+            preserved_fields = ("notebook_id", "notebook_source_id", "source_hash", "transcript_hash")
+            if any(not isinstance(job.get(field), str) or not str(job.get(field)).strip() for field in preserved_fields):
+                reprocess_blockers.append("보존할 NotebookLM source/hash 식별자가 없습니다.")
+            elif any(
+                not re.fullmatch(r"[0-9a-f]{64}", str(job[field]), re.IGNORECASE)
+                for field in ("source_hash", "transcript_hash")
+            ):
+                reprocess_blockers.append("보존할 source/hash 식별자가 SHA-256 형식이 아닙니다.")
             items.append(
                 {
                     "jobId": job.get("id"),
@@ -2644,6 +2682,11 @@ class KnowledgeService:
                     "category": result.get("category", "YT · 미분류 · Inbox"),
                     "status": "review_required" if recovering_approval else job.get("status"),
                     "approvalRecovery": recovering_approval,
+                    "approvalReady": not approval_blockers,
+                    "approvalBlockers": approval_blockers,
+                    "reprocessEligible": not reprocess_blockers,
+                    "reprocessBlockers": reprocess_blockers,
+                    "attemptCount": attempt_count,
                 }
             )
         return {"ok": True, "items": items}
@@ -2658,6 +2701,58 @@ class KnowledgeService:
             "attempt_count": job.get("attempt_count"),
             "notebook_id": job.get("notebook_id"),
             "notebook_source_id": job.get("notebook_source_id"),
+        }
+
+    @staticmethod
+    def _missing_public_caption_timestamps(job: Mapping[str, Any]) -> bool:
+        result = job.get("result") if isinstance(job.get("result"), dict) else {}
+        draft = result.get("draft") if isinstance(result.get("draft"), dict) else {}
+        coverage = draft.get("coverage") if isinstance(draft.get("coverage"), dict) else {}
+        for part in ("start", "middle", "end"):
+            evidence = coverage.get(part) if isinstance(coverage.get(part), dict) else {}
+            if not _TIMESTAMP_PATTERN.search(str(evidence.get("citation") or "")):
+                return True
+        claims = draft.get("claims") if isinstance(draft.get("claims"), list) else []
+        if not claims:
+            return True
+        return any(
+            not isinstance(claim, dict)
+            or not _TIMESTAMP_PATTERN.search(str(claim.get("citation") or ""))
+            for claim in claims
+        )
+
+    def invalidate_review(self, job_id: str) -> dict[str, Any]:
+        self._validate_job_id(job_id)
+        queue = self._queue()
+        job = queue.get(job_id)
+        if job.get("status") != "review_required":
+            raise KnowledgeError(f"검토 대기 작업만 무효화할 수 있습니다: {job.get('status')}")
+        attempt_count = int(job.get("attempt_count") or 0)
+        metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        legacy_recovery_used = metadata.get("_legacy_review_recovery_v1") is True
+        if attempt_count > 3 or legacy_recovery_used:
+            raise KnowledgeError("레거시 검토의 1회 복구 한도에 도달했습니다.")
+        if not self._missing_public_caption_timestamps(job):
+            raise KnowledgeError("공개 자막 타임스탬프가 완전한 검토는 무효화할 수 없습니다.")
+        preserved_fields = ("notebook_id", "notebook_source_id", "source_hash", "transcript_hash")
+        if any(not isinstance(job.get(field), str) or not str(job.get(field)).strip() for field in preserved_fields):
+            raise KnowledgeError("안전한 재처리에 필요한 NotebookLM source/hash 식별자가 없습니다.")
+        for field in ("source_hash", "transcript_hash"):
+            if not re.fullmatch(r"[0-9a-f]{64}", str(job[field]), re.IGNORECASE):
+                raise KnowledgeError(f"안전한 재처리에 필요한 {field}가 SHA-256 해시가 아닙니다.")
+        invalidated = queue.invalidate_review(job_id)
+        if invalidated.get("status") != "action_required" or invalidated.get("failure_code") != "PUBLIC_CAPTION_TIMESTAMPS_REQUIRED":
+            raise KnowledgeError("검토 무효화 응답의 상태 계약이 올바르지 않습니다.")
+        if any(invalidated.get(field) != job.get(field) for field in preserved_fields):
+            raise KnowledgeError("검토 무효화 중 NotebookLM source/hash 식별자가 변경되었습니다.")
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "status": invalidated.get("status"),
+            "failure_code": invalidated.get("failure_code"),
+            "attempt_count": invalidated.get("attempt_count"),
+            "notebook_id": invalidated.get("notebook_id"),
+            "notebook_source_id": invalidated.get("notebook_source_id"),
         }
 
     @staticmethod

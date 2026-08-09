@@ -252,6 +252,26 @@ class FakeQueue:
         self.job["result"] = {}
         return deepcopy(self.job)
 
+    def invalidate_review(self, job_id: str) -> dict[str, Any]:
+        assert job_id == self.job["id"]
+        metadata = self.job.get("metadata") if isinstance(self.job.get("metadata"), dict) else {}
+        attempt_count = int(self.job.get("attempt_count") or 0)
+        if self.job.get("status") != "review_required" or attempt_count > 3 or (
+            attempt_count == 3 and metadata.get("_legacy_review_recovery_v1") is True
+        ):
+            raise KnowledgeError("knowledge review is not eligible for invalidation")
+        self.job["status"] = "action_required"
+        if attempt_count == 3:
+            self.job["attempt_count"] = 2
+        self.job.setdefault("metadata", {})["_legacy_review_recovery_v1"] = True
+        self.job["failure_code"] = "PUBLIC_CAPTION_TIMESTAMPS_REQUIRED"
+        self.job["failure_message"] = "legacy review evidence must be reprocessed"
+        self.job["approval_token"] = None
+        self.job["approval_started_at"] = None
+        self.job["approval_intent_hash"] = None
+        self.job["lease_token"] = None
+        return deepcopy(self.job)
+
     def checkpoint(self, job: dict[str, Any], **fields: Any) -> dict[str, Any]:
         if job.get("lease_token") != self.job.get("lease_token"):
             raise AssertionError("lease drift")
@@ -1448,6 +1468,7 @@ def test_service_role_queue_is_scoped_to_configured_owner() -> None:
     queue.reviews()
     queue.claim("knowledge-worker:test", 1)
     queue.retry(JOB_ID)
+    queue.invalidate_review(JOB_ID)
     job = make_job()
     queue.checkpoint(job)
     queue.complete(job, "review_required")
@@ -1506,6 +1527,142 @@ def test_retry_contract_preserves_notebook_identity_and_attempt_ceiling(tmp_path
 def test_cli_exposes_explicit_single_job_retry_command() -> None:
     args = build_parser().parse_args(["retry", JOB_ID])
     assert args.command == "retry"
+    assert args.job_id == JOB_ID
+
+
+def test_invalid_legacy_review_moves_to_action_required_without_losing_source_identity(tmp_path: Path) -> None:
+    job = make_job()
+    draft = valid_draft()
+    draft["claims"][0].pop("citation")
+    job.update(
+        {
+            "status": "review_required",
+            "attempt_count": 1,
+            "result": {"draft": draft},
+            "quality_report": approval_quality(),
+            "notebook_id": "nb1",
+            "notebook_source_id": "source-nb1",
+            "source_hash": "a" * 64,
+            "transcript_hash": "b" * 64,
+        }
+    )
+    queue = FakeQueue(job)
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        env={},
+    )
+
+    result = service.invalidate_review(JOB_ID)
+
+    assert result["status"] == "action_required"
+    assert result["failure_code"] == "PUBLIC_CAPTION_TIMESTAMPS_REQUIRED"
+    assert queue.job["notebook_id"] == "nb1"
+    assert queue.job["notebook_source_id"] == "source-nb1"
+    assert queue.job["source_hash"] == "a" * 64
+    assert queue.job["transcript_hash"] == "b" * 64
+    assert queue.job["result"]["draft"]["claims"]
+
+
+def test_review_invalidation_rejects_missing_or_changed_source_identity(tmp_path: Path) -> None:
+    job = make_job()
+    job.update(
+        {
+            "status": "review_required",
+            "attempt_count": 1,
+            "result": {"draft": valid_draft()},
+            "notebook_id": "nb1",
+            "notebook_source_id": "source-nb1",
+            "source_hash": "a" * 64,
+            "transcript_hash": "b" * 64,
+        }
+    )
+    queue = FakeQueue(job)
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        env={},
+    )
+
+    queue.job["source_hash"] = None
+    with pytest.raises(KnowledgeError, match="source/hash"):
+        service.invalidate_review(JOB_ID)
+
+    queue.job["source_hash"] = "a" * 64
+    original_invalidate = queue.invalidate_review
+
+    def corrupting_invalidate(job_id: str) -> dict[str, Any]:
+        invalidated = original_invalidate(job_id)
+        invalidated["notebook_source_id"] = "changed-source"
+        return invalidated
+
+    queue.invalidate_review = corrupting_invalidate  # type: ignore[method-assign]
+    with pytest.raises(KnowledgeError, match="식별자가 변경"):
+        service.invalidate_review(JOB_ID)
+
+
+def test_review_invalidation_rejects_valid_timestamps_wrong_status_and_attempt_ceiling(tmp_path: Path) -> None:
+    job = make_job()
+    job.update(
+        {
+            "status": "review_required",
+            "attempt_count": 1,
+            "result": {"draft": grounded_draft()},
+            "quality_report": approval_quality(),
+        }
+    )
+    queue = FakeQueue(job)
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        env={},
+    )
+
+    with pytest.raises(KnowledgeError, match="타임스탬프가 완전"):
+        service.invalidate_review(JOB_ID)
+    queue.job["status"] = "completed"
+    with pytest.raises(KnowledgeError, match="검토 대기"):
+        service.invalidate_review(JOB_ID)
+    queue.job.update({"status": "review_required", "attempt_count": 2, "metadata": {"_legacy_review_recovery_v1": True}})
+    with pytest.raises(KnowledgeError, match="1회 복구 한도"):
+        service.invalidate_review(JOB_ID)
+
+
+def test_attempt_three_legacy_review_gets_exactly_one_bounded_recovery(tmp_path: Path) -> None:
+    job = make_job()
+    job.update(
+        {
+            "status": "review_required",
+            "attempt_count": 3,
+            "metadata": {},
+            "result": {"draft": valid_draft()},
+            "notebook_id": "nb1",
+            "notebook_source_id": "source-nb1",
+            "source_hash": "a" * 64,
+            "transcript_hash": "b" * 64,
+        }
+    )
+    queue = FakeQueue(job)
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        env={},
+    )
+
+    result = service.invalidate_review(JOB_ID)
+
+    assert result["status"] == "action_required"
+    assert result["attempt_count"] == 2
+    assert queue.job["metadata"]["_legacy_review_recovery_v1"] is True
+
+
+def test_cli_exposes_explicit_legacy_review_invalidation_command() -> None:
+    args = build_parser().parse_args(["invalidate-review", JOB_ID])
+    assert args.command == "invalidate-review"
     assert args.job_id == JOB_ID
 
 
@@ -1729,9 +1886,11 @@ def test_reviews_expose_control_tower_contract_without_transcript(tmp_path: Path
             "status": "review_required",
             "title": "검토할 영상",
             "quality_score": 91,
-            "quality_report": {"warnings": ["고유명사 확인 필요"]},
+            "quality_report": {**approval_quality(), "warnings": ["고유명사 확인 필요"]},
             "notebook_id": "nb1",
             "notebook_source_id": "source-nb1",
+            "source_hash": "a" * 64,
+            "transcript_hash": "b" * 64,
             "result": {"draft": grounded_draft()},
         }
     )
@@ -1747,7 +1906,47 @@ def test_reviews_expose_control_tower_contract_without_transcript(tmp_path: Path
     assert result["items"][0]["jobId"] == JOB_ID
     assert result["items"][0]["title"] == "검토할 영상"
     assert result["items"][0]["qualityWarnings"] == ["고유명사 확인 필요"]
+    assert result["items"][0]["approvalReady"] is True
+    assert result["items"][0]["approvalBlockers"] == []
+    assert result["items"][0]["reprocessEligible"] is False
+    assert result["items"][0]["reprocessBlockers"] == ["공개 자막 타임스탬프 누락 유형이 아닙니다."]
+    assert result["items"][0]["attemptCount"] == 0
     assert "transcript" not in json.dumps(result, ensure_ascii=False).lower()
+
+
+def test_reviews_fail_closed_for_used_recovery_marker_and_invalid_hash(tmp_path: Path) -> None:
+    draft = valid_draft()
+    draft["claims"][0].pop("citation", None)
+    job = make_job()
+    job.update(
+        {
+            "status": "review_required",
+            "attempt_count": 2,
+            "metadata": {"_legacy_review_recovery_v1": True},
+            "notebook_id": "nb1",
+            "notebook_source_id": "source-nb1",
+            "source_hash": "a" * 64,
+            "transcript_hash": "b" * 64,
+            "result": {"draft": draft},
+        }
+    )
+    queue = FakeQueue(job)
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        env={},
+    )
+
+    used_marker = service.reviews()["items"][0]
+    assert used_marker["reprocessEligible"] is False
+    assert "레거시 검토의 1회 복구 한도에 도달했습니다." in used_marker["reprocessBlockers"]
+
+    queue.job["metadata"] = {}
+    queue.job["source_hash"] = "not-a-sha256"
+    invalid_hash = service.reviews()["items"][0]
+    assert invalid_hash["reprocessEligible"] is False
+    assert "보존할 source/hash 식별자가 SHA-256 형식이 아닙니다." in invalid_hash["reprocessBlockers"]
 
 
 def test_knowledge_runtime_never_defaults_into_brain(monkeypatch: pytest.MonkeyPatch) -> None:
