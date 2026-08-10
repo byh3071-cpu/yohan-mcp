@@ -17,6 +17,7 @@ import pytest
 
 from core.knowledge import (
     BrainWriter,
+    CaptionCue,
     CaptionEvidence,
     CaptionEvidenceError,
     FocusFeedQueue,
@@ -74,22 +75,22 @@ def valid_draft() -> dict[str, Any]:
             {
                 "type": "fact",
                 "statement": "검증 가능한 사실",
-                "evidence_quote": "시작 구간에서 검증 가능한 사실을 자세히 설명합니다",
+                "evidence_quote": "시작 구간에서 검증 가능한 사실을 자세히 설명합니다 지금",
                 "citation": "[99:99]",
             }
         ],
         "coverage": {
             "start": {
                 "statement": "시작 설명",
-                "evidence_quote": "시작 구간에서 검증 가능한 사실을 자세히 설명합니다",
+                "evidence_quote": "시작 구간에서 검증 가능한 사실을 자세히 설명합니다 지금",
             },
             "middle": {
                 "statement": "중간 설명",
-                "evidence_quote": "중간 구간에서는 실행 방법과 중요한 제약을 설명합니다",
+                "evidence_quote": "중간 구간에서는 실행 방법과 중요한 제약을 설명합니다 지금",
             },
             "end": {
                 "statement": "끝 설명",
-                "evidence_quote": "마지막 구간에서는 결론과 다음 행동을 명확하게 정리합니다",
+                "evidence_quote": "마지막 구간에서는 결론과 다음 행동을 명확하게 정리합니다 지금",
             },
         },
         "yohan_relevance": "요한의 1인 AI 운영에서 반복 업무를 줄이는 데 적용할 수 있습니다.",
@@ -115,13 +116,13 @@ def caption_vtt() -> str:
     return """WEBVTT
 
 00:00:10.000 --> 00:00:18.000
-시작 구간에서 검증 가능한 사실을 자세히 설명합니다
+시작 구간에서 검증 가능한 사실을 자세히 설명합니다 지금
 
 00:02:30.000 --> 00:02:40.000
-중간 구간에서는 실행 방법과 중요한 제약을 설명합니다
+중간 구간에서는 실행 방법과 중요한 제약을 설명합니다 지금
 
 00:04:50.000 --> 00:05:00.000
-마지막 구간에서는 결론과 다음 행동을 명확하게 정리합니다
+마지막 구간에서는 결론과 다음 행동을 명확하게 정리합니다 지금
 """
 
 
@@ -427,6 +428,23 @@ def test_caption_provider_failure_also_deletes_temp_dir() -> None:
     assert not observed["temp_root"].exists()
 
 
+def test_caption_provider_rejects_oversized_vtt_before_reading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_runner(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+        del timeout
+        template = Path(args[args.index("--output") + 1])
+        (template.parent / "cap.ko.vtt").write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    def fail_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        raise AssertionError(f"oversized VTT must not be read: {self}")
+
+    monkeypatch.setattr(Path, "read_text", fail_read_text)
+    with pytest.raises(CaptionEvidenceError) as raised:
+        YoutubeCaptionProvider(fake_runner).fetch(VIDEO_URL)
+
+    assert raised.value.code == "YTDLP_CAPTION_FETCH_FAILED"
+
+
 def test_caption_grounding_overwrites_fake_times_and_keeps_only_verified_short_quotes() -> None:
     grounded = grounded_draft()
 
@@ -435,10 +453,10 @@ def test_caption_grounding_overwrites_fake_times_and_keeps_only_verified_short_q
     assert grounded["coverage"]["middle"]["citation"] == "[02:30]"
     assert grounded["coverage"]["end"]["citation"] == "[04:50]"
     assert grounded["claims"][0]["evidence_quote"] == (
-        "시작 구간에서 검증 가능한 사실을 자세히 설명합니다"
+        "시작 구간에서 검증 가능한 사실을 자세히 설명합니다 지금"
     )
     assert grounded["coverage"]["middle"]["evidence_quote"] == (
-        "중간 구간에서는 실행 방법과 중요한 제약을 설명합니다"
+        "중간 구간에서는 실행 방법과 중요한 제약을 설명합니다 지금"
     )
     assert "caption_quote" not in json.dumps(grounded, ensure_ascii=False)
 
@@ -464,7 +482,7 @@ def test_caption_grounding_rejects_hallucinated_or_short_quotes() -> None:
 def test_caption_grounding_requires_start_middle_end_thirds() -> None:
     draft = valid_draft()
     draft["coverage"]["start"]["evidence_quote"] = (
-        "마지막 구간에서는 결론과 다음 행동을 명확하게 정리합니다"
+        "마지막 구간에서는 결론과 다음 행동을 명확하게 정리합니다 지금"
     )
 
     with pytest.raises(KnowledgeError, match="start"):
@@ -485,12 +503,12 @@ alpha beta gamma delta
 gamma delta epsilon zeta
 
 00:00:05.000 --> 00:00:07.000
-epsilon zeta eta theta
+epsilon zeta eta theta iota
 """
     )
 
     assert rolling.locate(
-        "beta gamma delta epsilon zeta eta"
+        "beta gamma delta epsilon zeta eta theta iota"
     ) == 1.0
 
 
@@ -1036,7 +1054,7 @@ def test_process_reuses_existing_source_and_queries_only_that_source(tmp_path: P
     assert queue.job["transcript_hash"] == caption_evidence().evidence_hash
     persisted = json.dumps(queue.job, ensure_ascii=False)
     assert queue.job["result"]["draft"]["claims"][0]["evidence_quote"] == (
-        "시작 구간에서 검증 가능한 사실을 자세히 설명합니다"
+        "시작 구간에서 검증 가능한 사실을 자세히 설명합니다 지금"
     )
     assert "caption_quote" not in persisted
     assert not any(
@@ -1209,7 +1227,7 @@ def test_malformed_notebooklm_json_gets_one_strict_retry(
     assert runner.query_calls == 2
 
 
-def test_unmatched_evidence_gets_one_grounding_only_repair(
+def test_ungrounded_fact_fails_without_second_query(
     tmp_path: Path,
 ) -> None:
     bad = valid_draft()
@@ -1217,7 +1235,7 @@ def test_unmatched_evidence_gets_one_grounding_only_repair(
         "자막과 원문에 존재하지 않는 충분히 긴 모델 환각 문구입니다"
     )
 
-    class RepairRunner(FakeRunner):
+    class FailureRunner(FakeRunner):
         def __init__(self) -> None:
             super().__init__(draft=bad)
             self.query_calls = 0
@@ -1229,7 +1247,7 @@ def test_unmatched_evidence_gets_one_grounding_only_repair(
                     self.draft = valid_draft()
             return super().__call__(args, timeout)
 
-    runner = RepairRunner()
+    runner = FailureRunner()
     service = KnowledgeService(
         NotebookLmClient(runner),
         NotebookRegistry(tmp_path / "registry.json"),
@@ -1241,8 +1259,204 @@ def test_unmatched_evidence_gets_one_grounding_only_repair(
 
     report = service.process(limit=1)
 
+    assert report["action_required"] == [JOB_ID]
+    assert runner.query_calls == 1
+
+
+def test_long_ungrounded_coverage_fails_without_second_query(tmp_path: Path) -> None:
+    """P0 must not ask a second model query after a long-video quote failure."""
+    verified = {
+        "start": "start verified evidence appears in both source and captions exactly once",
+        "middle": "middle verified evidence appears in both source and captions exactly once",
+        "end": "end verified evidence appears in both source and captions exactly once",
+    }
+    lines = ["WEBVTT", ""]
+    for index in range(1139):
+        start = index * 5
+        end = start + 4
+        hours, remainder = divmod(start, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        end_hours, end_remainder = divmod(end, 3600)
+        end_minutes, end_seconds = divmod(end_remainder, 60)
+        text = {
+            0: verified["start"],
+            380: verified["middle"],
+            760: verified["end"],
+        }.get(index, f"background caption segment {index} with unrelated context")
+        lines.extend(
+            (
+                f"{hours:02d}:{minutes:02d}:{seconds:02d}.000 --> {end_hours:02d}:{end_minutes:02d}:{end_seconds:02d}.000",
+                text,
+            )
+        )
+    evidence = CaptionEvidence.from_vtt("\n".join(lines))
+    source = ("background source context " * 2400) + " ".join(verified.values())
+    assert len(source) >= 52_076
+    assert len(evidence.cues) == 1139
+
+    bad = valid_draft()
+    bad["claims"][0]["evidence_quote"] = verified["start"]
+    for item in bad["coverage"].values():
+        item["evidence_quote"] = "model invented quote that is absent from both evidence stores"
+
+    class LongFailureRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__(draft=bad)
+            self.query_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["source", "get"]:
+                self.calls.append(args)
+                return source
+            if args[:2] == ["notebook", "query"]:
+                self.query_calls += 1
+            return super().__call__(args, timeout)
+
+    runner = LongFailureRunner()
+    queue = FakeQueue()
+    service = KnowledgeService(
+        NotebookLmClient(runner),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(evidence),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    report = service.process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert runner.query_calls == 1
+
+
+def test_long_caption_initial_grounding_succeeds_without_second_query(tmp_path: Path) -> None:
+    quotes = {
+        "start": "start grounded evidence contains eight stable source words exactly now",
+        "middle": "middle grounded evidence contains eight stable source words exactly now",
+        "end": "end grounded evidence contains eight stable source words exactly now",
+    }
+    lines = ["WEBVTT", ""]
+    for index in range(1139):
+        start = index * 5
+        end = start + 4
+        hours, remainder = divmod(start, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        end_hours, end_remainder = divmod(end, 3600)
+        end_minutes, end_seconds = divmod(end_remainder, 60)
+        text = {0: quotes["start"], 380: quotes["middle"], 760: quotes["end"]}.get(
+            index, f"background caption segment {index} with unrelated context"
+        )
+        lines.extend((
+            f"{hours:02d}:{minutes:02d}:{seconds:02d}.000 --> {end_hours:02d}:{end_minutes:02d}:{end_seconds:02d}.000",
+            text,
+        ))
+    evidence = CaptionEvidence.from_vtt("\n".join(lines))
+    source = ("background source context " * 2400) + " ".join(quotes.values())
+    draft = valid_draft()
+    draft["claims"][0]["evidence_quote"] = quotes["start"]
+    for part, quote in quotes.items():
+        draft["coverage"][part]["evidence_quote"] = quote
+
+    class LongGroundedRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__(draft=draft)
+            self.query_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["source", "get"]:
+                self.calls.append(args)
+                return source
+            if args[:2] == ["notebook", "query"]:
+                self.query_calls += 1
+            return super().__call__(args, timeout)
+
+    runner = LongGroundedRunner()
+    service = KnowledgeService(
+        NotebookLmClient(runner), NotebookRegistry(tmp_path / "registry.json"),
+        queue=FakeQueue(), review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(evidence),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    report = service.process(limit=1)
+
     assert report["review_required"] == [JOB_ID]
-    assert runner.query_calls == 2
+    assert runner.query_calls == 1
+
+
+def test_caption_input_limits_fail_before_grounding_or_second_query(tmp_path: Path) -> None:
+    # Construct directly to avoid spending parser time on an intentionally hostile VTT.
+    huge_evidence = CaptionEvidence(
+        cues=tuple(
+            CaptionCue(float(index), float(index + 1), "bounded cue text")
+            for index in range(100_000)
+        ),
+        evidence_hash="a" * 64,
+        duration_seconds=100_000.0,
+    )
+    bad = valid_draft()
+    for item in bad["coverage"].values():
+        item["evidence_quote"] = "model invented quote that is absent from both evidence stores"
+
+    class LimitRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__(draft=bad)
+            self.query_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"]:
+                self.query_calls += 1
+            return super().__call__(args, timeout)
+
+    runner = LimitRunner()
+    queue = FakeQueue()
+    service = KnowledgeService(
+        NotebookLmClient(runner), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(huge_evidence),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    report = service.process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert queue.job["failure_code"] == "NLM_EVIDENCE_NOT_GROUNDED"
+    assert runner.query_calls == 1
+
+
+@pytest.mark.parametrize("field", ["citation", "promotion"])
+def test_oversized_ignored_model_fields_fail_before_grounding(tmp_path: Path, field: str) -> None:
+    bad = valid_draft()
+    for item in bad["coverage"].values():
+        item["evidence_quote"] = "model invented quote that is absent from both evidence stores"
+    if field == "citation":
+        bad["claims"][0]["citation"] = "x" * 257
+    else:
+        bad["promotion_candidates"]["concepts"] = ["x" * 8_193]
+
+    class OversizedRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__(draft=bad)
+            self.query_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"]:
+                self.query_calls += 1
+            return super().__call__(args, timeout)
+
+    runner = OversizedRunner()
+    queue = FakeQueue()
+    service = KnowledgeService(
+        NotebookLmClient(runner), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    report = service.process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert runner.query_calls == 1
 
 
 def test_quality_failure_stays_action_required(tmp_path: Path) -> None:

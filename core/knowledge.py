@@ -42,6 +42,8 @@ MAX_BATCH = 3
 REGISTRY_TTL = timedelta(hours=24)
 LEASE_SECONDS = 900
 MIN_EVIDENCE_QUOTE_CHARS = 10
+MIN_EVIDENCE_QUOTE_WORDS = 8
+MAX_PUBLIC_CAPTION_VTT_BYTES = 2 * 1024 * 1024
 NOTEBOOKLM_SOURCE_EVIDENCE_CONTRACT = "notebooklm-source-get-v1"
 _TRACKING_PARAMS = {"fbclid", "gclid", "dclid", "msclkid"}
 _TOKEN_PATTERN = re.compile(r"(?:Bearer\s+)?[A-Za-z0-9._-]{24,}", re.IGNORECASE)
@@ -682,6 +684,11 @@ class CaptionEvidence:
 
     @classmethod
     def from_vtt(cls, raw: str) -> "CaptionEvidence":
+        if len(raw.encode("utf-8")) > MAX_PUBLIC_CAPTION_VTT_BYTES:
+            raise CaptionEvidenceError(
+                "YTDLP_CAPTION_FETCH_FAILED",
+                "Public caption file exceeds the allowed size.",
+            )
         lines = raw.replace("\ufeff", "").splitlines()
         cues: list[CaptionCue] = []
         index = 0
@@ -729,6 +736,10 @@ class CaptionEvidence:
         if len(normalized_quote) < MIN_EVIDENCE_QUOTE_CHARS:
             raise EvidenceGroundingError(
                 "NotebookLM 근거 문구가 검증하기에 너무 짧습니다."
+            )
+        if len(_evidence_tokens(quote)) < MIN_EVIDENCE_QUOTE_WORDS:
+            raise EvidenceGroundingError(
+                "NotebookLM evidence quote must contain at least eight words."
             )
         stream_parts: list[str] = []
         positions: list[float] = []
@@ -940,6 +951,11 @@ class YoutubeCaptionProvider:
                     )
                 if candidates:
                     try:
+                        if candidates[0].stat().st_size > MAX_PUBLIC_CAPTION_VTT_BYTES:
+                            raise CaptionEvidenceError(
+                                "YTDLP_CAPTION_FETCH_FAILED",
+                                "Public caption file exceeds the allowed size.",
+                            )
                         return CaptionEvidence.from_vtt(
                             candidates[0].read_text(encoding="utf-8")
                         )
@@ -1611,6 +1627,12 @@ _COVERAGE_ITEM_FIELDS = {
     "citation",
     "citation_verified",
 }
+MAX_CAPTION_SOURCE_BYTES = 128 * 1024
+MAX_CAPTION_TOTAL_BYTES = 1024 * 1024
+MAX_CAPTION_CUE_COUNT = 5_000
+MAX_CAPTION_CUE_BYTES = 2_048
+MAX_IGNORED_CITATION_BYTES = 256
+MAX_PROMOTION_CANDIDATE_BYTES = 8 * 1024
 
 
 def _contract_text(value: Any, *, maximum: int = 12_000) -> str:
@@ -1650,6 +1672,10 @@ def _sanitize_draft_contract(draft: Mapping[str, Any]) -> dict[str, Any]:
         quote = _contract_text(quote_value, maximum=2_000) if quote_value else ""
         if claim_type == "fact" and not quote:
             raise DraftContractError("NotebookLM 사실 주장에 근거 문구가 없습니다.")
+        if "citation" in raw_claim:
+            _contract_text(raw_claim["citation"], maximum=MAX_IGNORED_CITATION_BYTES)
+        if "citation_verified" in raw_claim and not isinstance(raw_claim["citation_verified"], bool):
+            raise DraftContractError("NotebookLM citation_verified must be boolean.")
         claims.append(
             {
                 "type": claim_type,
@@ -1668,6 +1694,10 @@ def _sanitize_draft_contract(draft: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(raw_item, dict) or not set(raw_item).issubset(_COVERAGE_ITEM_FIELDS):
             raise DraftContractError("NotebookLM 영상 구간에 허용되지 않은 필드가 있습니다.")
         quote_value = raw_item.get("evidence_quote") or raw_item.get("caption_quote")
+        if "citation" in raw_item:
+            _contract_text(raw_item["citation"], maximum=MAX_IGNORED_CITATION_BYTES)
+        if "citation_verified" in raw_item and not isinstance(raw_item["citation_verified"], bool):
+            raise DraftContractError("NotebookLM citation_verified must be boolean.")
         coverage[part] = {
             "statement": _contract_text(raw_item.get("statement"), maximum=4_000),
             "evidence_quote": _contract_text(quote_value, maximum=2_000),
@@ -1678,6 +1708,9 @@ def _sanitize_draft_contract(draft: Mapping[str, Any]) -> dict[str, Any]:
         raise DraftContractError("NotebookLM 승격 후보 필드가 올바르지 않습니다.")
     if any(not isinstance(promotion.get(key), list) for key in ("concepts", "people", "triples")):
         raise DraftContractError("NotebookLM 승격 후보 목록 형식이 올바르지 않습니다.")
+
+    if len(json.dumps(promotion, ensure_ascii=False).encode("utf-8")) > MAX_PROMOTION_CANDIDATE_BYTES:
+        raise DraftContractError("NotebookLM promotion candidate input exceeds the size limit.")
 
     return {
         "title": _contract_text(draft.get("title"), maximum=1_000),
@@ -1951,21 +1984,21 @@ def build_query_prompt(job: Mapping[str, Any]) -> str:
     )
 
 
-def build_grounding_repair_prompt(
-    job: Mapping[str, Any],
-    draft: Mapping[str, Any],
-) -> str:
-    return "\n".join(
-        (
-            "아래 JSON의 요약 내용은 유지하고 evidence_quote만 교정하세요.",
-            f"이 YouTube source 하나만 사용하세요: {job.get('source_url')}",
-            "각 evidence_quote는 source에서 번역·생략·이어붙이기 없이 그대로 복사한 8~15단어여야 합니다.",
-            "coverage.start는 source의 첫 1/3, middle은 가운데 1/3, end는 마지막 1/3에서 복사하세요.",
-            "타임스탬프를 만들지 마세요.",
-            "Markdown fence·설명·각주 없이 유효한 JSON 객체 하나만 반환하세요.",
-            json.dumps(dict(draft), ensure_ascii=False),
-        )
-    )
+def _validate_caption_input_bounds(evidence: CaptionEvidence, source_text: str) -> None:
+    """Apply all bounded-input checks before any caption/source matching."""
+    if len(source_text.encode("utf-8")) > MAX_CAPTION_SOURCE_BYTES:
+        raise EvidenceGroundingError("NotebookLM source get exceeds the caption input limit.")
+    if len(evidence.cues) > MAX_CAPTION_CUE_COUNT:
+        raise EvidenceGroundingError("Public caption cue count exceeds the input limit.")
+    caption_bytes = 0
+    for cue in evidence.cues:
+        cue_bytes = len(cue.text.encode("utf-8"))
+        if cue_bytes > MAX_CAPTION_CUE_BYTES:
+            raise EvidenceGroundingError("Public caption cue exceeds the input limit.")
+        caption_bytes += cue_bytes
+        if caption_bytes > MAX_CAPTION_TOTAL_BYTES:
+            raise EvidenceGroundingError("Public caption exceeds the input limit.")
+    return None
 
 
 class ReviewStore:
@@ -2542,6 +2575,8 @@ class KnowledgeService:
                     )
                     report["action_required"].append(str(job.get("id")))
                     continue
+                if caption_evidence is not None:
+                    _validate_caption_input_bounds(caption_evidence, content)
                 try:
                     draft = (
                         ground_draft_with_caption_evidence(draft, caption_evidence, content)
@@ -2550,24 +2585,13 @@ class KnowledgeService:
                     )
                 except DraftContractError:
                     # Unknown fields are a persistence-boundary violation, not
-                    # a formatting mistake that should be echoed back for repair.
+                    # a formatting mistake that may be retried with model text.
                     raise
                 except EvidenceGroundingError:
-                    repaired_raw = self.notebooklm.query(
-                        notebook_id,
-                        source_id,
-                        build_grounding_repair_prompt(job, draft),
-                    )
-                    repaired = parse_draft(repaired_raw)
-                    if repaired is None:
-                        raise EvidenceGroundingError(
-                            "NotebookLM 근거 교정 응답이 JSON 형식이 아닙니다."
-                        )
-                    draft = (
-                        ground_draft_with_caption_evidence(repaired, caption_evidence, content)
-                        if caption_evidence is not None
-                        else ground_draft_with_source_evidence(repaired, content, str(source_id))
-                    )
+                    # P0 has no independent semantic evaluator.  A second model
+                    # query must not replace an ungrounded quote with a merely
+                    # plausible one, so every grounding failure is terminal.
+                    raise
                 quality = evaluate_draft(
                     draft,
                     True,
