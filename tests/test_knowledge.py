@@ -10,11 +10,13 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 
 import httpx
 import pytest
 
+from core import knowledge as knowledge_module
 from core.knowledge import (
     BrainWriter,
     CaptionCue,
@@ -512,7 +514,7 @@ epsilon zeta eta theta iota
     ) == 1.0
 
 
-def test_caption_grounding_allows_only_high_similarity_public_caption_match() -> None:
+def test_caption_grounding_rejects_semantic_but_nonidentical_public_caption_match() -> None:
     evidence = CaptionEvidence.from_vtt(
         """WEBVTT
 
@@ -527,13 +529,91 @@ the final recommendation was to review the evidence carefully
 """
     )
 
-    assert evidence.locate(
-        "the investment was around thirty billion dollars in total"
-    ) == 1.0
+    with pytest.raises(KnowledgeError):
+        evidence.locate(
+            "the investment was around thirty billion dollars in total"
+        )
     with pytest.raises(KnowledgeError):
         evidence.locate(
             "a completely unrelated statement about another market and company"
         )
+
+
+def test_caption_index_resets_across_time_gaps_and_counts_duplicate_quotes() -> None:
+    quote = "alpha beta gamma delta epsilon zeta eta theta"
+    unique = CaptionEvidence(
+        (
+            CaptionCue(1.0, 2.0, quote),
+            CaptionCue(1_000.0, 1_001.0, "unrelated later caption words remain separate"),
+        ),
+        "d" * 64,
+        1_001.0,
+    )
+    assert unique.locate(quote) == 1.0
+
+    split = CaptionEvidence(
+        (
+            CaptionCue(1.0, 2.0, "alpha beta gamma delta"),
+            CaptionCue(1_000.0, 1_001.0, "epsilon zeta eta theta"),
+        ),
+        "e" * 64,
+        1_001.0,
+    )
+    with pytest.raises(KnowledgeError):
+        split.locate(quote)
+
+    duplicate = CaptionEvidence(
+        (
+            CaptionCue(1.0, 2.0, quote),
+            CaptionCue(1_000.0, 1_001.0, quote),
+        ),
+        "f" * 64,
+        1_001.0,
+    )
+    with pytest.raises(KnowledgeError):
+        duplicate.locate(quote)
+
+
+@pytest.mark.parametrize(
+    "caption, quote",
+    [
+        ("profit was −5 million dollars after taxes during fiscal year", "profit was 5 million dollars after taxes during fiscal year"),
+        ("we must execute, John, after reviewing all eight source details", "we must execute John after reviewing all eight source details"),
+    ],
+)
+def test_caption_grounding_preserves_semantic_punctuation(
+    caption: str, quote: str,
+) -> None:
+    evidence = CaptionEvidence((CaptionCue(1.0, 2.0, caption),), "a" * 64, 2.0)
+    with pytest.raises(KnowledgeError):
+        evidence.locate(quote)
+
+
+def test_caption_locate_many_reuses_prebuilt_token_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = knowledge_module._canonical_evidence_lexemes
+    calls = 0
+
+    def counted(value: str) -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(knowledge_module, "_canonical_evidence_lexemes", counted)
+    quotes = [f"claim {index} has eight stable caption source words today now" for index in range(67)]
+    evidence = CaptionEvidence(
+        tuple(CaptionCue(float(index), float(index + 1), quote) for index, quote in enumerate(quotes)),
+        "b" * 64,
+        67.0,
+    )
+    assert calls == len(quotes)
+    calls = 0
+
+    found = evidence.locate_many(quotes)
+
+    assert len(found) == len(quotes)
+    assert calls == len(quotes)
 
 
 def test_caption_grounding_rejects_changed_numbers_negation_and_ambiguous_matches() -> None:
@@ -585,7 +665,7 @@ the closing section contains a different and sufficiently long sentence
 """
     )
     with pytest.raises(KnowledgeError):
-        ambiguous.locate("review all complete evidence before making the final decision today")
+        ambiguous.locate("review the complete evidence before making the final decision today")
 
 
 @pytest.mark.parametrize(
@@ -1384,6 +1464,59 @@ def test_long_caption_initial_grounding_succeeds_without_second_query(tmp_path: 
     assert runner.query_calls == 1
 
 
+def test_large_source_and_many_cues_use_bounded_timestamp_windows() -> None:
+    quotes = {
+        "start": "start verified quote has eight stable source words now here",
+        "middle": "middle verified quote has eight stable source words now here",
+        "end": "end verified quote has eight stable source words now here",
+    }
+    cue_count = 6_000
+    cues = tuple(
+        CaptionCue(
+            float(index),
+            float(index + 1),
+            {0: quotes["start"], 2_000: quotes["middle"], 4_000: quotes["end"]}.get(
+                index, "bounded caption context remains small"
+            ),
+        )
+        for index in range(cue_count)
+    )
+    evidence = CaptionEvidence(cues, "b" * 64, float(cue_count))
+    filler = "source padding remains bounded and deterministic "
+    source = (
+        quotes["start"] + " "
+        + filler * 3_800
+        + quotes["middle"] + " "
+        + filler * 3_800
+        + quotes["end"] + " "
+        + filler * 3_800
+    )
+    assert len(source) > 128 * 1024
+    draft = valid_draft()
+    draft["claims"][0]["evidence_quote"] = quotes["start"]
+    for part, quote in quotes.items():
+        draft["coverage"][part]["evidence_quote"] = quote
+
+    grounded = ground_draft_with_caption_evidence(draft, evidence, source)
+
+    assert grounded["coverage"]["start"]["citation"] == "[00:00]"
+    assert grounded["coverage"]["middle"]["citation"] == "[33:20]"
+    assert grounded["coverage"]["end"]["citation"] == "[01:06:40]"
+
+
+def test_caption_normalization_allows_only_formatting_differences() -> None:
+    quote = "Cafe ABC confirms eight stable words for source evidence today"
+    evidence = CaptionEvidence(
+        (CaptionCue(1.0, 5.0, "Cafe\u200b \uff21\uff22\uff23 confirms eight stable words for source evidence today"),),
+        "c" * 64,
+        5.0,
+    )
+
+    assert evidence.locate(quote) == 1.0
+    with pytest.raises(KnowledgeError):
+        evidence.locate("Cafe ABC confirms eight stable terms for source evidence today")
+
+
 def test_caption_input_limits_fail_before_grounding_or_second_query(tmp_path: Path) -> None:
     # Construct directly to avoid spending parser time on an intentionally hostile VTT.
     huge_evidence = CaptionEvidence(
@@ -1608,6 +1741,239 @@ def test_notebooklm_cli_uses_current_domain_compatible_package(
     assert "ANTHROPIC_API_KEY" not in observed["kwargs"]["env"]
     assert "UV_INDEX_PRIVATE_PASSWORD" not in observed["kwargs"]["env"]
     assert "NLM_INTERNAL_TOKEN" not in observed["kwargs"]["env"]
+
+
+def test_notebooklm_source_get_stdout_is_read_with_a_hard_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    class Pipe:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def read(self, size: int) -> bytes:
+            observed.setdefault("read_sizes", []).append(size)
+            chunk, self.payload = self.payload[:size], self.payload[size:]
+            return chunk
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdout = Pipe(b'{"content":"normal source"}')
+            self.stdin = type("Gate", (), {"write": lambda self, value: len(value), "flush": lambda self: None, "close": lambda self: None})()
+
+        def wait(self, timeout: int) -> int:
+            observed["timeout"] = timeout
+            return 0
+
+    monkeypatch.setattr("core.knowledge.subprocess.Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(knowledge_module, "_assign_windows_kill_job", lambda process: 1)
+    monkeypatch.setattr(knowledge_module, "_close_windows_job", lambda job: None)
+
+    assert run_notebooklm_command(["source", "get", "source-1", "--json"]) == '{"content":"normal source"}'
+    assert max(observed["read_sizes"]) <= 64 * 1024
+    assert observed["timeout"] == 120
+
+
+def test_notebooklm_source_get_rejects_oversized_stdout_before_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = {"killed": False}
+
+    class Pipe:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read(self, size: int) -> bytes:
+            self.reads += 1
+            return b"x" * size if self.reads <= 100 else b""
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdout = Pipe()
+            self.stdin = type("Gate", (), {"write": lambda self, value: len(value), "flush": lambda self: None, "close": lambda self: None})()
+
+        def kill(self) -> None:
+            observed["killed"] = True
+
+        def wait(self, timeout: int) -> int:
+            return 0
+
+    monkeypatch.setattr("core.knowledge.subprocess.Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(knowledge_module, "_assign_windows_kill_job", lambda process: 1)
+    monkeypatch.setattr(knowledge_module, "_close_windows_job", lambda job: None)
+
+    with pytest.raises(KnowledgeError, match="output exceeds"):
+        run_notebooklm_command(["source", "get", "source-1", "--json"])
+    assert observed["killed"] is True
+
+
+@pytest.mark.parametrize(
+    "child_code",
+    [
+        "import time; time.sleep(10)",
+        "import os, sys, time; os.close(sys.stdout.fileno()); time.sleep(10)",
+    ],
+)
+def test_notebooklm_source_get_deadline_kills_and_reaps_open_or_eof_child(
+    monkeypatch: pytest.MonkeyPatch, child_code: str,
+) -> None:
+    original_popen = subprocess.Popen
+    children: list[subprocess.Popen[bytes]] = []
+
+    def tracked_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        child = original_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr("core.knowledge.subprocess.Popen", tracked_popen)
+    started = time.monotonic()
+    with pytest.raises(KnowledgeError, match="timed out"):
+        knowledge_module._run_capped_source_get_command(
+            [sys.executable, "-c", child_code], 0.2,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3
+    assert children[0].poll() is not None
+
+
+def test_notebooklm_source_get_exact_cap_and_overflow_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_popen = subprocess.Popen
+    children: list[subprocess.Popen[bytes]] = []
+
+    def tracked_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        child = original_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr("core.knowledge.subprocess.Popen", tracked_popen)
+    exact = knowledge_module._run_capped_source_get_command(
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * (4 * 1024 * 1024))"], 5,
+    )
+    assert len(exact.encode("utf-8")) == 4 * 1024 * 1024
+
+    with pytest.raises(KnowledgeError, match="output exceeds"):
+        knowledge_module._run_capped_source_get_command(
+            [sys.executable, "-c", "import sys, time; sys.stdout.buffer.write(b'x' * (16 * 1024 * 1024)); sys.stdout.flush(); time.sleep(10)"], 5,
+        )
+    assert children[-1].poll() is not None
+    assert not any(
+        thread.name == "knowledge-source-get-reader" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix process-group assertion")
+def test_notebooklm_source_get_timeout_kills_unix_grandchild(tmp_path: Path) -> None:
+    pid_path = tmp_path / "grandchild.pid"
+    code = (
+        "import pathlib, subprocess, sys, time; "
+        "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(10)"
+    )
+
+    with pytest.raises(KnowledgeError, match="timed out"):
+        knowledge_module._run_capped_source_get_command(
+            [sys.executable, "-c", code, str(pid_path)], 0.2,
+        )
+
+    grandchild_pid = int(pid_path.read_text(encoding="utf-8"))
+    for _ in range(20):
+        try:
+            os.kill(grandchild_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("source_get grandchild remained alive after process-group cleanup")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object assertion")
+def test_notebooklm_source_get_timeout_kills_windows_parent_exit_grandchild(tmp_path: Path) -> None:
+    pid_path = tmp_path / "grandchild.pid"
+    code = (
+        "import pathlib, subprocess, sys; "
+        "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid))"
+    )
+    started = time.monotonic()
+    with pytest.raises(KnowledgeError, match="timed out"):
+        knowledge_module._run_capped_source_get_command(
+            [sys.executable, "-c", code, str(pid_path)], 0.2,
+        )
+    assert time.monotonic() - started < 1
+    grandchild_pid = int(pid_path.read_text(encoding="utf-8"))
+    for _ in range(10):
+        try:
+            os.kill(grandchild_pid, 0)
+        except OSError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("source_get grandchild remained alive after Job cleanup")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launch-gate assertion")
+def test_notebooklm_source_get_job_assignment_failure_never_runs_gated_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    marker = tmp_path / "should-not-exist"
+    monkeypatch.setattr(knowledge_module, "_assign_windows_kill_job", lambda process: None)
+    code = f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"
+
+    with pytest.raises(KnowledgeError, match="ownership failed"):
+        knowledge_module._run_capped_source_get_command(
+            [sys.executable, "-c", code], 1,
+        )
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launch-gate assertion")
+def test_notebooklm_source_get_gate_write_failure_never_runs_gated_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    marker = tmp_path / "should-not-exist"
+    original_popen = subprocess.Popen
+
+    class BrokenGate:
+        def write(self, value: bytes) -> int:
+            raise OSError("gate unavailable")
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class ProcessProxy:
+        def __init__(self, process: subprocess.Popen[bytes]) -> None:
+            self.process = process
+            self.stdout = process.stdout
+            self.stdin = BrokenGate()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.process, name)
+
+    monkeypatch.setattr(
+        "core.knowledge.subprocess.Popen",
+        lambda *args, **kwargs: ProcessProxy(original_popen(*args, **kwargs)),
+    )
+    monkeypatch.setattr(
+        "core.knowledge.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+    )
+    code = f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"
+
+    with pytest.raises(KnowledgeError, match="launch gate failed"):
+        knowledge_module._run_capped_source_get_command(
+            [sys.executable, "-c", code], 1,
+        )
+
+    assert not marker.exists()
 
 
 def test_queue_error_never_exposes_service_key() -> None:

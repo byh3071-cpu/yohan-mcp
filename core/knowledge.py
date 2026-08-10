@@ -12,22 +12,26 @@ No credential, transcript body, or human note is written to the registry.
 """
 from __future__ import annotations
 
-from collections import Counter
+import base64
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
 from hashlib import sha256
+import ctypes
 import html
 import json
 import os
 from pathlib import Path
+import queue
 import re
+import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import unicodedata
 from typing import Any, Callable, Iterable, Mapping, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -44,6 +48,8 @@ LEASE_SECONDS = 900
 MIN_EVIDENCE_QUOTE_CHARS = 10
 MIN_EVIDENCE_QUOTE_WORDS = 8
 MAX_PUBLIC_CAPTION_VTT_BYTES = 2 * 1024 * 1024
+MAX_NOTEBOOKLM_SOURCE_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_CAPTION_CUE_GAP_SECONDS = 1.0
 NOTEBOOKLM_SOURCE_EVIDENCE_CONTRACT = "notebooklm-source-get-v1"
 _TRACKING_PARAMS = {"fbclid", "gclid", "dclid", "msclkid"}
 _TOKEN_PATTERN = re.compile(r"(?:Bearer\s+)?[A-Za-z0-9._-]{24,}", re.IGNORECASE)
@@ -53,6 +59,8 @@ _VTT_TIMING_PATTERN = re.compile(
     r"(?P<end>\d{1,2}:\d{2}(?::\d{2})?[.,]\d{3})"
 )
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_CANONICAL_LEXEME_PATTERN = re.compile(r"[^\W_]+|[^\s\w]", re.UNICODE)
+_CAPTION_GAP_SENTINEL = "\x00caption-gap\x00"
 _UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -363,6 +371,257 @@ def _first_string(value: Any, keys: Iterable[str], depth: int = 0) -> str | None
 CommandRunner = Callable[[list[str], int], str]
 SourceIdentityReader = Callable[[str], Mapping[str, str]]
 
+_WINDOWS_SOURCE_GET_GATE_WRAPPER = (
+    "import base64,json,os,subprocess,sys;"
+    "command=json.loads(base64.urlsafe_b64decode(sys.argv[1]).decode('utf-8'));"
+    "gate=sys.stdin.buffer.read(1);"
+    "sys.exit(125) if gate != b'1' else None;"
+    "child=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=sys.stdout.buffer,"
+    "stderr=subprocess.DEVNULL,shell=False,env=dict(os.environ));"
+    "sys.exit(child.wait())"
+)
+
+
+def _assign_windows_kill_job(process: subprocess.Popen[bytes]) -> int | None:
+    """Own a source_get process tree; returning None is a fail-closed launch error."""
+    if os.name != "nt":
+        return 0
+    from ctypes import wintypes
+
+    class BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+        )]
+
+    class ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = ExtendedLimitInformation()
+    info.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+    assigned = False
+    try:
+        if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            return None
+        handle = getattr(process, "_handle", None)
+        if not handle or not kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(handle)):
+            return None
+        assigned = True
+        return int(job)
+    finally:
+        if not assigned:
+            kernel32.CloseHandle(job)
+
+
+def _close_windows_job(job: int | None) -> None:
+    if os.name == "nt" and job:
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job)
+
+
+def _run_capped_source_get_command(
+    command: list[str], timeout_seconds: int,
+) -> str:
+    """Read source_get stdout incrementally so a malformed CLI cannot exhaust RAM."""
+    process: subprocess.Popen[bytes] | None = None
+    reader: threading.Thread | None = None
+    stop_reader = threading.Event()
+    job_handle: int | None = None
+
+    def terminate_and_reap() -> None:
+        nonlocal job_handle
+        stop_reader.set()
+        if process is None:
+            return
+        try:
+            poll = getattr(process, "poll", None)
+            if os.name == "nt":
+                _close_windows_job(job_handle)
+                job_handle = None
+            elif getattr(process, "pid", None):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if poll is None or poll() is None:
+                if os.name == "nt" and getattr(process, "pid", None):
+                    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+                    taskkill = Path(system_root) / "System32" / "taskkill.exe" if system_root else None
+                    if taskkill is not None and taskkill.is_file():
+                        subprocess.run(
+                            [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
+                            check=False, shell=False, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, timeout=5, env=_child_process_env(),
+                        )
+                if poll is None or poll() is None:
+                    process.kill()
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass
+        finally:
+            try:
+                if process.stdout is not None:
+                    close_stdout = getattr(process.stdout, "close", None)
+                    if close_stdout is not None:
+                        close_stdout()
+            except (AttributeError, OSError):
+                pass
+            try:
+                process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if reader is not None:
+                reader.join(timeout=5)
+
+    try:
+        popen_kwargs: dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "shell": False,
+            "env": _child_process_env(),
+        }
+        launch_command = command
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            popen_kwargs["stdin"] = subprocess.PIPE
+            encoded_command = base64.urlsafe_b64encode(
+                json.dumps(command, ensure_ascii=False).encode("utf-8")
+            ).decode("ascii")
+            launch_command = [sys.executable, "-c", _WINDOWS_SOURCE_GET_GATE_WRAPPER, encoded_command]
+        else:
+            popen_kwargs["stdin"] = subprocess.DEVNULL
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(
+            launch_command,
+            **popen_kwargs,
+        )
+        if os.name == "nt":
+            job_handle = _assign_windows_kill_job(process)
+            if job_handle is None:
+                terminate_and_reap()
+                raise NotebookLmCommandError(
+                    "NLM_PROCESSING_FAILED", "NotebookLM source get process ownership failed."
+                )
+            try:
+                assert process.stdin is not None
+                process.stdin.write(b"1")
+                process.stdin.flush()
+                process.stdin.close()
+            except (AssertionError, OSError):
+                terminate_and_reap()
+                raise NotebookLmCommandError(
+                    "NLM_PROCESSING_FAILED", "NotebookLM source get launch gate failed."
+                )
+        assert process.stdout is not None
+        deadline = time.monotonic() + timeout_seconds
+        output: queue.Queue[bytes | None] = queue.Queue(maxsize=2)
+
+        def offer(item: bytes | None) -> None:
+            while not stop_reader.is_set():
+                try:
+                    output.put(item, timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
+
+        def read_stdout() -> None:
+            try:
+                read_chunk = getattr(process.stdout, "read1", process.stdout.read)
+                while not stop_reader.is_set():
+                    chunk = read_chunk(64 * 1024)
+                    offer(chunk)
+                    if not chunk:
+                        return
+            except OSError:
+                offer(None)
+
+        reader = threading.Thread(target=read_stdout, name="knowledge-source-get-reader")
+        reader.start()
+        chunks: list[bytes] = []
+        remaining = MAX_NOTEBOOKLM_SOURCE_STDOUT_BYTES
+        while True:
+            seconds_left = deadline - time.monotonic()
+            if seconds_left <= 0:
+                terminate_and_reap()
+                raise NotebookLmCommandError("NLM_PROCESSING_FAILED", "NotebookLM source get timed out.")
+            try:
+                chunk = output.get(timeout=seconds_left)
+            except queue.Empty as error:
+                terminate_and_reap()
+                raise NotebookLmCommandError("NLM_PROCESSING_FAILED", "NotebookLM source get timed out.") from error
+            if chunk is None:
+                terminate_and_reap()
+                raise NotebookLmCommandError("NLM_PROCESSING_FAILED", "NotebookLM source get failed.")
+            if not chunk:
+                break
+            if len(chunk) > remaining:
+                terminate_and_reap()
+                raise NotebookLmCommandError(
+                    "NLM_PROCESSING_FAILED",
+                    "NotebookLM source get output exceeds the allowed size.",
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        seconds_left = deadline - time.monotonic()
+        if seconds_left <= 0:
+            terminate_and_reap()
+            raise NotebookLmCommandError("NLM_PROCESSING_FAILED", "NotebookLM source get timed out.")
+        try:
+            returncode = process.wait(timeout=seconds_left)
+        except subprocess.TimeoutExpired as error:
+            terminate_and_reap()
+            raise NotebookLmCommandError("NLM_PROCESSING_FAILED", "NotebookLM source get timed out.") from error
+        reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if reader.is_alive():
+            terminate_and_reap()
+            raise NotebookLmCommandError("NLM_PROCESSING_FAILED", "NotebookLM source get timed out.")
+        try:
+            close_stdout = getattr(process.stdout, "close", None)
+            if close_stdout is not None:
+                close_stdout()
+        except (AttributeError, OSError):
+            pass
+        if os.name == "nt":
+            _close_windows_job(job_handle)
+            job_handle = None
+    except (OSError, subprocess.TimeoutExpired) as error:
+        terminate_and_reap()
+        raise NotebookLmCommandError(
+            "NLM_PROCESSING_FAILED",
+            "NotebookLM command could not be completed.",
+        ) from error
+    if returncode != 0:
+        raise NotebookLmCommandError(
+            "NLM_PROCESSING_FAILED", "NotebookLM source get failed."
+        )
+    return b"".join(chunks).decode("utf-8", errors="replace").strip()
+
 
 def run_notebooklm_command(args: list[str], timeout_seconds: int = 120) -> str:
     command = [
@@ -372,6 +631,8 @@ def run_notebooklm_command(args: list[str], timeout_seconds: int = 120) -> str:
         "nlm",
         *args,
     ]
+    if args[:2] == ["source", "get"]:
+        return _run_capped_source_get_command(command, timeout_seconds)
     try:
         completed = subprocess.run(
             command,
@@ -607,7 +868,14 @@ def _parse_vtt_clock(value: str) -> float:
 
 
 def _clean_caption_text(value: str) -> str:
-    return re.sub(r"\s+", " ", html.unescape(_HTML_TAG_PATTERN.sub("", value))).strip()
+    normalized = unicodedata.normalize("NFKC", html.unescape(_HTML_TAG_PATTERN.sub("", value)))
+    return re.sub(r"[\s\u200b-\u200d\ufeff]+", " ", normalized).strip()
+
+
+def _canonical_evidence_lexemes(value: str) -> tuple[str, ...]:
+    """Keep semantic punctuation while normalizing formatting-only differences."""
+    normalized = _clean_caption_text(value).casefold().replace("−", "-")
+    return tuple(_CANONICAL_LEXEME_PATTERN.findall(normalized))
 
 
 def _normalize_evidence_text(value: str) -> str:
@@ -619,15 +887,7 @@ def _normalize_evidence_text(value: str) -> str:
 
 
 def _evidence_tokens(value: str) -> list[str]:
-    return [
-        token
-        for token in re.findall(
-            r"[^\W_]+",
-            _clean_caption_text(value).casefold(),
-            re.UNICODE,
-        )
-        if token
-    ]
+    return [token.casefold() for token in _raw_evidence_tokens(value)]
 
 
 _CRITICAL_NUMBER_WORDS = {
@@ -676,11 +936,74 @@ def _format_timestamp(seconds: float) -> str:
     return f"[{minutes:02d}:{seconds:02d}]"
 
 
+def _kmp_occurrences(
+    stream: tuple[str, ...], phrase: tuple[str, ...],
+) -> list[int]:
+    """Return exact phrase starts in linear time without rebuilding captions."""
+    prefix = [0] * len(phrase)
+    matched = 0
+    for index in range(1, len(phrase)):
+        while matched and phrase[index] != phrase[matched]:
+            matched = prefix[matched - 1]
+        if phrase[index] == phrase[matched]:
+            matched += 1
+        prefix[index] = matched
+
+    found: list[int] = []
+    matched = 0
+    for index, token in enumerate(stream):
+        while matched and token != phrase[matched]:
+            matched = prefix[matched - 1]
+        if token == phrase[matched]:
+            matched += 1
+        if matched == len(phrase):
+            found.append(index - len(phrase) + 1)
+            matched = prefix[matched - 1]
+    return found
+
+
 @dataclass(frozen=True)
 class CaptionEvidence:
     cues: tuple[CaptionCue, ...]
     evidence_hash: str
     duration_seconds: float
+    token_stream: tuple[str, ...] = ()
+    token_timestamps: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.token_stream or self.token_timestamps:
+            if len(self.token_stream) != len(self.token_timestamps):
+                raise EvidenceGroundingError("Caption token index is invalid.")
+            return
+        tokens: list[str] = []
+        timestamps: list[float] = []
+        previous_words: tuple[str, ...] = ()
+        previous_end: float | None = None
+        for cue in self.cues:
+            current_words = _canonical_evidence_lexemes(cue.text)
+            if not current_words:
+                continue
+            adjacent = (
+                previous_end is not None
+                and cue.start_seconds <= previous_end + MAX_CAPTION_CUE_GAP_SECONDS
+            )
+            if not adjacent:
+                if previous_end is not None:
+                    tokens.append(_CAPTION_GAP_SENTINEL)
+                    timestamps.append(cue.start_seconds)
+                previous_words = ()
+            overlap = 0
+            for size in range(min(len(previous_words), len(current_words)), 0, -1):
+                if previous_words[-size:] == current_words[:size]:
+                    overlap = size
+                    break
+            novel = current_words[overlap:]
+            tokens.extend(novel)
+            timestamps.extend([cue.start_seconds] * len(novel))
+            previous_words = current_words
+            previous_end = cue.end_seconds
+        object.__setattr__(self, "token_stream", tuple(tokens))
+        object.__setattr__(self, "token_timestamps", tuple(timestamps))
 
     @classmethod
     def from_vtt(cls, raw: str) -> "CaptionEvidence":
@@ -741,105 +1064,27 @@ class CaptionEvidence:
             raise EvidenceGroundingError(
                 "NotebookLM evidence quote must contain at least eight words."
             )
-        stream_parts: list[str] = []
-        positions: list[float] = []
-        previous_end: float | None = None
-        for cue in self.cues:
-            normalized_cue = _normalize_evidence_text(cue.text)
-            if not normalized_cue:
-                continue
-            current = "".join(stream_parts)
-            overlap = 0
-            if previous_end is not None and cue.start_seconds <= previous_end + 1.0:
-                for size in range(
-                    min(len(current), len(normalized_cue)),
-                    0,
-                    -1,
-                ):
-                    if current.endswith(normalized_cue[:size]):
-                        overlap = size
-                        break
-            novel = normalized_cue[overlap:]
-            stream_parts.append(novel)
-            positions.extend([cue.start_seconds] * len(novel))
-            previous_end = cue.end_seconds
-        normalized_stream = "".join(stream_parts)
-        position = normalized_stream.find(normalized_quote)
-        if 0 <= position < len(positions):
-            if normalized_stream.find(normalized_quote, position + 1) >= 0:
-                raise EvidenceGroundingError(
-                    "NotebookLM 근거 문구가 공개 자막의 여러 구간과 일치합니다."
-                )
-            return positions[position]
+        return self.locate_many((quote,))[quote]
 
-        quote_tokens = _evidence_tokens(quote)
-        if len(quote_tokens) < 6:
-            raise EvidenceGroundingError(
-                "NotebookLM 근거 문구가 단어 기준으로 너무 짧습니다."
-            )
-        caption_tokens: list[str] = []
-        caption_raw_tokens: list[str] = []
-        token_positions: list[float] = []
-        previous_end = None
-        for cue in self.cues:
-            raw_cue_tokens = _raw_evidence_tokens(cue.text)
-            cue_tokens = [token.casefold() for token in raw_cue_tokens]
-            if not cue_tokens:
-                continue
-            overlap = 0
-            if previous_end is not None and cue.start_seconds <= previous_end + 1.0:
-                for size in range(
-                    min(len(caption_tokens), len(cue_tokens)),
-                    0,
-                    -1,
-                ):
-                    if caption_tokens[-size:] == cue_tokens[:size]:
-                        overlap = size
-                        break
-            novel = cue_tokens[overlap:]
-            caption_tokens.extend(novel)
-            caption_raw_tokens.extend(raw_cue_tokens[overlap:])
-            token_positions.extend(
-                [cue.start_seconds] * len(novel)
-            )
-            previous_end = cue.end_seconds
-        quote_raw_tokens = _raw_evidence_tokens(quote)
-        quote_critical = _critical_tokens(quote_raw_tokens)
-        candidates: list[tuple[float, int]] = []
-        minimum = max(6, len(quote_tokens) - 2)
-        maximum = len(quote_tokens) + 2
-        for size in range(minimum, maximum + 1):
-            for index in range(
-                0,
-                len(caption_tokens) - size + 1,
+    def locate_many(self, quotes: Iterable[str]) -> dict[str, float]:
+        """Find each exact quote against the prebuilt, gap-aware token index."""
+        results: dict[str, float] = {}
+        for quote in dict.fromkeys(quotes):
+            normalized_quote = _normalize_evidence_text(quote)
+            quote_words = _canonical_evidence_lexemes(quote)
+            if (
+                len(normalized_quote) < MIN_EVIDENCE_QUOTE_CHARS
+                or len(_evidence_tokens(quote)) < MIN_EVIDENCE_QUOTE_WORDS
+                or not quote_words
             ):
-                window_raw = caption_raw_tokens[index : index + size]
-                if _critical_tokens(window_raw) != quote_critical:
-                    continue
-                ratio = SequenceMatcher(
-                    None,
-                    quote_tokens,
-                    caption_tokens[index : index + size],
-                    autojunk=False,
-                ).ratio()
-                candidates.append((ratio, index))
-        candidates.sort(reverse=True)
-        best_ratio, best_index = candidates[0] if candidates else (0.0, -1)
-        ambiguity_distance = max(3, len(quote_tokens) // 2)
-        second_ratio = next(
-            (ratio for ratio, index in candidates[1:] if abs(index - best_index) >= ambiguity_distance),
-            0.0,
-        )
-        if (
-            best_ratio < 0.85
-            or (second_ratio >= 0.85 and best_ratio - second_ratio < 0.05)
-            or best_index < 0
-            or best_index >= len(token_positions)
-        ):
-            raise EvidenceGroundingError(
-                "NotebookLM 근거 문구를 공개 자막에서 확인하지 못했습니다."
-            )
-        return token_positions[best_index]
+                raise EvidenceGroundingError("NotebookLM evidence quote is too short.")
+            matches = _kmp_occurrences(self.token_stream, quote_words)
+            if len(matches) != 1:
+                raise EvidenceGroundingError(
+                    "NotebookLM evidence quote is missing or ambiguous in public captions."
+                )
+            results[quote] = self.token_timestamps[matches[0]]
+        return results
 
 
 CaptionCommandRunner = Callable[
@@ -1629,10 +1874,10 @@ _COVERAGE_ITEM_FIELDS = {
 }
 MAX_CAPTION_SOURCE_BYTES = 128 * 1024
 MAX_CAPTION_TOTAL_BYTES = 1024 * 1024
-MAX_CAPTION_CUE_COUNT = 5_000
 MAX_CAPTION_CUE_BYTES = 2_048
 MAX_IGNORED_CITATION_BYTES = 256
 MAX_PROMOTION_CANDIDATE_BYTES = 8 * 1024
+MAX_SOURCE_VERIFICATION_WINDOW_CHARS = MAX_CAPTION_SOURCE_BYTES // 3
 
 
 def _contract_text(value: Any, *, maximum: int = 12_000) -> str:
@@ -1725,6 +1970,25 @@ def _sanitize_draft_contract(draft: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _source_quote_matches_bounded_window(
+    source_text: str,
+    quote: str,
+    timestamp: float,
+    duration_seconds: float,
+) -> bool:
+    """Match only a deterministic source window for oversized source_get text."""
+    quote_lexemes = _canonical_evidence_lexemes(quote)
+    if len(source_text) <= MAX_CAPTION_SOURCE_BYTES:
+        return len(_kmp_occurrences(_canonical_evidence_lexemes(source_text), quote_lexemes)) == 1
+
+    ratio = min(1.0, max(0.0, timestamp / max(duration_seconds, 0.001)))
+    half_window = MAX_SOURCE_VERIFICATION_WINDOW_CHARS // 2
+    center = int(len(source_text) * ratio)
+    start = max(0, min(center - half_window, len(source_text) - MAX_SOURCE_VERIFICATION_WINDOW_CHARS))
+    end = min(len(source_text), start + MAX_SOURCE_VERIFICATION_WINDOW_CHARS)
+    return len(_kmp_occurrences(_canonical_evidence_lexemes(source_text[start:end]), quote_lexemes)) == 1
+
+
 def ground_draft_with_caption_evidence(
     draft: Mapping[str, Any],
     evidence: CaptionEvidence,
@@ -1740,22 +2004,25 @@ def ground_draft_with_caption_evidence(
         "uncertainties": sanitized["uncertainties"],
         "promotion_candidates": sanitized["promotion_candidates"],
     }
-    normalized_source = (
-        _normalize_evidence_text(source_text)
-        if source_text is not None
-        else ""
-    )
+    quotes = [
+        str(item.get("evidence_quote") or "")
+        for item in sanitized["claims"]
+        if item.get("type") == "fact"
+    ] + [
+        sanitized["coverage"][part]["evidence_quote"]
+        for part in ("start", "middle", "end")
+    ]
+    caption_locations = evidence.locate_many(quotes)
 
     def locate(quote: str) -> float:
-        normalized_quote = _normalize_evidence_text(quote)
-        if (
-            source_text is not None
-            and normalized_quote not in normalized_source
+        timestamp = caption_locations[quote]
+        if source_text is not None and not _source_quote_matches_bounded_window(
+            source_text, quote, timestamp, evidence.duration_seconds,
         ):
             raise EvidenceGroundingError(
                 "NotebookLM 근거 문구가 NotebookLM 원문에 존재하지 않습니다."
             )
-        return evidence.locate(quote)
+        return timestamp
 
     raw_claims = sanitized["claims"]
     claims: list[dict[str, Any]] = []
@@ -1984,12 +2251,8 @@ def build_query_prompt(job: Mapping[str, Any]) -> str:
     )
 
 
-def _validate_caption_input_bounds(evidence: CaptionEvidence, source_text: str) -> None:
+def _validate_caption_input_bounds(evidence: CaptionEvidence) -> None:
     """Apply all bounded-input checks before any caption/source matching."""
-    if len(source_text.encode("utf-8")) > MAX_CAPTION_SOURCE_BYTES:
-        raise EvidenceGroundingError("NotebookLM source get exceeds the caption input limit.")
-    if len(evidence.cues) > MAX_CAPTION_CUE_COUNT:
-        raise EvidenceGroundingError("Public caption cue count exceeds the input limit.")
     caption_bytes = 0
     for cue in evidence.cues:
         cue_bytes = len(cue.text.encode("utf-8"))
@@ -2576,7 +2839,7 @@ class KnowledgeService:
                     report["action_required"].append(str(job.get("id")))
                     continue
                 if caption_evidence is not None:
-                    _validate_caption_input_bounds(caption_evidence, content)
+                    _validate_caption_input_bounds(caption_evidence)
                 try:
                     draft = (
                         ground_draft_with_caption_evidence(draft, caption_evidence, content)
