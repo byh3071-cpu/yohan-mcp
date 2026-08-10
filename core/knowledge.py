@@ -2214,7 +2214,7 @@ class BrainWriter:
                 claims or "- 없음",
                 "",
                 "## 내 생각",
-                self._clean(human_note, 4000) or "- ",
+                self._clean(human_note, 4000) or "- 없음",
                 "",
                 "## 인사이트 → 적용",
                 self._clean(draft.get("yohan_relevance"), 3000),

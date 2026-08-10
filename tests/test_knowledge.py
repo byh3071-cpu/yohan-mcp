@@ -1718,6 +1718,20 @@ def test_approval_is_write_once_and_human_note_only_enters_summary(tmp_path: Pat
     assert "내 적용 메모" not in json.dumps(queue.job, ensure_ascii=False)
 
 
+def test_brain_writer_uses_explicit_empty_note_without_trailing_whitespace(tmp_path: Path) -> None:
+    job = make_job()
+    job.update({"id": JOB_ID, "result": {"draft": grounded_draft()}})
+    brain_root = tmp_path / "brain"
+    (brain_root / "memory").mkdir(parents=True)
+
+    written = BrainWriter(brain_root).write(job, "", "2026-08-05T00:00:00Z")
+    insight = brain_root / written["insight_path"]
+    content = insight.read_text(encoding="utf-8")
+
+    assert "## 내 생각\n- 없음\n" in content
+    assert all(not line.endswith((" ", "\t")) for line in content.splitlines())
+
+
 def test_approval_recovers_resource_summary_pair_after_mid_write_crash(tmp_path: Path) -> None:
     job = make_job()
     job.update(
