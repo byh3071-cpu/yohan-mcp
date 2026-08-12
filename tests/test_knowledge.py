@@ -188,6 +188,49 @@ def semantic_verdict_response(prompt: str, *, supported: bool = True) -> dict[st
     }
 
 
+def test_semantic_verdict_accepts_one_exact_json_code_fence() -> None:
+    expected = (
+        {
+            "item_id": "F01",
+            "candidate_id": "CS01",
+            "quote": "eight grounded words remain immutable for this semantic evidence check",
+            "statement": "The quote supports the statement.",
+        },
+    )
+    verdict = {
+        "contract_version": "notebooklm-semantic-verdict-v1",
+        "items": [{"id": "F01", "supported": True}],
+    }
+
+    knowledge_module.validate_semantic_verdict(
+        f"```json\n{json.dumps(verdict)}\n```",
+        expected,
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Result:\n```json\n{}\n```",
+        "```json\n{}\n```\nDone.",
+        "```javascript\n{}\n```",
+        "```json\n{}\n```\n```json\n{}\n```",
+    ],
+)
+def test_semantic_verdict_rejects_prose_wrong_fence_and_multiple_fences(raw: str) -> None:
+    expected = (
+        {
+            "item_id": "F01",
+            "candidate_id": "CS01",
+            "quote": "eight grounded words remain immutable for this semantic evidence check",
+            "statement": "The quote supports the statement.",
+        },
+    )
+
+    with pytest.raises(knowledge_module.SemanticEvidenceError):
+        knowledge_module.validate_semantic_verdict(raw, expected)
+
+
 class FakeCaptionProvider:
     def __init__(
         self,
