@@ -65,6 +65,7 @@ _UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+_EVIDENCE_CANDIDATE_ID_PATTERN = re.compile(r"^C[SME]\d{2}$")
 
 _CHILD_ENV_KEYS = {
     "APPDATA",
@@ -128,6 +129,10 @@ class SemanticEvidenceError(KnowledgeError):
 
 class DraftContractError(EvidenceGroundingError):
     """A model draft violated the strict persistence allowlist."""
+
+
+class CandidateSelectionFormatError(DraftContractError):
+    """A candidate response did not select exactly one bounded evidence ID."""
 
 
 class NotebookLmCommandError(KnowledgeError):
@@ -2009,6 +2014,19 @@ def _contract_text_list(value: Any, *, maximum_items: int = 64) -> list[str]:
     return [_contract_text(item, maximum=4_000) for item in value]
 
 
+def _candidate_selection_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise CandidateSelectionFormatError(
+            "Candidate evidence_id must be exactly one four-character ID."
+        )
+    candidate_id = value.strip()
+    if not _EVIDENCE_CANDIDATE_ID_PATTERN.fullmatch(candidate_id):
+        raise CandidateSelectionFormatError(
+            "Candidate evidence_id must be exactly one four-character ID."
+        )
+    return candidate_id
+
+
 def _sanitize_draft_contract(draft: Mapping[str, Any]) -> dict[str, Any]:
     """Validate an exact allowlist and rebuild the only persistable draft shape."""
     if set(draft) != _DRAFT_TOP_LEVEL_FIELDS:
@@ -2114,7 +2132,7 @@ def _hydrate_candidate_draft(
         }
         candidate_id = raw_claim.get("evidence_id")
         if claim_type == "fact":
-            candidate_id = _contract_text(candidate_id, maximum=8)
+            candidate_id = _candidate_selection_id(candidate_id)
             candidate = by_id.get(candidate_id)
             if candidate is None:
                 raise DraftContractError("Candidate claim selected an unknown evidence ID.")
@@ -2134,7 +2152,7 @@ def _hydrate_candidate_draft(
             # real bounded candidate ID, then discard it.  The claim remains
             # visibly non-factual, so the review UI still treats it as human
             # judgment rather than verified evidence.
-            candidate_id = _contract_text(candidate_id, maximum=8)
+            candidate_id = _candidate_selection_id(candidate_id)
             if candidate_id not in by_id:
                 raise DraftContractError("Non-fact claim selected an unknown evidence ID.")
         hydrated_claims.append(claim)
@@ -2147,7 +2165,7 @@ def _hydrate_candidate_draft(
         raw_item = raw_coverage.get(part)
         if not isinstance(raw_item, dict) or set(raw_item) != {"statement", "evidence_id"}:
             raise DraftContractError("Candidate coverage contains forbidden fields.")
-        candidate_id = _contract_text(raw_item.get("evidence_id"), maximum=8)
+        candidate_id = _candidate_selection_id(raw_item.get("evidence_id"))
         candidate = by_id.get(candidate_id)
         if candidate is None:
             raise DraftContractError("Coverage selected an unknown evidence ID.")
@@ -2476,6 +2494,7 @@ def build_candidate_query_prompt(
         f"Source URL: {job.get('source_url')}",
         f"Video title: {job.get('title')}",
         "For every fact and coverage item select evidence_id only from EVIDENCE_CANDIDATES.",
+        "Each evidence_id must be exactly one four-character ID such as CS01; never output multiple IDs, lists, commas, spaces, or explanations in evidence_id.",
         "Interpretation and recommendation claims must omit evidence_id.",
         "Never output evidence_quote, caption_quote, citation, or an unknown ID.",
         "Coverage start/middle/end may select only CS/CM/CE IDs respectively.",
@@ -2550,6 +2569,19 @@ def build_format_retry_prompt(prompt: str) -> str:
     ))
     if len(retry_prompt.encode("utf-8")) > MAX_KNOWLEDGE_QUERY_PROMPT_BYTES:
         raise DraftContractError("NotebookLM formatting retry prompt exceeds the allowed size.")
+    return retry_prompt
+
+
+def build_candidate_selection_retry_prompt(prompt: str) -> str:
+    retry_prompt = "\n".join((
+        prompt,
+        "The previous JSON used an invalid evidence_id format.",
+        "Correct only the candidate selections and return the complete JSON object again.",
+        "Every evidence_id must be exactly one supplied four-character ID such as CS01.",
+        "Never combine IDs or add commas, spaces, lists, prose, or unknown IDs.",
+    ))
+    if len(retry_prompt.encode("utf-8")) > MAX_KNOWLEDGE_QUERY_PROMPT_BYTES:
+        raise DraftContractError("NotebookLM candidate selection retry prompt exceeds the allowed size.")
     return retry_prompt
 
 
@@ -3130,6 +3162,7 @@ class KnowledgeService:
                     prompt,
                 )
                 draft = parse_draft(raw)
+                format_retried = False
                 if draft is None:
                     retry_prompt = build_format_retry_prompt(prompt)
                     raw = self.notebooklm.query(
@@ -3138,6 +3171,7 @@ class KnowledgeService:
                         retry_prompt,
                     )
                     draft = parse_draft(raw)
+                    format_retried = True
                 if draft is None:
                     queue.complete(
                         job,
@@ -3151,7 +3185,27 @@ class KnowledgeService:
                 semantic_items: tuple[dict[str, str], ...] = ()
                 try:
                     if caption_evidence is not None:
-                        draft, semantic_items = _hydrate_candidate_draft(draft, evidence_candidates)
+                        try:
+                            draft, semantic_items = _hydrate_candidate_draft(
+                                draft, evidence_candidates
+                            )
+                        except CandidateSelectionFormatError:
+                            if format_retried:
+                                raise
+                            selection_retry_prompt = build_candidate_selection_retry_prompt(prompt)
+                            selection_raw = self.notebooklm.query(
+                                notebook_id,
+                                source_id,
+                                selection_retry_prompt,
+                            )
+                            selection_draft = parse_draft(selection_raw)
+                            if selection_draft is None:
+                                raise DraftContractError(
+                                    "Candidate selection retry returned malformed JSON."
+                                )
+                            draft, semantic_items = _hydrate_candidate_draft(
+                                selection_draft, evidence_candidates
+                            )
                         draft = ground_draft_with_caption_evidence(draft, caption_evidence, content)
                     else:
                         draft = ground_draft_with_source_evidence(draft, content, str(source_id))

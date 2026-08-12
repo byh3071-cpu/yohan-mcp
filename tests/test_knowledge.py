@@ -821,6 +821,73 @@ def test_candidate_contract_discards_valid_non_fact_evidence_id() -> None:
         knowledge_module._hydrate_candidate_draft(draft, bank)
 
 
+def test_candidate_selection_format_retries_once_then_runs_semantic_evaluator(
+    tmp_path: Path,
+) -> None:
+    class SelectionRetryRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"]:
+                self.query_calls += 1
+                prompt = args[3]
+                if "EVIDENCE_CANDIDATES=" in prompt and self.query_calls == 1:
+                    self.calls.append(args)
+                    response = candidate_contract_response(prompt, valid_draft())
+                    response["claims"][0]["evidence_id"] = "CS01, CM01"
+                    return json.dumps({"answer": json.dumps(response, ensure_ascii=False)})
+            return super().__call__(args, timeout)
+
+    runner = SelectionRetryRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    ).process(limit=1)
+
+    assert report["review_required"] == [JOB_ID]
+    assert runner.query_calls == 3
+
+
+def test_candidate_selection_format_retry_is_bounded_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    class RepeatedInvalidSelectionRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"]:
+                self.query_calls += 1
+                prompt = args[3]
+                if "EVIDENCE_CANDIDATES=" in prompt:
+                    self.calls.append(args)
+                    response = candidate_contract_response(prompt, valid_draft())
+                    response["claims"][0]["evidence_id"] = "CS01, CM01"
+                    return json.dumps({"answer": json.dumps(response, ensure_ascii=False)})
+            return super().__call__(args, timeout)
+
+    runner = RepeatedInvalidSelectionRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    ).process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert queue.job["failure_code"] == "NLM_DRAFT_CONTRACT_INVALID"
+    assert runner.query_calls == 2
+    with pytest.raises(KnowledgeError, match="retry prompt exceeds"):
+        knowledge_module.build_candidate_selection_retry_prompt("x" * 32_700)
+
+
 def test_candidate_and_semantic_prompts_are_hard_capped() -> None:
     bank = caption_evidence().candidate_bank(transcript())
     candidate_prompt = knowledge_module.build_candidate_query_prompt(make_job(), bank)
