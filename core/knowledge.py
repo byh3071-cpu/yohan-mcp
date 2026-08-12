@@ -2091,7 +2091,16 @@ def _hydrate_candidate_draft(
                 "quote": candidate.quote, "statement": claim["statement"],
             })
         elif candidate_id is not None:
-            raise DraftContractError("Only fact claims may select an evidence ID.")
+            # NotebookLM occasionally attaches one of the supplied candidate
+            # IDs to an interpretation or recommendation even though the
+            # prompt reserves evidence for facts.  Never promote that extra
+            # selection into a citation or semantic verdict.  Accept only a
+            # real bounded candidate ID, then discard it.  The claim remains
+            # visibly non-factual, so the review UI still treats it as human
+            # judgment rather than verified evidence.
+            candidate_id = _contract_text(candidate_id, maximum=8)
+            if candidate_id not in by_id:
+                raise DraftContractError("Non-fact claim selected an unknown evidence ID.")
         hydrated_claims.append(claim)
 
     raw_coverage = draft.get("coverage")
@@ -2431,6 +2440,7 @@ def build_candidate_query_prompt(
         f"Source URL: {job.get('source_url')}",
         f"Video title: {job.get('title')}",
         "For every fact and coverage item select evidence_id only from EVIDENCE_CANDIDATES.",
+        "Interpretation and recommendation claims must omit evidence_id.",
         "Never output evidence_quote, caption_quote, citation, or an unknown ID.",
         "Coverage start/middle/end may select only CS/CM/CE IDs respectively.",
         "The system owns review flags. Do not output requires_crosscheck. Return one JSON object only.",

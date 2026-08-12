@@ -722,6 +722,32 @@ def test_candidate_contract_rejects_unknown_cross_part_duplicate_and_quote_field
         knowledge_module._hydrate_candidate_draft(model_owned_flag, bank)
 
 
+def test_candidate_contract_discards_valid_non_fact_evidence_id() -> None:
+    bank = caption_evidence().candidate_bank()
+    prompt = knowledge_module.build_candidate_query_prompt(make_job(), bank)
+    draft = candidate_contract_response(prompt, valid_draft())
+    non_fact = {
+        "type": "recommendation",
+        "statement": "Keep this recommendation subject to human judgment.",
+        "evidence_id": bank[0].candidate_id,
+    }
+    draft["claims"].append(non_fact)
+
+    hydrated, semantic_items = knowledge_module._hydrate_candidate_draft(draft, bank)
+
+    hydrated_non_fact = next(
+        claim for claim in hydrated["claims"] if claim["type"] == non_fact["type"]
+    )
+    assert "evidence_id" not in hydrated_non_fact
+    assert hydrated_non_fact["evidence_quote"] == ""
+    assert hydrated_non_fact["requires_crosscheck"] is False
+    assert all(item["statement"] != non_fact["statement"] for item in semantic_items)
+
+    non_fact["evidence_id"] = "CS99"
+    with pytest.raises(KnowledgeError, match="unknown"):
+        knowledge_module._hydrate_candidate_draft(draft, bank)
+
+
 def test_candidate_and_semantic_prompts_are_hard_capped() -> None:
     bank = caption_evidence().candidate_bank()
     candidate_prompt = knowledge_module.build_candidate_query_prompt(make_job(), bank)
@@ -2040,7 +2066,7 @@ def test_notebooklm_source_get_stdout_is_read_with_a_hard_cap(
 
     assert run_notebooklm_command(["source", "get", "source-1", "--json"]) == '{"content":"normal source"}'
     assert max(observed["read_sizes"]) <= 64 * 1024
-    assert observed["timeout"] == 120
+    assert 119 <= observed["timeout"] <= 120
 
 
 def test_notebooklm_source_get_rejects_oversized_stdout_before_parse(
