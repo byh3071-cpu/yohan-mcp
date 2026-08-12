@@ -468,6 +468,19 @@ def _run_capped_source_get_command(
             if os.name == "nt":
                 _close_windows_job(job_handle)
                 job_handle = None
+                # Closing the assigned Job Object terminates the whole tree. Reap the
+                # wrapper immediately before falling back to the slower taskkill path;
+                # otherwise a still-stale poll can make every normal timeout wait on
+                # taskkill even though the descendants are already fenced by the Job.
+                if poll is None or poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=0.5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
             elif getattr(process, "pid", None):
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
