@@ -1475,7 +1475,7 @@ def test_process_reuses_existing_source_and_queries_only_that_source(tmp_path: P
     )
 
 
-def test_default_process_uses_only_source_get_and_source_limited_query(tmp_path: Path) -> None:
+def test_process_refuses_to_claim_without_public_caption_opt_in(tmp_path: Path) -> None:
     runner = FakeRunner()
     queue = FakeQueue()
     service = KnowledgeService(
@@ -1486,14 +1486,14 @@ def test_default_process_uses_only_source_get_and_source_limited_query(tmp_path:
         env={},
     )
 
-    report = service.process()
+    with pytest.raises(
+        KnowledgeError,
+        match="Public-caption processing is disabled",
+    ):
+        service.process()
 
-    assert report["action_required"] == [JOB_ID]
-    assert queue.job["quality_report"]["evidence_contract"] == "notebooklm-source-get-v1"
-    assert queue.job["quality_report"]["passed"] is False
-    assert any(call[:2] == ["source", "get"] for call in runner.calls)
-    query = next(call for call in runner.calls if call[:2] == ["notebook", "query"])
-    assert query[query.index("--source-ids") + 1] == "source-nb1"
+    assert queue.claimed is False
+    assert runner.calls == []
 
 
 def test_source_get_grounding_verifies_distinct_source_thirds_but_not_timestamps() -> None:
@@ -1524,17 +1524,22 @@ def test_transcript_provider_is_fail_closed_without_explicit_flag(tmp_path: Path
     provider = FakeCaptionProvider(
         error=CaptionEvidenceError("YTDLP_CAPTION_UNAVAILABLE", "must not be called")
     )
+    queue = FakeQueue()
     service = KnowledgeService(
         NotebookLmClient(FakeRunner()),
         NotebookRegistry(tmp_path / "registry.json", canonical_notebook_ids=["nb1"]),
-        queue=FakeQueue(), review_store=ReviewStore(tmp_path / "reviews"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
         caption_provider=provider, env={},
     )
 
-    report = service.process()
+    with pytest.raises(
+        KnowledgeError,
+        match="Public-caption processing is disabled",
+    ):
+        service.process()
 
-    assert report["action_required"] == [JOB_ID]
     assert provider.calls == []
+    assert queue.claimed is False
 
 
 def test_source_get_extracts_content_from_cli_json() -> None:

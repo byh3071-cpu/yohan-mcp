@@ -2942,6 +2942,11 @@ class KnowledgeService:
 
     def process(self, limit: int = MAX_BATCH) -> dict[str, Any]:
         requested = max(1, min(int(limit), MAX_BATCH))
+        if self.caption_provider is None:
+            raise KnowledgeError(
+                "Public-caption processing is disabled; enable the documented "
+                "worker flag before processing. No queue job was claimed."
+            )
         queue = self._queue()
         self.inventory(force=False)
         jobs = queue.claim(self._worker_id(), requested)
