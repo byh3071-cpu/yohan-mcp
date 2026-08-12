@@ -2505,8 +2505,19 @@ def build_semantic_evaluator_prompt(items: tuple[dict[str, str], ...]) -> str:
 
 
 def validate_semantic_verdict(raw: str, expected: tuple[dict[str, str], ...]) -> None:
+    stripped = raw.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if (
+            len(lines) < 3
+            or lines[0].strip().casefold() not in {"```", "```json"}
+            or lines[-1].strip() != "```"
+            or any("```" in line for line in lines[1:-1])
+        ):
+            raise SemanticEvidenceError("Semantic evaluator returned malformed JSON.")
+        stripped = "\n".join(lines[1:-1]).strip()
     try:
-        value = json.loads(raw)
+        value = json.loads(stripped)
     except json.JSONDecodeError as error:
         raise SemanticEvidenceError("Semantic evaluator returned malformed JSON.") from error
     if not isinstance(value, dict) or set(value) != {"contract_version", "items"}:
