@@ -122,6 +122,10 @@ class EvidenceGroundingError(KnowledgeError):
     """NotebookLM evidence text could not be grounded in public captions."""
 
 
+class SemanticEvidenceError(KnowledgeError):
+    """The verdict-only semantic pass rejected immutable candidate evidence."""
+
+
 class DraftContractError(EvidenceGroundingError):
     """A model draft violated the strict persistence allowlist."""
 
@@ -154,6 +158,8 @@ def processing_failure_code(error: object) -> str:
         return error.code
     if isinstance(error, DraftContractError):
         return "NLM_DRAFT_CONTRACT_INVALID"
+    if isinstance(error, SemanticEvidenceError):
+        return "NLM_EVIDENCE_NOT_SUPPORTED"
     if isinstance(error, EvidenceGroundingError):
         return "NLM_EVIDENCE_NOT_GROUNDED"
     if isinstance(error, NotebookLmCommandError):
@@ -1086,6 +1092,58 @@ class CaptionEvidence:
             results[quote] = self.token_timestamps[matches[0]]
         return results
 
+    def candidate_bank(self) -> tuple[EvidenceCandidate, ...]:
+        """Build a bounded, deterministic bank of unique exact caption spans."""
+        spans: list[tuple[int, tuple[str, ...], str]] = []
+        counts: dict[tuple[str, ...], int] = {}
+        for start, token in enumerate(self.token_stream):
+            if token == _CAPTION_GAP_SENTINEL:
+                continue
+            start_ratio = self.token_timestamps[start] / max(self.duration_seconds, 0.001)
+            start_part = "start" if start_ratio < 1 / 3 else "middle" if start_ratio < 2 / 3 else "end"
+            words = 0
+            phrase: list[str] = []
+            for offset, token in enumerate(self.token_stream[start : start + 15]):
+                if token == _CAPTION_GAP_SENTINEL:
+                    break
+                ratio = self.token_timestamps[start + offset] / max(self.duration_seconds, 0.001)
+                part = "start" if ratio < 1 / 3 else "middle" if ratio < 2 / 3 else "end"
+                if part != start_part:
+                    break
+                phrase.append(token)
+                words += int(token.isalnum())
+                if words >= MIN_EVIDENCE_QUOTE_WORDS:
+                    key = tuple(phrase)
+                    spans.append((start, key, start_part))
+                    counts[key] = counts.get(key, 0) + 1
+                    break
+
+        candidates: list[EvidenceCandidate] = []
+        prefixes = {"start": "CS", "middle": "CM", "end": "CE"}
+        for part in ("start", "middle", "end"):
+            eligible = [item for item in spans if item[2] == part and counts[item[1]] == 1]
+            if not eligible:
+                raise EvidenceGroundingError(f"Public captions have no unique {part} evidence candidates.")
+            if len(eligible) > MAX_EVIDENCE_CANDIDATES_PER_PART:
+                last = len(eligible) - 1
+                indexes = [round(index * last / (MAX_EVIDENCE_CANDIDATES_PER_PART - 1)) for index in range(MAX_EVIDENCE_CANDIDATES_PER_PART)]
+                eligible = [eligible[index] for index in indexes]
+            for number, (start, phrase, _) in enumerate(eligible, 1):
+                candidates.append(EvidenceCandidate(
+                    f"{prefixes[part]}{number:02d}",
+                    part,
+                    " ".join(phrase),
+                    self.token_timestamps[start],
+                ))
+        payload = json.dumps(
+            [candidate.prompt_payload() for candidate in candidates],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > MAX_EVIDENCE_CANDIDATE_PAYLOAD_BYTES:
+            raise EvidenceGroundingError("Evidence candidate payload exceeds the allowed size.")
+        return tuple(candidates)
+
 
 CaptionCommandRunner = Callable[
     [list[str], int],
@@ -1878,6 +1936,26 @@ MAX_CAPTION_CUE_BYTES = 2_048
 MAX_IGNORED_CITATION_BYTES = 256
 MAX_PROMOTION_CANDIDATE_BYTES = 8 * 1024
 MAX_SOURCE_VERIFICATION_WINDOW_CHARS = MAX_CAPTION_SOURCE_BYTES // 3
+MAX_EVIDENCE_CANDIDATES_PER_PART = 12
+MAX_EVIDENCE_CANDIDATE_PAYLOAD_BYTES = 16 * 1024
+MAX_KNOWLEDGE_QUERY_PROMPT_BYTES = 32 * 1024
+SEMANTIC_EVALUATOR_CONTRACT = "notebooklm-semantic-verdict-v1"
+
+
+@dataclass(frozen=True)
+class EvidenceCandidate:
+    candidate_id: str
+    part: str
+    quote: str
+    timestamp: float
+
+    def prompt_payload(self) -> dict[str, Any]:
+        return {
+            "id": self.candidate_id,
+            "part": self.part,
+            "quote": self.quote,
+            "timestamp": _format_timestamp(self.timestamp),
+        }
 
 
 def _contract_text(value: Any, *, maximum: int = 12_000) -> str:
@@ -1968,6 +2046,79 @@ def _sanitize_draft_contract(draft: Mapping[str, Any]) -> dict[str, Any]:
         # P0 never promotes model-proposed entities automatically.
         "promotion_candidates": {"concepts": [], "people": [], "triples": []},
     }
+
+
+def _hydrate_candidate_draft(
+    draft: Mapping[str, Any], candidates: tuple[EvidenceCandidate, ...],
+) -> tuple[dict[str, Any], tuple[dict[str, str], ...]]:
+    """Validate candidate IDs, then hydrate immutable verified quotes."""
+    if set(draft) != _DRAFT_TOP_LEVEL_FIELDS:
+        raise DraftContractError("Candidate draft contains unknown top-level fields.")
+    by_id = {item.candidate_id: item for item in candidates}
+    if len(by_id) != len(candidates):
+        raise DraftContractError("Evidence candidate IDs are not unique.")
+    raw_claims = draft.get("claims")
+    if not isinstance(raw_claims, list) or not raw_claims or len(raw_claims) > 64:
+        raise DraftContractError("Candidate draft claims are invalid.")
+    hydrated_claims: list[dict[str, Any]] = []
+    selected: list[dict[str, str]] = []
+    fact_candidate_ids: set[str] = set()
+    for index, raw_claim in enumerate(raw_claims, 1):
+        if not isinstance(raw_claim, dict) or not set(raw_claim).issubset(
+            {"type", "statement", "evidence_id"}
+        ):
+            raise DraftContractError("Candidate claim contains forbidden fields.")
+        claim_type = _contract_text(raw_claim.get("type"), maximum=32)
+        if claim_type not in {"fact", "interpretation", "recommendation"}:
+            raise DraftContractError("Candidate claim type is invalid.")
+        claim: dict[str, Any] = {
+            "type": claim_type,
+            "statement": _contract_text(raw_claim.get("statement"), maximum=4_000),
+            "requires_crosscheck": claim_type == "fact",
+        }
+        candidate_id = raw_claim.get("evidence_id")
+        if claim_type == "fact":
+            candidate_id = _contract_text(candidate_id, maximum=8)
+            candidate = by_id.get(candidate_id)
+            if candidate is None:
+                raise DraftContractError("Candidate claim selected an unknown evidence ID.")
+            if candidate_id in fact_candidate_ids:
+                raise DraftContractError("Fact claims contain a duplicate evidence ID conflict.")
+            fact_candidate_ids.add(candidate_id)
+            claim["evidence_quote"] = candidate.quote
+            selected.append({
+                "item_id": f"F{index:02d}", "candidate_id": candidate_id,
+                "quote": candidate.quote, "statement": claim["statement"],
+            })
+        elif candidate_id is not None:
+            raise DraftContractError("Only fact claims may select an evidence ID.")
+        hydrated_claims.append(claim)
+
+    raw_coverage = draft.get("coverage")
+    if not isinstance(raw_coverage, dict) or set(raw_coverage) != {"start", "middle", "end"}:
+        raise DraftContractError("Candidate coverage is invalid.")
+    hydrated_coverage: dict[str, dict[str, str]] = {}
+    for part in ("start", "middle", "end"):
+        raw_item = raw_coverage.get(part)
+        if not isinstance(raw_item, dict) or set(raw_item) != {"statement", "evidence_id"}:
+            raise DraftContractError("Candidate coverage contains forbidden fields.")
+        candidate_id = _contract_text(raw_item.get("evidence_id"), maximum=8)
+        candidate = by_id.get(candidate_id)
+        if candidate is None:
+            raise DraftContractError("Coverage selected an unknown evidence ID.")
+        if candidate.part != part:
+            raise DraftContractError("Coverage selected an evidence ID from another part.")
+        statement = _contract_text(raw_item.get("statement"), maximum=4_000)
+        hydrated_coverage[part] = {"statement": statement, "evidence_quote": candidate.quote}
+        selected.append({
+            "item_id": f"C{part.upper()}", "candidate_id": candidate_id,
+            "quote": candidate.quote, "statement": statement,
+        })
+
+    hydrated = dict(draft)
+    hydrated["claims"] = hydrated_claims
+    hydrated["coverage"] = hydrated_coverage
+    return _sanitize_draft_contract(hydrated), tuple(selected)
 
 
 def _source_quote_matches_bounded_window(
@@ -2249,6 +2400,100 @@ def build_query_prompt(job: Mapping[str, Any]) -> str:
             json.dumps(skeleton, ensure_ascii=False),
         )
     )
+
+
+def build_candidate_query_prompt(
+    job: Mapping[str, Any], candidates: tuple[EvidenceCandidate, ...],
+) -> str:
+    skeleton = {
+        "title": "video title",
+        "summary": "grounded summary",
+        "key_points": ["point 1", "point 2", "point 3"],
+        "claims": [{
+            "type": "fact", "statement": "fact statement",
+            "evidence_id": "CS01",
+        }],
+        "coverage": {
+            "start": {"statement": "start", "evidence_id": "CS01"},
+            "middle": {"statement": "middle", "evidence_id": "CM01"},
+            "end": {"statement": "end", "evidence_id": "CE01"},
+        },
+        "yohan_relevance": "application",
+        "uncertainties": ["none"],
+        "promotion_candidates": {"concepts": [], "people": [], "triples": []},
+    }
+    payload = json.dumps(
+        [candidate.prompt_payload() for candidate in candidates],
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    prompt = "\n".join((
+        "Analyze only the selected NotebookLM source.",
+        f"Source URL: {job.get('source_url')}",
+        f"Video title: {job.get('title')}",
+        "For every fact and coverage item select evidence_id only from EVIDENCE_CANDIDATES.",
+        "Never output evidence_quote, caption_quote, citation, or an unknown ID.",
+        "Coverage start/middle/end may select only CS/CM/CE IDs respectively.",
+        "The system owns review flags. Do not output requires_crosscheck. Return one JSON object only.",
+        f"EVIDENCE_CANDIDATES={payload}",
+        json.dumps(skeleton, ensure_ascii=False, separators=(",", ":")),
+    ))
+    if len(prompt.encode("utf-8")) > MAX_KNOWLEDGE_QUERY_PROMPT_BYTES:
+        raise DraftContractError("NotebookLM candidate query prompt exceeds the allowed size.")
+    return prompt
+
+
+def build_semantic_evaluator_prompt(items: tuple[dict[str, str], ...]) -> str:
+    skeleton = {
+        "contract_version": SEMANTIC_EVALUATOR_CONTRACT,
+        "items": [{"id": item["item_id"], "supported": True} for item in items],
+    }
+    prompt = "\n".join((
+        "Verdict-only semantic check for immutable evidence. Do not rewrite any field.",
+        "Return exact JSON only. Mark supported=false unless the quote directly supports the statement.",
+        f"ITEMS={json.dumps([dict(item) for item in items], ensure_ascii=False, separators=(',', ':'))}",
+        json.dumps(skeleton, ensure_ascii=False, separators=(",", ":")),
+    ))
+    if len(prompt.encode("utf-8")) > MAX_KNOWLEDGE_QUERY_PROMPT_BYTES:
+        raise DraftContractError("Semantic evaluator prompt exceeds the allowed size.")
+    return prompt
+
+
+def validate_semantic_verdict(raw: str, expected: tuple[dict[str, str], ...]) -> None:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SemanticEvidenceError("Semantic evaluator returned malformed JSON.") from error
+    if not isinstance(value, dict) or set(value) != {"contract_version", "items"}:
+        raise SemanticEvidenceError("Semantic evaluator contract is invalid.")
+    if value.get("contract_version") != SEMANTIC_EVALUATOR_CONTRACT:
+        raise SemanticEvidenceError("Semantic evaluator contract version is invalid.")
+    rows = value.get("items")
+    if not isinstance(rows, list):
+        raise SemanticEvidenceError("Semantic evaluator items are invalid.")
+    expected_ids = [item["item_id"] for item in expected]
+    observed: dict[str, bool] = {}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"id", "supported"}:
+            raise SemanticEvidenceError("Semantic evaluator item shape is invalid.")
+        item_id, supported = row.get("id"), row.get("supported")
+        if not isinstance(item_id, str) or not isinstance(supported, bool) or item_id in observed:
+            raise SemanticEvidenceError("Semantic evaluator item is duplicated or invalid.")
+        observed[item_id] = supported
+    if set(observed) != set(expected_ids) or len(observed) != len(expected_ids):
+        raise SemanticEvidenceError("Semantic evaluator items are missing or extra.")
+    if not all(observed[item_id] for item_id in expected_ids):
+        raise SemanticEvidenceError("Semantic evaluator did not support every evidence item.")
+
+
+def build_format_retry_prompt(prompt: str) -> str:
+    retry_prompt = "\n".join((
+        prompt,
+        "The previous response was not valid JSON.",
+        "Return exactly one valid JSON object without Markdown, explanation, or footnotes.",
+    ))
+    if len(retry_prompt.encode("utf-8")) > MAX_KNOWLEDGE_QUERY_PROMPT_BYTES:
+        raise DraftContractError("NotebookLM formatting retry prompt exceeds the allowed size.")
+    return retry_prompt
 
 
 def _validate_caption_input_bounds(evidence: CaptionEvidence) -> None:
@@ -2808,7 +3053,15 @@ class KnowledgeService:
                         f"{NOTEBOOKLM_SOURCE_EVIDENCE_CONTRACT}:{source_hash}"
                     )
                 job = queue.checkpoint(job, source_hash=source_hash, transcript_hash=transcript_hash)
-                prompt = build_query_prompt(job)
+                evidence_candidates: tuple[EvidenceCandidate, ...] = ()
+                if caption_evidence is not None:
+                    _validate_caption_input_bounds(caption_evidence)
+                    evidence_candidates = caption_evidence.candidate_bank()
+                prompt = (
+                    build_candidate_query_prompt(job, evidence_candidates)
+                    if evidence_candidates
+                    else build_query_prompt(job)
+                )
                 raw = self.notebooklm.query(
                     notebook_id,
                     source_id,
@@ -2816,16 +3069,11 @@ class KnowledgeService:
                 )
                 draft = parse_draft(raw)
                 if draft is None:
+                    retry_prompt = build_format_retry_prompt(prompt)
                     raw = self.notebooklm.query(
                         notebook_id,
                         source_id,
-                        "\n".join(
-                            (
-                                prompt,
-                                "직전 응답 형식이 잘못되었습니다.",
-                                "Markdown fence·설명·각주 없이 유효한 JSON 객체 하나만 다시 반환하세요.",
-                            )
-                        ),
+                        retry_prompt,
                     )
                     draft = parse_draft(raw)
                 if draft is None:
@@ -2838,14 +3086,13 @@ class KnowledgeService:
                     )
                     report["action_required"].append(str(job.get("id")))
                     continue
-                if caption_evidence is not None:
-                    _validate_caption_input_bounds(caption_evidence)
+                semantic_items: tuple[dict[str, str], ...] = ()
                 try:
-                    draft = (
-                        ground_draft_with_caption_evidence(draft, caption_evidence, content)
-                        if caption_evidence is not None
-                        else ground_draft_with_source_evidence(draft, content, str(source_id))
-                    )
+                    if caption_evidence is not None:
+                        draft, semantic_items = _hydrate_candidate_draft(draft, evidence_candidates)
+                        draft = ground_draft_with_caption_evidence(draft, caption_evidence, content)
+                    else:
+                        draft = ground_draft_with_source_evidence(draft, content, str(source_id))
                 except DraftContractError:
                     # Unknown fields are a persistence-boundary violation, not
                     # a formatting mistake that may be retried with model text.
@@ -2861,6 +3108,21 @@ class KnowledgeService:
                     str(job.get("tier") or "T2"),
                     evidence_contract=evidence_contract,
                 )
+                if semantic_items:
+                    semantic_raw = self.notebooklm.query(
+                        notebook_id,
+                        source_id,
+                        build_semantic_evaluator_prompt(semantic_items),
+                    )
+                    validate_semantic_verdict(semantic_raw, semantic_items)
+                    for claim in draft["claims"]:
+                        if claim.get("type") == "fact":
+                            claim["requires_crosscheck"] = False
+                    quality["semantic_evaluator"] = "notebooklm-second-pass-semantic-consistency-v1"
+                    quality["semantic_evaluator_independent"] = False
+                    quality.setdefault("warnings", []).append(
+                        "동일 NotebookLM의 2차 의미 일관성 검사이며 독립 모델 검증이 아닙니다. 최종 인간 판단이 필요합니다."
+                    )
                 if not quality["passed"]:
                     queue.complete(
                         job,

@@ -151,6 +151,38 @@ def approval_quality(*, tier: str = "T2") -> dict[str, Any]:
     return quality
 
 
+def candidate_contract_response(prompt: str, draft: dict[str, Any]) -> dict[str, Any]:
+    payload_line = next(line for line in prompt.splitlines() if line.startswith("EVIDENCE_CANDIDATES="))
+    candidates = json.loads(payload_line.split("=", 1)[1])
+    by_part = {
+        part: next(item for item in candidates if item["part"] == part)
+        for part in ("start", "middle", "end")
+    }
+    result = deepcopy(draft)
+    claims = []
+    for claim in result["claims"]:
+        cleaned = {key: value for key, value in claim.items() if key not in {"evidence_quote", "caption_quote", "citation", "citation_verified"}}
+        cleaned.pop("requires_crosscheck", None)
+        if cleaned.get("type") == "fact":
+            cleaned["evidence_id"] = by_part["start"]["id"]
+        claims.append(cleaned)
+    result["claims"] = claims
+    result["coverage"] = {
+        part: {"statement": result["coverage"][part]["statement"], "evidence_id": by_part[part]["id"]}
+        for part in ("start", "middle", "end")
+    }
+    return result
+
+
+def semantic_verdict_response(prompt: str, *, supported: bool = True) -> dict[str, Any]:
+    items_line = next(line for line in prompt.splitlines() if line.startswith("ITEMS="))
+    items = json.loads(items_line.split("=", 1)[1])
+    return {
+        "contract_version": "notebooklm-semantic-verdict-v1",
+        "items": [{"id": item["item_id"], "supported": supported} for item in items],
+    }
+
+
 class FakeCaptionProvider:
     def __init__(
         self,
@@ -195,7 +227,15 @@ class FakeRunner:
         if args[:2] == ["source", "get"]:
             return transcript()
         if args[:2] == ["notebook", "query"]:
-            return json.dumps({"answer": json.dumps(self.draft, ensure_ascii=False)})
+            prompt = args[3]
+            response = (
+                semantic_verdict_response(prompt)
+                if prompt.startswith("Verdict-only semantic check")
+                else candidate_contract_response(prompt, self.draft)
+                if "EVIDENCE_CANDIDATES=" in prompt
+                else self.draft
+            )
+            return json.dumps({"answer": json.dumps(response, ensure_ascii=False)})
         raise AssertionError(f"unexpected command: {args}")
 
 
@@ -225,7 +265,15 @@ class ConcurrentAddRunner:
         if args[:2] == ["source", "get"]:
             return transcript()
         if args[:2] == ["notebook", "query"]:
-            return json.dumps({"answer": json.dumps(valid_draft(), ensure_ascii=False)})
+            prompt = args[3]
+            response = (
+                semantic_verdict_response(prompt)
+                if prompt.startswith("Verdict-only semantic check")
+                else candidate_contract_response(prompt, valid_draft())
+                if "EVIDENCE_CANDIDATES=" in prompt
+                else valid_draft()
+            )
+            return json.dumps({"answer": json.dumps(response, ensure_ascii=False)})
         raise AssertionError(f"unexpected command: {args}")
 
 
@@ -614,6 +662,190 @@ def test_caption_locate_many_reuses_prebuilt_token_index(
 
     assert len(found) == len(quotes)
     assert calls == len(quotes)
+
+
+def test_candidate_bank_is_bounded_balanced_and_gap_safe() -> None:
+    evidence = caption_evidence()
+    bank = evidence.candidate_bank()
+
+    assert 3 <= len(bank) <= 36
+    assert {candidate.part for candidate in bank} == {"start", "middle", "end"}
+    assert all(8 <= len(knowledge_module._evidence_tokens(candidate.quote)) <= 15 for candidate in bank)
+    assert len(json.dumps([candidate.prompt_payload() for candidate in bank], ensure_ascii=False).encode("utf-8")) <= 16 * 1024
+    assert all(candidate.candidate_id.startswith({"start": "CS", "middle": "CM", "end": "CE"}[candidate.part]) for candidate in bank)
+
+
+def test_candidate_bank_excludes_ambiguous_repeated_spans() -> None:
+    repeated = "repeated evidence has eight stable exact caption words today"
+    evidence = CaptionEvidence(
+        (
+            CaptionCue(1.0, 2.0, repeated),
+            CaptionCue(40.0, 41.0, repeated),
+            CaptionCue(80.0, 81.0, repeated),
+        ),
+        "9" * 64,
+        90.0,
+    )
+
+    with pytest.raises(KnowledgeError, match="no unique"):
+        evidence.candidate_bank()
+
+
+def test_candidate_contract_rejects_unknown_cross_part_duplicate_and_quote_fields() -> None:
+    bank = caption_evidence().candidate_bank()
+    prompt = knowledge_module.build_candidate_query_prompt(make_job(), bank)
+    draft = candidate_contract_response(prompt, valid_draft())
+
+    unknown = deepcopy(draft)
+    unknown["claims"][0]["evidence_id"] = "CS99"
+    with pytest.raises(KnowledgeError, match="unknown"):
+        knowledge_module._hydrate_candidate_draft(unknown, bank)
+
+    cross_part = deepcopy(draft)
+    cross_part["coverage"]["start"]["evidence_id"] = next(item.candidate_id for item in bank if item.part == "middle")
+    with pytest.raises(KnowledgeError, match="another part"):
+        knowledge_module._hydrate_candidate_draft(cross_part, bank)
+
+    duplicate = deepcopy(draft)
+    duplicate["claims"].append(deepcopy(duplicate["claims"][0]))
+    with pytest.raises(KnowledgeError, match="duplicate"):
+        knowledge_module._hydrate_candidate_draft(duplicate, bank)
+
+    fabricated = deepcopy(draft)
+    fabricated["claims"][0]["evidence_quote"] = "fabricated raw quote must never be accepted"
+    with pytest.raises(KnowledgeError, match="forbidden"):
+        knowledge_module._hydrate_candidate_draft(fabricated, bank)
+
+    model_owned_flag = deepcopy(draft)
+    model_owned_flag["claims"][0]["requires_crosscheck"] = False
+    with pytest.raises(KnowledgeError, match="forbidden"):
+        knowledge_module._hydrate_candidate_draft(model_owned_flag, bank)
+
+
+def test_candidate_and_semantic_prompts_are_hard_capped() -> None:
+    bank = caption_evidence().candidate_bank()
+    candidate_prompt = knowledge_module.build_candidate_query_prompt(make_job(), bank)
+    assert len(candidate_prompt.encode("utf-8")) <= 32 * 1024
+
+    oversized_job = make_job()
+    oversized_job["title"] = "x" * (33 * 1024)
+    with pytest.raises(KnowledgeError, match="prompt exceeds"):
+        knowledge_module.build_candidate_query_prompt(oversized_job, bank)
+
+    oversized_items = ({
+        "item_id": "F01", "candidate_id": "CS01",
+        "quote": "q" * (17 * 1024), "statement": "s" * (17 * 1024),
+    },)
+    with pytest.raises(KnowledgeError, match="prompt exceeds"):
+        knowledge_module.build_semantic_evaluator_prompt(oversized_items)
+
+
+@pytest.mark.parametrize("mode", ["unknown", "cross_part", "fabricated", "duplicate"])
+def test_candidate_contract_failure_does_not_query_semantic_evaluator(
+    tmp_path: Path, mode: str,
+) -> None:
+    class InvalidCandidateRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"]:
+                self.query_calls += 1
+                prompt = args[3]
+                if "EVIDENCE_CANDIDATES=" in prompt:
+                    self.calls.append(args)
+                    response = candidate_contract_response(prompt, valid_draft())
+                    if mode == "unknown":
+                        response["claims"][0]["evidence_id"] = "CS99"
+                    elif mode == "cross_part":
+                        response["coverage"]["start"]["evidence_id"] = response["coverage"]["middle"]["evidence_id"]
+                    elif mode == "fabricated":
+                        response["claims"][0]["evidence_quote"] = "invented paraphrase"
+                    else:
+                        response["claims"].append(deepcopy(response["claims"][0]))
+                    return json.dumps({"answer": json.dumps(response, ensure_ascii=False)})
+            return super().__call__(args, timeout)
+
+    runner = InvalidCandidateRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    ).process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert queue.job["failure_code"] == "NLM_DRAFT_CONTRACT_INVALID"
+    assert runner.query_calls == 1
+
+
+@pytest.mark.parametrize("mode", ["false", "missing", "extra", "mutate", "malformed"])
+def test_semantic_verdict_failures_are_action_required_without_retry(
+    tmp_path: Path, mode: str,
+) -> None:
+    class VerdictRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"]:
+                self.query_calls += 1
+                prompt = args[3]
+                if prompt.startswith("Verdict-only semantic check"):
+                    self.calls.append(args)
+                    if mode == "malformed":
+                        return json.dumps({"answer": "not json"})
+                    verdict = semantic_verdict_response(prompt, supported=mode != "false")
+                    if mode == "missing":
+                        verdict["items"].pop()
+                    elif mode == "extra":
+                        verdict["items"].append({"id": "EXTRA", "supported": True})
+                    elif mode == "mutate":
+                        verdict["items"][0]["quote"] = "evaluator attempted mutation"
+                    return json.dumps({"answer": json.dumps(verdict)})
+            return super().__call__(args, timeout)
+
+    runner = VerdictRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    ).process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert queue.job["failure_code"] == "NLM_EVIDENCE_NOT_SUPPORTED"
+    assert runner.query_calls == 2
+    assert not (tmp_path / "reviews" / f"{JOB_ID}.json").exists()
+
+
+def test_candidate_semantic_success_is_human_approval_ready_with_visible_limitation(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner()
+    queue = FakeQueue()
+    service = KnowledgeService(
+        NotebookLmClient(runner), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    report = service.process(limit=1)
+    reviews = service.reviews()
+
+    assert report["review_required"] == [JOB_ID]
+    assert len([call for call in runner.calls if call[:2] == ["notebook", "query"]]) == 2
+    facts = [claim for claim in queue.job["result"]["draft"]["claims"] if claim["type"] == "fact"]
+    assert facts and all(claim["requires_crosscheck"] is False for claim in facts)
+    assert queue.job["quality_report"]["semantic_evaluator"] == "notebooklm-second-pass-semantic-consistency-v1"
+    assert queue.job["quality_report"]["semantic_evaluator_independent"] is False
+    assert any("독립 모델 검증이 아닙니다" in warning for warning in reviews["items"][0]["qualityWarnings"])
+    assert reviews["items"][0]["approvalReady"] is True
 
 
 def test_caption_grounding_rejects_changed_numbers_negation_and_ambiguous_matches() -> None:
@@ -1267,12 +1499,10 @@ def test_unmatched_notebooklm_evidence_is_action_required_without_quote_persiste
 
     report = service.process(limit=1)
 
-    assert report["action_required"] == [JOB_ID]
-    assert queue.job["failure_code"] == "NLM_EVIDENCE_NOT_GROUNDED"
+    assert report["review_required"] == [JOB_ID]
     persisted = json.dumps(queue.job, ensure_ascii=False)
     assert "모델 환각 문구" not in persisted
-    assert "evidence_quote" not in persisted
-    assert not (tmp_path / "reviews" / f"{JOB_ID}.json").exists()
+    assert (tmp_path / "reviews" / f"{JOB_ID}.json").exists()
 
 
 def test_malformed_notebooklm_json_gets_one_strict_retry(
@@ -1304,7 +1534,42 @@ def test_malformed_notebooklm_json_gets_one_strict_retry(
     report = service.process(limit=1)
 
     assert report["review_required"] == [JOB_ID]
-    assert runner.query_calls == 2
+    assert runner.query_calls == 3
+
+
+def test_format_retry_prompt_over_cap_fails_before_second_query(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    first_prompt = "x" * 32_700
+    assert len(first_prompt.encode("utf-8")) <= 32 * 1024
+    with pytest.raises(KnowledgeError, match="retry prompt exceeds"):
+        knowledge_module.build_format_retry_prompt(first_prompt)
+
+    class BoundaryRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"]:
+                self.query_calls += 1
+                self.calls.append(args)
+                return json.dumps({"answer": "not valid json"})
+            return super().__call__(args, timeout)
+
+    monkeypatch.setattr(knowledge_module, "build_candidate_query_prompt", lambda job, candidates: first_prompt)
+    runner = BoundaryRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    ).process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert queue.job["failure_code"] == "NLM_DRAFT_CONTRACT_INVALID"
+    assert runner.query_calls == 1
 
 
 def test_ungrounded_fact_fails_without_second_query(
@@ -1339,8 +1604,8 @@ def test_ungrounded_fact_fails_without_second_query(
 
     report = service.process(limit=1)
 
-    assert report["action_required"] == [JOB_ID]
-    assert runner.query_calls == 1
+    assert report["review_required"] == [JOB_ID]
+    assert runner.query_calls == 2
 
 
 def test_long_ungrounded_coverage_fails_without_second_query(tmp_path: Path) -> None:
@@ -1405,8 +1670,8 @@ def test_long_ungrounded_coverage_fails_without_second_query(tmp_path: Path) -> 
 
     report = service.process(limit=1)
 
-    assert report["action_required"] == [JOB_ID]
-    assert runner.query_calls == 1
+    assert report["review_required"] == [JOB_ID]
+    assert runner.query_calls == 2
 
 
 def test_long_caption_initial_grounding_succeeds_without_second_query(tmp_path: Path) -> None:
@@ -1461,7 +1726,7 @@ def test_long_caption_initial_grounding_succeeds_without_second_query(tmp_path: 
     report = service.process(limit=1)
 
     assert report["review_required"] == [JOB_ID]
-    assert runner.query_calls == 1
+    assert runner.query_calls == 2
 
 
 def test_large_source_and_many_cues_use_bounded_timestamp_windows() -> None:
@@ -1554,7 +1819,7 @@ def test_caption_input_limits_fail_before_grounding_or_second_query(tmp_path: Pa
 
     assert report["action_required"] == [JOB_ID]
     assert queue.job["failure_code"] == "NLM_EVIDENCE_NOT_GROUNDED"
-    assert runner.query_calls == 1
+    assert runner.query_calls == 0
 
 
 @pytest.mark.parametrize("field", ["citation", "promotion"])
@@ -1575,6 +1840,9 @@ def test_oversized_ignored_model_fields_fail_before_grounding(tmp_path: Path, fi
         def __call__(self, args: list[str], timeout: int) -> str:
             if args[:2] == ["notebook", "query"]:
                 self.query_calls += 1
+                if "EVIDENCE_CANDIDATES=" in args[3]:
+                    self.calls.append(args)
+                    return json.dumps({"answer": json.dumps(self.draft, ensure_ascii=False)})
             return super().__call__(args, timeout)
 
     runner = OversizedRunner()
@@ -1909,7 +2177,7 @@ def test_notebooklm_source_get_timeout_kills_windows_parent_exit_grandchild(tmp_
     for _ in range(10):
         try:
             os.kill(grandchild_pid, 0)
-        except OSError:
+        except (OSError, SystemError):
             break
         time.sleep(0.05)
     else:
