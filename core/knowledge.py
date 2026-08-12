@@ -1092,8 +1092,10 @@ class CaptionEvidence:
             results[quote] = self.token_timestamps[matches[0]]
         return results
 
-    def candidate_bank(self) -> tuple[EvidenceCandidate, ...]:
-        """Build a bounded, deterministic bank of unique exact caption spans."""
+    def candidate_bank(self, source_text: str) -> tuple[EvidenceCandidate, ...]:
+        """Build a bounded bank grounded in both captions and source_get."""
+        if not isinstance(source_text, str) or not source_text.strip():
+            raise EvidenceGroundingError("NotebookLM source text is required for evidence candidates.")
         spans: list[tuple[int, tuple[str, ...], str]] = []
         counts: dict[tuple[str, ...], int] = {}
         for start, token in enumerate(self.token_stream):
@@ -1124,6 +1126,26 @@ class CaptionEvidence:
             eligible = [item for item in spans if item[2] == part and counts[item[1]] == 1]
             if not eligible:
                 raise EvidenceGroundingError(f"Public captions have no unique {part} evidence candidates.")
+            if len(eligible) > MAX_EVIDENCE_SOURCE_VERIFICATION_POOL_PER_PART:
+                last = len(eligible) - 1
+                indexes = [
+                    round(index * last / (MAX_EVIDENCE_SOURCE_VERIFICATION_POOL_PER_PART - 1))
+                    for index in range(MAX_EVIDENCE_SOURCE_VERIFICATION_POOL_PER_PART)
+                ]
+                eligible = [eligible[index] for index in indexes]
+            eligible = [
+                item for item in eligible
+                if _source_quote_matches_bounded_window(
+                    source_text,
+                    " ".join(item[1]),
+                    self.token_timestamps[item[0]],
+                    self.duration_seconds,
+                )
+            ]
+            if not eligible:
+                raise EvidenceGroundingError(
+                    f"NotebookLM source has no unique {part} evidence candidates."
+                )
             if len(eligible) > MAX_EVIDENCE_CANDIDATES_PER_PART:
                 last = len(eligible) - 1
                 indexes = [round(index * last / (MAX_EVIDENCE_CANDIDATES_PER_PART - 1)) for index in range(MAX_EVIDENCE_CANDIDATES_PER_PART)]
@@ -1937,6 +1959,7 @@ MAX_IGNORED_CITATION_BYTES = 256
 MAX_PROMOTION_CANDIDATE_BYTES = 8 * 1024
 MAX_SOURCE_VERIFICATION_WINDOW_CHARS = MAX_CAPTION_SOURCE_BYTES // 3
 MAX_EVIDENCE_CANDIDATES_PER_PART = 12
+MAX_EVIDENCE_SOURCE_VERIFICATION_POOL_PER_PART = 96
 MAX_EVIDENCE_CANDIDATE_PAYLOAD_BYTES = 16 * 1024
 MAX_KNOWLEDGE_QUERY_PROMPT_BYTES = 32 * 1024
 SEMANTIC_EVALUATOR_CONTRACT = "notebooklm-semantic-verdict-v1"
@@ -3066,7 +3089,7 @@ class KnowledgeService:
                 evidence_candidates: tuple[EvidenceCandidate, ...] = ()
                 if caption_evidence is not None:
                     _validate_caption_input_bounds(caption_evidence)
-                    evidence_candidates = caption_evidence.candidate_bank()
+                    evidence_candidates = caption_evidence.candidate_bank(content)
                 prompt = (
                     build_candidate_query_prompt(job, evidence_candidates)
                     if evidence_candidates

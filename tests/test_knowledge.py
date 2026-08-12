@@ -132,6 +132,11 @@ def caption_evidence() -> CaptionEvidence:
     return CaptionEvidence.from_vtt(caption_vtt())
 
 
+def caption_source_text(evidence: CaptionEvidence | None = None) -> str:
+    selected = evidence or caption_evidence()
+    return " ".join(cue.text for cue in selected.cues)
+
+
 def grounded_draft() -> dict[str, Any]:
     return ground_draft_with_caption_evidence(
         valid_draft(),
@@ -666,7 +671,7 @@ def test_caption_locate_many_reuses_prebuilt_token_index(
 
 def test_candidate_bank_is_bounded_balanced_and_gap_safe() -> None:
     evidence = caption_evidence()
-    bank = evidence.candidate_bank()
+    bank = evidence.candidate_bank(caption_source_text(evidence))
 
     assert 3 <= len(bank) <= 36
     assert {candidate.part for candidate in bank} == {"start", "middle", "end"}
@@ -688,11 +693,36 @@ def test_candidate_bank_excludes_ambiguous_repeated_spans() -> None:
     )
 
     with pytest.raises(KnowledgeError, match="no unique"):
-        evidence.candidate_bank()
+        evidence.candidate_bank(caption_source_text(evidence))
+
+
+def test_candidate_bank_excludes_caption_only_spans_before_query() -> None:
+    cues = (
+        CaptionCue(1.0, 2.0, "caption only start evidence has eight stable words today"),
+        CaptionCue(10.0, 11.0, "dual grounded start evidence has eight stable words today"),
+        CaptionCue(40.0, 41.0, "caption only middle evidence has eight stable words today"),
+        CaptionCue(50.0, 51.0, "dual grounded middle evidence has eight stable words today"),
+        CaptionCue(80.0, 81.0, "caption only ending evidence has eight stable words today"),
+        CaptionCue(90.0, 91.0, "dual grounded ending evidence has eight stable words today"),
+    )
+    evidence = CaptionEvidence(cues, "8" * 64, 100.0)
+    source = " ".join(cue.text for cue in (cues[1], cues[3], cues[5]))
+
+    bank = evidence.candidate_bank(source)
+
+    assert {candidate.part for candidate in bank} == {"start", "middle", "end"}
+    assert all(
+        knowledge_module._source_quote_matches_bounded_window(
+            source, candidate.quote, candidate.timestamp, evidence.duration_seconds
+        )
+        for candidate in bank
+    )
+    with pytest.raises(KnowledgeError, match="no unique end"):
+        evidence.candidate_bank(" ".join(cue.text for cue in (cues[1], cues[3])))
 
 
 def test_candidate_contract_rejects_unknown_cross_part_duplicate_and_quote_fields() -> None:
-    bank = caption_evidence().candidate_bank()
+    bank = caption_evidence().candidate_bank(transcript())
     prompt = knowledge_module.build_candidate_query_prompt(make_job(), bank)
     draft = candidate_contract_response(prompt, valid_draft())
 
@@ -723,7 +753,7 @@ def test_candidate_contract_rejects_unknown_cross_part_duplicate_and_quote_field
 
 
 def test_candidate_contract_discards_valid_non_fact_evidence_id() -> None:
-    bank = caption_evidence().candidate_bank()
+    bank = caption_evidence().candidate_bank(transcript())
     prompt = knowledge_module.build_candidate_query_prompt(make_job(), bank)
     draft = candidate_contract_response(prompt, valid_draft())
     non_fact = {
@@ -749,7 +779,7 @@ def test_candidate_contract_discards_valid_non_fact_evidence_id() -> None:
 
 
 def test_candidate_and_semantic_prompts_are_hard_capped() -> None:
-    bank = caption_evidence().candidate_bank()
+    bank = caption_evidence().candidate_bank(transcript())
     candidate_prompt = knowledge_module.build_candidate_query_prompt(make_job(), bank)
     assert len(candidate_prompt.encode("utf-8")) <= 32 * 1024
 
