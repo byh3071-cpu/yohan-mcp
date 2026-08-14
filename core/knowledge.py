@@ -2261,15 +2261,22 @@ def _hydrate_candidate_draft(
                 raise DraftContractError("Candidate claim selected an unknown evidence ID.")
             if candidate_id in fact_candidate_ids:
                 raise DraftContractError("Fact claims contain a duplicate evidence ID conflict.")
+            model_statement = claim["statement"]
             # The model chooses evidence; the system owns factual wording.
             # Discard every model-added detail and persist only the verified quote.
             claim["statement"] = candidate.quote
             fact_candidate_ids.add(candidate_id)
             claim["evidence_quote"] = candidate.quote
-            selected.append({
-                "item_id": f"F{index:02d}", "candidate_id": candidate_id,
-                "quote": candidate.quote, "statement": claim["statement"],
-            })
+            # A quote cannot meaningfully validate itself. Preserve the model's
+            # non-persisted statement only for semantic comparison, and leave a
+            # tautological fact marked for human cross-check.
+            if _canonical_evidence_lexemes(model_statement) != _canonical_evidence_lexemes(
+                candidate.quote
+            ):
+                selected.append({
+                    "item_id": f"F{index:02d}", "candidate_id": candidate_id,
+                    "quote": candidate.quote, "statement": model_statement,
+                })
         elif candidate_id is not None:
             # NotebookLM occasionally attaches one of the supplied candidate
             # IDs to an interpretation or recommendation even though the
@@ -2746,9 +2753,11 @@ class ReviewStore:
             raise KnowledgeError("Could not read the invalidated review staging file.") from error
         digest = sha256_text(content)
         archive_root = self.root.parent / "invalidated-reviews"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        if archive_root.is_symlink() or not archive_root.is_dir():
-            raise KnowledgeError("The invalidated review archive path is not a safe directory.")
+        if archive_root.exists() or archive_root.is_symlink():
+            if archive_root.is_symlink() or not archive_root.is_dir():
+                raise KnowledgeError("The invalidated review archive path is not a safe directory.")
+        else:
+            archive_root.mkdir(parents=True, exist_ok=True)
         archive_path = archive_root / f"{job_id}-{digest}.json"
         if archive_path.exists():
             if archive_path.is_symlink() or not archive_path.is_file():
@@ -3178,6 +3187,8 @@ class KnowledgeService:
         report = {
             "ok": True,
             "read_only": True,
+            "read_only_scope": "queue-and-external-sources",
+            "local_registry_cache_may_refresh": True,
             "execution_safety_guaranteed": False,
             "job_id": job_id,
             "status": job.get("status"),
@@ -3237,7 +3248,7 @@ class KnowledgeService:
             self._validate_job_id(job_id)
             if expected_git_sha is None:
                 raise KnowledgeError("exact-job processing requires --expected-git-sha")
-            diagnosis, preflight_job, caption_evidence = self._doctor_snapshot(
+            diagnosis, _preflight_job, caption_evidence = self._doctor_snapshot(
                 job_id,
                 expected_git_sha=expected_git_sha,
                 require_clean=True,
@@ -3248,7 +3259,7 @@ class KnowledgeService:
                 raise KnowledgeError("NotebookLM preflight failed before exact claim")
             if not diagnosis["public_caption_ready"] or caption_evidence is None:
                 raise KnowledgeError("public-caption preflight failed before exact claim")
-            preflight_captions[job_id] = caption_evidence
+            preflight_captions[job_id.lower()] = caption_evidence
             claimed = queue.claim_exact(job_id, self._worker_id())
             if str(claimed.get("id") or "").lower() != job_id.lower():
                 raise KnowledgeError("exact claim returned a different job")
@@ -3280,7 +3291,9 @@ class KnowledgeService:
                 # This is an explicit opt-in path only.  Keep its validation
                 # ahead of every NotebookLM mutation for the approved legacy
                 # workflow; the default path below never enters this branch.
-                caption_evidence = preflight_captions.get(str(job.get("id") or ""))
+                caption_evidence = preflight_captions.get(
+                    str(job.get("id") or "").lower()
+                )
                 if caption_evidence is None and self.caption_provider is not None:
                     caption_evidence = self.caption_provider.fetch(source_url)
                 # Serialize the external check-then-add by canonical source key.
@@ -3509,8 +3522,16 @@ class KnowledgeService:
                         build_semantic_evaluator_prompt(semantic_items),
                     )
                     validate_semantic_verdict(semantic_raw, semantic_items)
-                    for claim in draft["claims"]:
-                        if claim.get("type") == "fact":
+                    verified_fact_ids = {
+                        item["item_id"]
+                        for item in semantic_items
+                        if item["item_id"].startswith("F")
+                    }
+                    for index, claim in enumerate(draft["claims"], 1):
+                        if (
+                            claim.get("type") == "fact"
+                            and f"F{index:02d}" in verified_fact_ids
+                        ):
                             claim["requires_crosscheck"] = False
                     quality["semantic_evaluator"] = "notebooklm-second-pass-semantic-consistency-v1"
                     quality["semantic_evaluator_independent"] = False
