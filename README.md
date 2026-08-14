@@ -435,6 +435,23 @@ python scripts/validate_schemas.py
 
 ---
 
+## Focus Feed 지식 대기열
+
+모든 명령은 같은 `scripts/knowledge.py` 엔진을 사용한다. 일반 배치는 최대 3건이고, clean 카나리와 승인된 레거시 진단은 exact job 경로만 사용한다.
+
+```powershell
+python scripts/knowledge.py doctor --job-id <uuid>
+python scripts/knowledge.py process --job-id <uuid> --expected-git-sha <40자-sha>
+python scripts/knowledge.py canary inspect --manifest <manifest.json>
+```
+
+- `doctor`는 DB·NotebookLM·공개 자막을 변경하지 않는 진단이며 이후 실행 안전성을 보증하지 않는다.
+- exact `process`는 전역 로컬 잠금 안에서 doctor 진단과 tracked-clean Git SHA 검증을 다시 수행한 뒤 DB claim을 시도한다.
+- `--job-id`와 `--limit`는 함께 사용할 수 없다. 모든 NotebookLM 요약 질의는 해당 source ID로 제한된다.
+- `_canary_no_retry` 또는 과거 recovery marker가 있는 작업은 `knowledge retry`가 거부한다.
+
+---
+
 ## Docker / 인프라
 
 `docker-compose.yml` 은 Qdrant 컨테이너 하나다.

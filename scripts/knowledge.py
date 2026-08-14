@@ -61,7 +61,17 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("cleanup-plan", help="중복 source 정리 후보만 출력")
 
     process = commands.add_parser("process", help="대기열을 최대 3건 처리")
-    process.add_argument("--limit", type=int, default=3)
+    process.add_argument("--limit", type=int)
+    process.add_argument("--job-id")
+    process.add_argument("--expected-git-sha")
+
+    doctor = commands.add_parser("doctor", help="exact-job execution read-only preflight")
+    doctor.add_argument("--job-id", required=True)
+
+    canary = commands.add_parser("canary", help="clean canary inspection helpers")
+    canary_commands = canary.add_subparsers(dest="canary_command", required=True)
+    inspect = canary_commands.add_parser("inspect", help="inspect jobs created for a canary manifest")
+    inspect.add_argument("--manifest", required=True)
 
     commands.add_parser("reviews", help="사람 검토 대기 목록 출력")
 
@@ -90,6 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     needs_queue = args.command in {
         "process",
+        "doctor",
+        "canary",
         "reviews",
         "retry",
         "invalidate-review",
@@ -103,7 +115,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "cleanup-plan":
         return service.cleanup_plan()
     if args.command == "process":
-        return service.process(limit=args.limit)
+        if args.job_id and args.limit is not None:
+            raise KnowledgeError("--job-id and --limit cannot be used together")
+        if args.job_id:
+            if not args.expected_git_sha:
+                raise KnowledgeError("--job-id requires --expected-git-sha")
+            return service.process(
+                limit=1,
+                job_id=args.job_id,
+                expected_git_sha=args.expected_git_sha,
+            )
+        if args.expected_git_sha:
+            raise KnowledgeError("--expected-git-sha requires --job-id")
+        return service.process(limit=args.limit if args.limit is not None else 3)
+    if args.command == "doctor":
+        return service.doctor(args.job_id)
+    if args.command == "canary" and args.canary_command == "inspect":
+        return service.canary_inspect(Path(args.manifest).expanduser().resolve())
     if args.command == "reviews":
         return service.reviews()
     if args.command == "retry":
