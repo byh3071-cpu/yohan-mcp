@@ -43,6 +43,7 @@ from core.knowledge import (
     youtube_video_id,
 )
 from core.paths import resolve_knowledge_runtime_dir
+from scripts import knowledge as knowledge_cli
 from scripts.knowledge import configure_utf8_stdio
 from scripts.knowledge import build_parser
 
@@ -339,6 +340,17 @@ class FakeQueue:
         self.claimed = True
         return [deepcopy(self.job)]
 
+    def claim_exact(self, job_id: str, worker_id: str) -> dict[str, Any]:
+        assert job_id == self.job["id"]
+        assert worker_id.startswith("knowledge-worker:")
+        if self.claimed or self.job.get("status") != "queued":
+            raise KnowledgeError("job is not eligible for exact claim")
+        self.claimed = True
+        self.job["status"] = "processing"
+        self.job["attempt_count"] = int(self.job.get("attempt_count") or 0) + 1
+        self.job["lease_token"] = "22222222-2222-4222-8222-222222222222"
+        return deepcopy(self.job)
+
     def retry(self, job_id: str) -> dict[str, Any]:
         assert job_id == self.job["id"]
         if self.job.get("status") != "action_required" or int(self.job.get("attempt_count") or 0) >= 3:
@@ -391,6 +403,10 @@ class FakeQueue:
     def get(self, job_id: str) -> dict[str, Any]:
         assert job_id == self.job["id"]
         return deepcopy(self.job)
+
+    def canary_jobs(self, run_id: str) -> list[dict[str, Any]]:
+        metadata = self.job.get("metadata") if isinstance(self.job.get("metadata"), dict) else {}
+        return [deepcopy(self.job)] if metadata.get("_canary_run_id") == run_id else []
 
     def begin_approval(self, job: dict[str, Any], intent_hash: str) -> dict[str, Any]:
         assert job["status"] in {"review_required", "approving"}
@@ -794,6 +810,21 @@ def test_candidate_contract_rejects_unknown_cross_part_duplicate_and_quote_field
     with pytest.raises(KnowledgeError, match="forbidden"):
         knowledge_module._hydrate_candidate_draft(model_owned_flag, bank)
 
+    expanded = deepcopy(draft)
+    expanded["claims"][0]["statement"] = "This tool is growing rapidly without evidence."
+    hydrated, semantic_items = knowledge_module._hydrate_candidate_draft(expanded, bank)
+    selected_quote = next(item.quote for item in bank if item.candidate_id == expanded["claims"][0]["evidence_id"])
+    assert hydrated["claims"][0]["statement"] == selected_quote
+    assert semantic_items[0]["statement"] == expanded["claims"][0]["statement"]
+
+    tautological = deepcopy(draft)
+    tautological["claims"][0]["statement"] = selected_quote
+    hydrated_tautology, tautological_items = knowledge_module._hydrate_candidate_draft(
+        tautological, bank
+    )
+    assert hydrated_tautology["claims"][0]["requires_crosscheck"] is True
+    assert not any(item["item_id"].startswith("F") for item in tautological_items)
+
 
 def test_candidate_contract_discards_valid_non_fact_evidence_id() -> None:
     bank = caption_evidence().candidate_bank(transcript())
@@ -928,7 +959,7 @@ def test_candidate_contract_failure_does_not_query_semantic_evaluator(
                         response["coverage"]["start"]["evidence_id"] = response["coverage"]["middle"]["evidence_id"]
                     elif mode == "fabricated":
                         response["claims"][0]["evidence_quote"] = "invented paraphrase"
-                    else:
+                    elif mode == "duplicate":
                         response["claims"].append(deepcopy(response["claims"][0]))
                     return json.dumps({"answer": json.dumps(response, ensure_ascii=False)})
             return super().__call__(args, timeout)
@@ -1012,6 +1043,51 @@ def test_candidate_semantic_success_is_human_approval_ready_with_visible_limitat
     assert queue.job["quality_report"]["semantic_evaluator_independent"] is False
     assert any("독립 모델 검증이 아닙니다" in warning for warning in reviews["items"][0]["qualityWarnings"])
     assert reviews["items"][0]["approvalReady"] is True
+
+
+def test_tautological_fact_quote_remains_human_crosscheck_required(
+    tmp_path: Path,
+) -> None:
+    class TautologicalFactRunner(FakeRunner):
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"] and "EVIDENCE_CANDIDATES=" in args[3]:
+                self.calls.append(args)
+                response = candidate_contract_response(args[3], valid_draft())
+                candidates = json.loads(
+                    next(
+                        line for line in args[3].splitlines()
+                        if line.startswith("EVIDENCE_CANDIDATES=")
+                    ).split("=", 1)[1]
+                )
+                by_id = {item["id"]: item for item in candidates}
+                fact = next(claim for claim in response["claims"] if claim["type"] == "fact")
+                fact["statement"] = by_id[fact["evidence_id"]]["quote"]
+                return json.dumps({"answer": json.dumps(response, ensure_ascii=False)})
+            return super().__call__(args, timeout)
+
+    runner = TautologicalFactRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    ).process(limit=1)
+
+    assert report["review_required"] == [JOB_ID]
+    fact = next(
+        claim for claim in queue.job["result"]["draft"]["claims"]
+        if claim["type"] == "fact"
+    )
+    assert fact["requires_crosscheck"] is True
+    semantic_prompt = next(
+        call[3] for call in runner.calls
+        if call[:2] == ["notebook", "query"]
+        and call[3].startswith("Verdict-only semantic check")
+    )
+    assert '"item_id":"F' not in semantic_prompt
 
 
 def test_caption_grounding_rejects_changed_numbers_negation_and_ambiguous_matches() -> None:
@@ -1540,6 +1616,237 @@ def test_process_reuses_existing_source_and_queries_only_that_source(tmp_path: P
         for _TIMESTAMP_PATTERN in ["00:01", "10:00", "20:00"]
         if _TIMESTAMP_PATTERN in transcript()
     )
+
+
+def test_exact_process_claims_only_requested_job_after_clean_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = make_job()
+    job.update(
+        {
+            "status": "queued",
+            "attempt_count": 0,
+            "capture_ready": True,
+            "lease_token": None,
+            "metadata": {"_canary_hold": True, "_canary_no_retry": True},
+        }
+    )
+    queue = FakeQueue(job)
+    monkeypatch.setattr(
+        knowledge_module,
+        "runtime_git_provenance",
+        lambda expected_sha=None, require_clean=False: {
+            "git_sha": expected_sha or "a" * 40,
+            "tracked_clean": require_clean,
+            "module_path": __file__,
+            "repository_root": str(tmp_path),
+        },
+    )
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json", canonical_notebook_ids=["nb1"]),
+        queue=queue,
+        review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    report = service.process(job_id=JOB_ID, expected_git_sha="a" * 40)
+
+    assert report["exact_job_id"] == JOB_ID
+    assert report["requested_limit"] == 1
+    assert report["review_required"] == [JOB_ID]
+    assert queue.job["attempt_count"] == 1
+
+
+def test_runtime_git_provenance_rejects_invalid_sha_before_running_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("git must not run for an invalid expected SHA")
+
+    monkeypatch.setattr(knowledge_module.subprocess, "run", unexpected_run)
+
+    with pytest.raises(KnowledgeError, match="full 40-character"):
+        knowledge_module.runtime_git_provenance("short", require_clean=True)
+
+
+@pytest.mark.parametrize(
+    ("head", "status", "expected", "message"),
+    [
+        ("a" * 40, "", "b" * 40, "does not match"),
+        ("a" * 40, " M core/knowledge.py", "a" * 40, "uncommitted tracked changes"),
+    ],
+)
+def test_runtime_git_provenance_rejects_mismatch_and_dirty_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    head: str,
+    status: str,
+    expected: str,
+    message: str,
+) -> None:
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        output = head if command[1:3] == ["rev-parse", "HEAD"] else status
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(knowledge_module.subprocess, "run", fake_run)
+
+    with pytest.raises(KnowledgeError, match=message):
+        knowledge_module.runtime_git_provenance(expected, require_clean=True)
+
+
+def test_doctor_is_read_only_and_reports_that_execution_must_repeat_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = make_job()
+    job.update({"status": "queued", "attempt_count": 0, "capture_ready": True, "lease_token": None})
+    queue = FakeQueue(job)
+    monkeypatch.setattr(
+        knowledge_module,
+        "runtime_git_provenance",
+        lambda expected_sha=None, require_clean=False: {
+            "git_sha": expected_sha or "a" * 40,
+            "tracked_clean": not require_clean,
+            "module_path": __file__,
+            "repository_root": str(tmp_path),
+        },
+    )
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    report = service.doctor(JOB_ID)
+
+    assert report["read_only"] is True
+    assert report["read_only_scope"] == "queue-and-external-sources"
+    assert report["local_registry_cache_may_refresh"] is True
+    assert report["execution_safety_guaranteed"] is False
+    assert report["ready_state"] is True
+    assert queue.claimed is False
+    assert queue.job["attempt_count"] == 0
+
+
+def test_exact_process_reuses_preflight_caption_for_case_normalized_job_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = make_job()
+    job.update({"status": "queued", "attempt_count": 0, "capture_ready": True, "lease_token": None})
+
+    class CaseNormalizingQueue(FakeQueue):
+        def claim_exact(self, job_id: str, worker_id: str) -> dict[str, Any]:
+            assert job_id.lower() == self.job["id"]
+            return super().claim_exact(job_id.lower(), worker_id)
+
+    queue = CaseNormalizingQueue(job)
+    captions = FakeCaptionProvider()
+    monkeypatch.setattr(
+        knowledge_module,
+        "runtime_git_provenance",
+        lambda expected_sha=None, require_clean=False: {
+            "git_sha": expected_sha or "a" * 40,
+            "tracked_clean": require_clean,
+            "module_path": __file__,
+            "repository_root": str(tmp_path),
+        },
+    )
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json", canonical_notebook_ids=["nb1"]),
+        queue=queue,
+        review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=captions,
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    report = service.process(job_id=JOB_ID.upper(), expected_git_sha="a" * 40)
+
+    assert report["review_required"] == [JOB_ID]
+    assert captions.calls == [VIDEO_URL]
+
+
+def test_exact_process_rejects_bad_provenance_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = make_job()
+    job.update({"status": "queued", "attempt_count": 0, "capture_ready": True, "lease_token": None})
+    queue = FakeQueue(job)
+    monkeypatch.setattr(
+        knowledge_module,
+        "runtime_git_provenance",
+        lambda expected_sha=None, require_clean=False: (_ for _ in ()).throw(
+            KnowledgeError("knowledge runtime has uncommitted tracked changes")
+        ),
+    )
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    with pytest.raises(KnowledgeError, match="uncommitted tracked changes"):
+        service.process(job_id=JOB_ID, expected_git_sha="a" * 40)
+
+    assert queue.claimed is False
+
+
+def test_exact_process_rejects_terminal_claim_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = make_job()
+    job.update({"status": "queued", "attempt_count": 2, "capture_ready": True, "lease_token": None})
+
+    class TerminalExactQueue(FakeQueue):
+        def claim_exact(self, job_id: str, worker_id: str) -> dict[str, Any]:
+            assert job_id == self.job["id"]
+            assert worker_id.startswith("knowledge-worker:")
+            self.claimed = True
+            self.job.update(
+                {
+                    "status": "action_required",
+                    "failure_code": "CANARY_LEASE_EXPIRED",
+                    "failure_message": "Clean canary lease expired; retry is disabled.",
+                    "lease_token": None,
+                }
+            )
+            return deepcopy(self.job)
+
+    queue = TerminalExactQueue(job)
+    monkeypatch.setattr(
+        knowledge_module,
+        "runtime_git_provenance",
+        lambda expected_sha=None, require_clean=False: {
+            "git_sha": expected_sha or "a" * 40,
+            "tracked_clean": require_clean,
+            "module_path": __file__,
+            "repository_root": str(tmp_path),
+        },
+    )
+    runner = FakeRunner()
+    service = KnowledgeService(
+        NotebookLmClient(runner),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    )
+
+    with pytest.raises(KnowledgeError, match="did not acquire a processing lease"):
+        service.process(job_id=JOB_ID, expected_git_sha="a" * 40)
+
+    assert queue.claimed is True
+    assert not any(command[:2] == ["notebook", "query"] for command in runner.calls)
 
 
 def test_process_refuses_to_claim_without_public_caption_opt_in(tmp_path: Path) -> None:
@@ -2543,10 +2850,140 @@ def test_retry_contract_preserves_notebook_identity_and_attempt_ceiling(tmp_path
         service.retry(JOB_ID)
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"_canary_no_retry": True},
+        {"_legacy_review_recovery_v1": True},
+        {"_review_staging_conflict_recovery_v1": {"recovered_at": "now"}},
+    ],
+)
+def test_retry_refuses_clean_and_recovery_jobs(
+    tmp_path: Path,
+    metadata: dict[str, Any],
+) -> None:
+    job = make_job()
+    job.update(
+        {
+            "status": "action_required",
+            "attempt_count": 1,
+            "failure_code": "QUALITY_GATE_FAILED",
+            "metadata": metadata,
+        }
+    )
+    queue = FakeQueue(job)
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        env={},
+    )
+
+    with pytest.raises(KnowledgeError, match="permanently excluded"):
+        service.retry(JOB_ID)
+
+    assert queue.job["status"] == "action_required"
+
+
+def test_canary_inspect_reconstructs_eligible_jobs_from_manifest(tmp_path: Path) -> None:
+    manifest = tmp_path / "canary.json"
+    manifest.write_text(json.dumps({"items": [{"url": VIDEO_URL}]}), encoding="utf-8")
+    run_id, _ = knowledge_module.canary_manifest_run_id(manifest)
+    assert run_id == knowledge_module.sha256_text(
+        json.dumps([VIDEO_URL], ensure_ascii=False, separators=(",", ":"))
+    )
+    job = make_job()
+    job.update(
+        {
+            "status": "queued",
+            "attempt_count": 0,
+            "capture_ready": True,
+            "lease_token": None,
+            "metadata": {
+                "_canary_run_id": run_id,
+                "_canary_hold": True,
+                "_canary_no_retry": True,
+            },
+        }
+    )
+    service = KnowledgeService(
+        NotebookLmClient(FakeRunner()),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=FakeQueue(job),
+        env={},
+    )
+
+    report = service.canary_inspect(manifest)
+
+    assert report["run_id"] == run_id
+    assert report["expected"] == 1
+    assert report["found"] == 1
+    assert report["eligible"] == 1
+    assert report["items"][0]["job_id"] == JOB_ID
+
+
+def test_canary_manifest_run_id_matches_focus_feed_normalized_url_contract(tmp_path: Path) -> None:
+    manifest = tmp_path / "canary-two.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "items": [
+                    {"url": "https://youtu.be/abc_DEF-123"},
+                    {"url": "https://www.youtube.com/watch?v=xyz_ABC-789"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    run_id, video_ids = knowledge_module.canary_manifest_run_id(manifest)
+
+    assert run_id == "bceb9a4c4cd505e5ac97b20272024dac07de4d97c88ccaf15c7219dce3ed6adb"
+    assert video_ids == ("abc_DEF-123", "xyz_ABC-789")
+
+
 def test_cli_exposes_explicit_single_job_retry_command() -> None:
     args = build_parser().parse_args(["retry", JOB_ID])
     assert args.command == "retry"
     assert args.job_id == JOB_ID
+
+
+def test_cli_exposes_exact_process_doctor_and_canary_inspect() -> None:
+    exact = build_parser().parse_args(
+        ["process", "--job-id", JOB_ID, "--expected-git-sha", "a" * 40]
+    )
+    assert exact.job_id == JOB_ID
+    assert exact.limit is None
+    assert exact.expected_git_sha == "a" * 40
+    doctor = build_parser().parse_args(["doctor", "--job-id", JOB_ID])
+    assert doctor.job_id == JOB_ID
+    canary = build_parser().parse_args(["canary", "inspect", "--manifest", "canary.json"])
+    assert canary.canary_command == "inspect"
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (
+            ["process", "--job-id", JOB_ID, "--limit", "1", "--expected-git-sha", "a" * 40],
+            "cannot be used together",
+        ),
+        (["process", "--expected-git-sha", "a" * 40], "requires --job-id"),
+    ],
+)
+def test_cli_rejects_ambiguous_exact_process_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        knowledge_cli.KnowledgeService,
+        "from_env",
+        classmethod(lambda cls, require_queue=False: object()),
+    )
+
+    with pytest.raises(KnowledgeError, match=message):
+        knowledge_cli.run(build_parser().parse_args(argv))
 
 
 def test_invalid_legacy_review_moves_to_action_required_without_losing_source_identity(tmp_path: Path) -> None:
@@ -2566,10 +3003,14 @@ def test_invalid_legacy_review_moves_to_action_required_without_losing_source_id
         }
     )
     queue = FakeQueue(job)
+    review_store = ReviewStore(tmp_path / "runtime" / "reviews")
+    original_review = {"job_id": JOB_ID, "draft": {"summary": "old review"}}
+    review_store.write(JOB_ID, original_review)
     service = KnowledgeService(
         NotebookLmClient(FakeRunner()),
         NotebookRegistry(tmp_path / "registry.json"),
         queue=queue,
+        review_store=review_store,
         env={},
     )
 
@@ -2582,6 +3023,14 @@ def test_invalid_legacy_review_moves_to_action_required_without_losing_source_id
     assert queue.job["source_hash"] == "a" * 64
     assert queue.job["transcript_hash"] == "b" * 64
     assert queue.job["result"]["draft"]["claims"]
+    assert result["review_archived"] is True
+    assert not (review_store.root / f"{JOB_ID}.json").exists()
+    archives = list((review_store.root.parent / "invalidated-reviews").glob(f"{JOB_ID}-*.json"))
+    assert len(archives) == 1
+    assert json.loads(archives[0].read_text(encoding="utf-8")) == original_review
+
+    replacement = {"job_id": JOB_ID, "draft": {"summary": "new review"}}
+    assert json.loads(review_store.write(JOB_ID, replacement).read_text(encoding="utf-8")) == replacement
 
 
 def test_review_invalidation_rejects_missing_or_changed_source_identity(tmp_path: Path) -> None:
@@ -2938,6 +3387,7 @@ def test_reviews_expose_control_tower_contract_without_transcript(tmp_path: Path
 
     assert result["items"][0]["jobId"] == JOB_ID
     assert result["items"][0]["title"] == "검토할 영상"
+    assert result["items"][0]["relevance"] == grounded_draft()["yohan_relevance"]
     assert result["items"][0]["qualityWarnings"] == ["고유명사 확인 필요"]
     assert result["items"][0]["approvalReady"] is True
     assert result["items"][0]["approvalBlockers"] == []

@@ -66,6 +66,15 @@ _UUID_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _EVIDENCE_CANDIDATE_ID_PATTERN = re.compile(r"^C[SME]\d{2}$")
+_GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_CANARY_RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+_RECOVERY_MARKERS = frozenset({
+    "_legacy_review_recovery_v1",
+    "_semantic_json_fence_recovery_v1",
+    "_public_caption_config_recovery_v1",
+    "_candidate_selection_format_recovery_v1",
+    "_review_staging_conflict_recovery_v1",
+})
 
 _CHILD_ENV_KEYS = {
     "APPDATA",
@@ -155,6 +164,85 @@ def safe_error(error: object, limit: int = 800) -> str:
     message = str(error).replace("\x00", " ")
     message = _TOKEN_PATTERN.sub("[redacted]", message)
     return re.sub(r"\s+", " ", message).strip()[:limit]
+
+
+def runtime_git_provenance(
+    expected_sha: str | None = None,
+    *,
+    require_clean: bool = False,
+) -> dict[str, Any]:
+    """Verify that exact-job execution uses a reviewed, clean checkout."""
+    root = Path(__file__).resolve().parent.parent
+    module_path = Path(__file__).resolve()
+    try:
+        module_path.relative_to(root)
+    except ValueError as error:
+        raise KnowledgeError("knowledge runtime module is outside the repository root") from error
+    if expected_sha is not None and not _GIT_SHA_PATTERN.fullmatch(expected_sha.strip()):
+        raise KnowledgeError("expected git SHA must be a full 40-character commit hash")
+
+    def git(*args: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=root,
+                env=_child_process_env(),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise KnowledgeError("could not verify knowledge runtime git provenance") from error
+        if completed.returncode != 0:
+            raise KnowledgeError("could not verify knowledge runtime git provenance")
+        return completed.stdout.strip()
+
+    head = git("rev-parse", "HEAD").lower()
+    tracked_status = git("status", "--porcelain", "--untracked-files=no")
+    if expected_sha is not None and head != expected_sha.strip().lower():
+        raise KnowledgeError("knowledge runtime git SHA does not match the reviewed commit")
+    if require_clean and tracked_status:
+        raise KnowledgeError("knowledge runtime has uncommitted tracked changes")
+    return {
+        "git_sha": head,
+        "tracked_clean": not bool(tracked_status),
+        "module_path": str(module_path),
+        "repository_root": str(root),
+    }
+
+
+def canary_manifest_run_id(path: Path) -> tuple[str, tuple[str, ...]]:
+    """Return the deterministic run ID shared with Focus Feed's canary route."""
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise KnowledgeError("could not read the canary manifest") from error
+    if len(raw) > 16_384:
+        raise KnowledgeError("canary manifest exceeds 16 KiB")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise KnowledgeError("canary manifest must be a UTF-8 JSON object") from error
+    items = value.get("items") if isinstance(value, dict) else None
+    if not isinstance(items, list) or not 1 <= len(items) <= 7:
+        raise KnowledgeError("canary manifest items must contain 1 to 7 videos")
+    video_ids: list[str] = []
+    normalized_urls: list[str] = []
+    for item in items:
+        url = item.get("url") if isinstance(item, dict) else None
+        video_id = youtube_video_id(str(url or ""))
+        if not video_id:
+            raise KnowledgeError("canary manifest contains a non-YouTube URL")
+        video_ids.append(video_id)
+        normalized_urls.append(canonical_url(str(url)))
+    if len(set(video_ids)) != len(video_ids):
+        raise KnowledgeError("canary manifest contains duplicate YouTube videos")
+    canonical = json.dumps(normalized_urls, ensure_ascii=False, separators=(",", ":"))
+    return sha256_text(canonical), tuple(video_ids)
 
 
 def processing_failure_code(error: object) -> str:
@@ -1693,12 +1781,14 @@ class NotebookRegistry:
 
 class Queue(Protocol):
     def claim(self, worker_id: str, limit: int) -> list[dict[str, Any]]: ...
+    def claim_exact(self, job_id: str, worker_id: str) -> dict[str, Any]: ...
     def retry(self, job_id: str) -> dict[str, Any]: ...
     def invalidate_review(self, job_id: str) -> dict[str, Any]: ...
     def checkpoint(self, job: Mapping[str, Any], **fields: Any) -> dict[str, Any]: ...
     def complete(self, job: Mapping[str, Any], status: str, **fields: Any) -> dict[str, Any]: ...
     def reviews(self) -> list[dict[str, Any]]: ...
     def get(self, job_id: str) -> dict[str, Any]: ...
+    def canary_jobs(self, run_id: str) -> list[dict[str, Any]]: ...
     def begin_approval(self, job: Mapping[str, Any], intent_hash: str) -> dict[str, Any]: ...
     def mark_completed(self, job: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]: ...
     def defer(self, job: Mapping[str, Any]) -> dict[str, Any]: ...
@@ -1794,6 +1884,23 @@ class FocusFeedQueue:
             raise KnowledgeError("claim 응답이 배열이 아닙니다.")
         return [row for row in value if isinstance(row, dict)]
 
+    def claim_exact(self, job_id: str, worker_id: str) -> dict[str, Any]:
+        if not _UUID_PATTERN.fullmatch(job_id):
+            raise KnowledgeError("job ID must be a UUID")
+        return self._single(
+            self._request(
+                "POST",
+                "/rest/v1/rpc/claim_knowledge_job_by_id",
+                body={
+                    "p_user_id": self.owner_user_id,
+                    "p_job_id": job_id,
+                    "p_worker_id": worker_id[:120],
+                    "p_lease_seconds": LEASE_SECONDS,
+                },
+            ),
+            "exact claim",
+        )
+
     def retry(self, job_id: str) -> dict[str, Any]:
         return self._single(
             self._request(
@@ -1862,6 +1969,22 @@ class FocusFeedQueue:
         if not isinstance(value, list) or not value or not isinstance(value[0], dict):
             raise KnowledgeError(f"작업을 찾을 수 없습니다: {job_id}")
         return value[0]
+
+    def canary_jobs(self, run_id: str) -> list[dict[str, Any]]:
+        if not _CANARY_RUN_ID_PATTERN.fullmatch(run_id):
+            raise KnowledgeError("canary run ID must be a SHA-256 hash")
+        query = urlencode(
+            {
+                "user_id": f"eq.{self.owner_user_id}",
+                "metadata->>_canary_run_id": f"eq.{run_id.lower()}",
+                "select": "id,video_id,status,attempt_count,capture_ready,lease_token,metadata,created_at",
+                "order": "created_at.asc",
+            }
+        )
+        value = self._request("GET", f"/rest/v1/knowledge_jobs?{query}")
+        if not isinstance(value, list):
+            raise KnowledgeError("canary job lookup returned a non-array response")
+        return [row for row in value if isinstance(row, dict)]
 
     def reviews(self) -> list[dict[str, Any]]:
         value = self._request(
@@ -2138,12 +2261,22 @@ def _hydrate_candidate_draft(
                 raise DraftContractError("Candidate claim selected an unknown evidence ID.")
             if candidate_id in fact_candidate_ids:
                 raise DraftContractError("Fact claims contain a duplicate evidence ID conflict.")
+            model_statement = claim["statement"]
+            # The model chooses evidence; the system owns factual wording.
+            # Discard every model-added detail and persist only the verified quote.
+            claim["statement"] = candidate.quote
             fact_candidate_ids.add(candidate_id)
             claim["evidence_quote"] = candidate.quote
-            selected.append({
-                "item_id": f"F{index:02d}", "candidate_id": candidate_id,
-                "quote": candidate.quote, "statement": claim["statement"],
-            })
+            # A quote cannot meaningfully validate itself. Preserve the model's
+            # non-persisted statement only for semantic comparison, and leave a
+            # tautological fact marked for human cross-check.
+            if _canonical_evidence_lexemes(model_statement) != _canonical_evidence_lexemes(
+                candidate.quote
+            ):
+                selected.append({
+                    "item_id": f"F{index:02d}", "candidate_id": candidate_id,
+                    "quote": candidate.quote, "statement": model_statement,
+                })
         elif candidate_id is not None:
             # NotebookLM occasionally attaches one of the supplied candidate
             # IDs to an interpretation or recommendation even though the
@@ -2497,6 +2630,8 @@ def build_candidate_query_prompt(
         "Each evidence_id must be exactly one four-character ID such as CS01; never output multiple IDs, lists, commas, spaces, or explanations in evidence_id.",
         "Interpretation and recommendation claims must omit evidence_id.",
         "Never output evidence_quote, caption_quote, citation, or an unknown ID.",
+        "Every fact statement must copy the selected evidence candidate quote exactly, without paraphrasing or adding any detail.",
+        "Put broader analysis only in interpretation or recommendation claims.",
         "Coverage start/middle/end may select only CS/CM/CE IDs respectively.",
         "The system owns review flags. Do not output requires_crosscheck. Return one JSON object only.",
         f"EVIDENCE_CANDIDATES={payload}",
@@ -2601,6 +2736,41 @@ def _validate_caption_input_bounds(evidence: CaptionEvidence) -> None:
 class ReviewStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or resolve_knowledge_runtime_dir() / "reviews"
+
+    def archive_invalidated_review(self, job_id: str) -> bool:
+        """Move an invalidated review aside without destroying audit evidence."""
+        if not _UUID_PATTERN.fullmatch(job_id):
+            raise KnowledgeError("job ID must be a UUID.")
+        path = self.root / f"{job_id}.json"
+        if not path.exists():
+            return False
+        if path.is_symlink() or not path.is_file():
+            raise KnowledgeError("The invalidated review staging path is not a regular file.")
+
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise KnowledgeError("Could not read the invalidated review staging file.") from error
+        digest = sha256_text(content)
+        archive_root = self.root.parent / "invalidated-reviews"
+        if archive_root.exists() or archive_root.is_symlink():
+            if archive_root.is_symlink() or not archive_root.is_dir():
+                raise KnowledgeError("The invalidated review archive path is not a safe directory.")
+        else:
+            archive_root.mkdir(parents=True, exist_ok=True)
+        archive_path = archive_root / f"{job_id}-{digest}.json"
+        if archive_path.exists():
+            if archive_path.is_symlink() or not archive_path.is_file():
+                raise KnowledgeError("The invalidated review archive target is not a regular file.")
+            if archive_path.read_text(encoding="utf-8") != content:
+                raise KnowledgeError("The invalidated review archive conflicts with staged content.")
+            path.unlink()
+            return True
+        try:
+            path.replace(archive_path)
+        except OSError as error:
+            raise KnowledgeError("Could not archive the invalidated review staging file.") from error
+        return True
 
     def write(self, job_id: str, value: Mapping[str, Any]) -> Path:
         if not _UUID_PATTERN.fullmatch(job_id):
@@ -2972,7 +3142,100 @@ class KnowledgeService:
     def _worker_id() -> str:
         return f"knowledge-worker:{socket.gethostname()}:{os.getpid()}"
 
-    def process(self, limit: int = MAX_BATCH) -> dict[str, Any]:
+    def _process_lock(self) -> InterProcessFileLock:
+        return InterProcessFileLock(
+            self.registry.path.parent / "locks" / "process.lock",
+            timeout_seconds=30.0,
+        )
+
+    def _doctor_snapshot(
+        self,
+        job_id: str,
+        *,
+        expected_git_sha: str | None = None,
+        require_clean: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any], CaptionEvidence | None]:
+        """Collect the read-only exact-job diagnosis without claiming the row."""
+        self._validate_job_id(job_id)
+        provenance = runtime_git_provenance(expected_git_sha, require_clean=require_clean)
+        job = self._queue().get(job_id)
+        metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        notebook_ok = False
+        notebook_error = ""
+        try:
+            self.inventory(force=False)
+            notebook_ok = True
+        except Exception as error:
+            notebook_error = safe_error(error, 300)
+        caption_ok = False
+        caption_evidence: CaptionEvidence | None = None
+        caption_error = ""
+        if self.caption_provider is None:
+            caption_error = "public-caption processing is disabled"
+        else:
+            try:
+                caption_evidence = self.caption_provider.fetch(str(job.get("source_url") or ""))
+                caption_ok = True
+            except Exception as error:
+                caption_error = safe_error(error, 300)
+        ready_state = (
+            job.get("status") == "queued"
+            and job.get("capture_ready") is True
+            and int(job.get("attempt_count") or 0) < 3
+            and not job.get("lease_token")
+        )
+        report = {
+            "ok": True,
+            "read_only": True,
+            "read_only_scope": "queue-and-external-sources",
+            "local_registry_cache_may_refresh": True,
+            "execution_safety_guaranteed": False,
+            "job_id": job_id,
+            "status": job.get("status"),
+            "attempt_count": int(job.get("attempt_count") or 0),
+            "capture_ready": job.get("capture_ready") is True,
+            "lease_present": bool(job.get("lease_token")),
+            "notebook_identity_complete": bool(job.get("notebook_id") and job.get("notebook_source_id")),
+            "source_hash_present": bool(job.get("source_hash")),
+            "transcript_hash_present": bool(job.get("transcript_hash")),
+            "recovery_markers": sorted(key for key in metadata if key in _RECOVERY_MARKERS),
+            "canary_hold": metadata.get("_canary_hold") is True,
+            "canary_no_retry": metadata.get("_canary_no_retry") is True,
+            "notebook_ready": notebook_ok,
+            "notebook_error": notebook_error,
+            "public_caption_ready": caption_ok,
+            "public_caption_error": caption_error,
+            "ready_state": ready_state,
+            "provenance": provenance,
+        }
+        return report, job, caption_evidence
+
+    def doctor(self, job_id: str) -> dict[str, Any]:
+        """Read-only diagnosis; exact execution repeats it while holding the process lock."""
+        report, _, _ = self._doctor_snapshot(job_id)
+        return report
+
+    def process(
+        self,
+        limit: int = MAX_BATCH,
+        *,
+        job_id: str | None = None,
+        expected_git_sha: str | None = None,
+    ) -> dict[str, Any]:
+        with self._process_lock():
+            return self._process_locked(
+                limit=limit,
+                job_id=job_id,
+                expected_git_sha=expected_git_sha,
+            )
+
+    def _process_locked(
+        self,
+        *,
+        limit: int,
+        job_id: str | None,
+        expected_git_sha: str | None,
+    ) -> dict[str, Any]:
         requested = max(1, min(int(limit), MAX_BATCH))
         if self.caption_provider is None:
             raise KnowledgeError(
@@ -2980,8 +3243,35 @@ class KnowledgeService:
                 "worker flag before processing. No queue job was claimed."
             )
         queue = self._queue()
-        self.inventory(force=False)
-        jobs = queue.claim(self._worker_id(), requested)
+        preflight_captions: dict[str, CaptionEvidence] = {}
+        if job_id is not None:
+            self._validate_job_id(job_id)
+            if expected_git_sha is None:
+                raise KnowledgeError("exact-job processing requires --expected-git-sha")
+            diagnosis, _preflight_job, caption_evidence = self._doctor_snapshot(
+                job_id,
+                expected_git_sha=expected_git_sha,
+                require_clean=True,
+            )
+            if not diagnosis["ready_state"]:
+                raise KnowledgeError("exact job is not ready for a first atomic claim")
+            if not diagnosis["notebook_ready"]:
+                raise KnowledgeError("NotebookLM preflight failed before exact claim")
+            if not diagnosis["public_caption_ready"] or caption_evidence is None:
+                raise KnowledgeError("public-caption preflight failed before exact claim")
+            preflight_captions[job_id.lower()] = caption_evidence
+            claimed = queue.claim_exact(job_id, self._worker_id())
+            if str(claimed.get("id") or "").lower() != job_id.lower():
+                raise KnowledgeError("exact claim returned a different job")
+            if claimed.get("status") != "processing" or not claimed.get("lease_token"):
+                raise KnowledgeError("exact claim did not acquire a processing lease")
+            jobs = [claimed]
+            requested = 1
+        else:
+            if expected_git_sha is not None:
+                raise KnowledgeError("--expected-git-sha is valid only with --job-id")
+            self.inventory(force=False)
+            jobs = queue.claim(self._worker_id(), requested)
         report: dict[str, Any] = {
             "ok": True,
             "requested_limit": requested,
@@ -2989,6 +3279,7 @@ class KnowledgeService:
             "review_required": [],
             "action_required": [],
             "lease_lost": [],
+            "exact_job_id": job_id,
         }
         for claimed in jobs:
             job = claimed
@@ -3000,11 +3291,11 @@ class KnowledgeService:
                 # This is an explicit opt-in path only.  Keep its validation
                 # ahead of every NotebookLM mutation for the approved legacy
                 # workflow; the default path below never enters this branch.
-                caption_evidence = (
-                    self.caption_provider.fetch(source_url)
-                    if self.caption_provider is not None
-                    else None
+                caption_evidence = preflight_captions.get(
+                    str(job.get("id") or "").lower()
                 )
+                if caption_evidence is None and self.caption_provider is not None:
+                    caption_evidence = self.caption_provider.fetch(source_url)
                 # Serialize the external check-then-add by canonical source key.
                 # An OS lock is released automatically when a worker crashes.
                 with self.registry.source_lock(source_url):
@@ -3231,8 +3522,16 @@ class KnowledgeService:
                         build_semantic_evaluator_prompt(semantic_items),
                     )
                     validate_semantic_verdict(semantic_raw, semantic_items)
-                    for claim in draft["claims"]:
-                        if claim.get("type") == "fact":
+                    verified_fact_ids = {
+                        item["item_id"]
+                        for item in semantic_items
+                        if item["item_id"].startswith("F")
+                    }
+                    for index, claim in enumerate(draft["claims"], 1):
+                        if (
+                            claim.get("type") == "fact"
+                            and f"F{index:02d}" in verified_fact_ids
+                        ):
                             claim["requires_crosscheck"] = False
                     quality["semantic_evaluator"] = "notebooklm-second-pass-semantic-consistency-v1"
                     quality["semantic_evaluator_independent"] = False
@@ -3341,6 +3640,7 @@ class KnowledgeService:
                     "qualityScore": job.get("quality_score"),
                     "qualityWarnings": quality_warnings,
                     "summary": draft.get("summary"),
+                    "relevance": draft.get("yohan_relevance"),
                     "keyPoints": draft.get("key_points", []),
                     "claims": draft.get("claims", []),
                     "uncertainties": draft.get("uncertainties", []),
@@ -3356,9 +3656,52 @@ class KnowledgeService:
             )
         return {"ok": True, "items": items}
 
+    def canary_inspect(self, manifest_path: Path) -> dict[str, Any]:
+        run_id, video_ids = canary_manifest_run_id(manifest_path)
+        rows = self._queue().canary_jobs(run_id)
+        by_video = {str(row.get("video_id") or ""): row for row in rows}
+        items: list[dict[str, Any]] = []
+        for video_id in video_ids:
+            row = by_video.get(video_id)
+            metadata = row.get("metadata") if isinstance(row, dict) and isinstance(row.get("metadata"), dict) else {}
+            eligible = bool(
+                row
+                and metadata.get("_canary_run_id") == run_id
+                and metadata.get("_canary_hold") is True
+                and metadata.get("_canary_no_retry") is True
+                and row.get("status") == "queued"
+                and row.get("capture_ready") is True
+                and int(row.get("attempt_count") or 0) == 0
+                and not row.get("lease_token")
+            )
+            items.append(
+                {
+                    "video_id": video_id,
+                    "job_id": row.get("id") if row else None,
+                    "status": row.get("status") if row else "missing",
+                    "eligible": eligible,
+                }
+            )
+        return {
+            "ok": True,
+            "read_only": True,
+            "run_id": run_id,
+            "expected": len(video_ids),
+            "found": sum(item["job_id"] is not None for item in items),
+            "eligible": sum(item["eligible"] for item in items),
+            "items": items,
+        }
+
     def retry(self, job_id: str) -> dict[str, Any]:
         self._validate_job_id(job_id)
-        job = self._queue().retry(job_id)
+        queue = self._queue()
+        current = queue.get(job_id)
+        metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
+        if metadata.get("_canary_no_retry") is True or any(
+            marker in metadata for marker in _RECOVERY_MARKERS
+        ):
+            raise KnowledgeError("this job is permanently excluded from retry")
+        job = queue.retry(job_id)
         return {
             "ok": True,
             "job_id": job_id,
@@ -3410,6 +3753,7 @@ class KnowledgeService:
             raise KnowledgeError("검토 무효화 응답의 상태 계약이 올바르지 않습니다.")
         if any(invalidated.get(field) != job.get(field) for field in preserved_fields):
             raise KnowledgeError("검토 무효화 중 NotebookLM source/hash 식별자가 변경되었습니다.")
+        review_archived = self.review_store.archive_invalidated_review(job_id)
         return {
             "ok": True,
             "job_id": job_id,
@@ -3418,6 +3762,7 @@ class KnowledgeService:
             "attempt_count": invalidated.get("attempt_count"),
             "notebook_id": invalidated.get("notebook_id"),
             "notebook_source_id": invalidated.get("notebook_source_id"),
+            "review_archived": review_archived,
         }
 
     @staticmethod
