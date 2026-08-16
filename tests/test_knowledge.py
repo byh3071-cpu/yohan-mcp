@@ -814,16 +814,27 @@ def test_candidate_contract_rejects_unknown_cross_part_duplicate_and_quote_field
     expanded["claims"][0]["statement"] = "This tool is growing rapidly without evidence."
     hydrated, semantic_items = knowledge_module._hydrate_candidate_draft(expanded, bank)
     selected_quote = next(item.quote for item in bank if item.candidate_id == expanded["claims"][0]["evidence_id"])
-    assert hydrated["claims"][0]["statement"] == selected_quote
+    assert hydrated["claims"][0]["statement"] == expanded["claims"][0]["statement"]
+    assert hydrated["claims"][0]["evidence_quote"] == selected_quote
     assert semantic_items[0]["statement"] == expanded["claims"][0]["statement"]
 
     tautological = deepcopy(draft)
     tautological["claims"][0]["statement"] = selected_quote
-    hydrated_tautology, tautological_items = knowledge_module._hydrate_candidate_draft(
-        tautological, bank
+    with pytest.raises(KnowledgeError, match="standalone claim"):
+        knowledge_module._hydrate_candidate_draft(tautological, bank)
+
+    punctuation_only = deepcopy(draft)
+    punctuation_only["claims"][0]["statement"] = f"{selected_quote}."
+    with pytest.raises(KnowledgeError, match="standalone claim"):
+        knowledge_module._hydrate_candidate_draft(punctuation_only, bank)
+
+    tautological_coverage = deepcopy(draft)
+    start_id = tautological_coverage["coverage"]["start"]["evidence_id"]
+    tautological_coverage["coverage"]["start"]["statement"] = next(
+        item.quote for item in bank if item.candidate_id == start_id
     )
-    assert hydrated_tautology["claims"][0]["requires_crosscheck"] is True
-    assert not any(item["item_id"].startswith("F") for item in tautological_items)
+    with pytest.raises(KnowledgeError, match="describe the segment"):
+        knowledge_module._hydrate_candidate_draft(tautological_coverage, bank)
 
 
 def test_candidate_contract_discards_valid_non_fact_evidence_id() -> None:
@@ -923,6 +934,8 @@ def test_candidate_and_semantic_prompts_are_hard_capped() -> None:
     bank = caption_evidence().candidate_bank(transcript())
     candidate_prompt = knowledge_module.build_candidate_query_prompt(make_job(), bank)
     assert len(candidate_prompt.encode("utf-8")) <= 32 * 1024
+    assert "standalone claim" in candidate_prompt
+    assert "must not copy" in candidate_prompt
 
     oversized_job = make_job()
     oversized_job["title"] = "x" * (33 * 1024)
@@ -1045,7 +1058,7 @@ def test_candidate_semantic_success_is_human_approval_ready_with_visible_limitat
     assert reviews["items"][0]["approvalReady"] is True
 
 
-def test_tautological_fact_quote_remains_human_crosscheck_required(
+def test_tautological_fact_quote_is_action_required_before_semantic_review(
     tmp_path: Path,
 ) -> None:
     class TautologicalFactRunner(FakeRunner):
@@ -1076,18 +1089,13 @@ def test_tautological_fact_quote_remains_human_crosscheck_required(
         env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
     ).process(limit=1)
 
-    assert report["review_required"] == [JOB_ID]
-    fact = next(
-        claim for claim in queue.job["result"]["draft"]["claims"]
-        if claim["type"] == "fact"
-    )
-    assert fact["requires_crosscheck"] is True
-    semantic_prompt = next(
-        call[3] for call in runner.calls
+    assert report["action_required"] == [JOB_ID]
+    assert queue.job["failure_code"] == "NLM_DRAFT_CONTRACT_INVALID"
+    assert len([
+        call for call in runner.calls
         if call[:2] == ["notebook", "query"]
-        and call[3].startswith("Verdict-only semantic check")
-    )
-    assert '"item_id":"F' not in semantic_prompt
+    ]) == 1
+    assert not (tmp_path / "reviews" / f"{JOB_ID}.json").exists()
 
 
 def test_caption_grounding_rejects_changed_numbers_negation_and_ambiguous_matches() -> None:
