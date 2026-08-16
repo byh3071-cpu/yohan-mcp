@@ -1002,6 +1002,19 @@ def _evidence_tokens(value: str) -> list[str]:
     return [token.casefold() for token in _raw_evidence_tokens(value)]
 
 
+def _statement_is_evidence_fragment(statement: str, quote: str) -> bool:
+    """Reject a claim that is only a contiguous transcript excerpt."""
+    statement_tokens = tuple(_evidence_tokens(statement))
+    quote_tokens = tuple(_evidence_tokens(quote))
+    if not statement_tokens or len(statement_tokens) > len(quote_tokens):
+        return False
+    width = len(statement_tokens)
+    return any(
+        quote_tokens[start : start + width] == statement_tokens
+        for start in range(len(quote_tokens) - width + 1)
+    )
+
+
 _CRITICAL_NUMBER_WORDS = {
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
     "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
@@ -2266,7 +2279,7 @@ def _hydrate_candidate_draft(
             # immutable quote and timestamp.  A quote cannot explain or
             # validate itself, so never admit a tautological transcript
             # fragment into the human review queue.
-            if _evidence_tokens(model_statement) == _evidence_tokens(candidate.quote):
+            if _statement_is_evidence_fragment(model_statement, candidate.quote):
                 raise DraftContractError(
                     "Fact statement must be a standalone claim, not the evidence quote."
                 )
@@ -2304,7 +2317,7 @@ def _hydrate_candidate_draft(
         if candidate.part != part:
             raise DraftContractError("Coverage selected an evidence ID from another part.")
         statement = _contract_text(raw_item.get("statement"), maximum=4_000)
-        if _evidence_tokens(statement) == _evidence_tokens(candidate.quote):
+        if _statement_is_evidence_fragment(statement, candidate.quote):
             raise DraftContractError(
                 "Coverage statement must describe the segment, not repeat the evidence quote."
             )

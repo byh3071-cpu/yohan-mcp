@@ -828,13 +828,35 @@ def test_candidate_contract_rejects_unknown_cross_part_duplicate_and_quote_field
     with pytest.raises(KnowledgeError, match="standalone claim"):
         knowledge_module._hydrate_candidate_draft(punctuation_only, bank)
 
+    fact_fragment = deepcopy(draft)
+    fact_fragment["claims"][0]["statement"] = " ".join(
+        knowledge_module._evidence_tokens(selected_quote)[1:-1]
+    )
+    with pytest.raises(KnowledgeError, match="standalone claim"):
+        knowledge_module._hydrate_candidate_draft(fact_fragment, bank)
+
+    fact_suffix = deepcopy(draft)
+    fact_suffix["claims"][0]["statement"] = " ".join(
+        knowledge_module._evidence_tokens(selected_quote)[1:]
+    )
+    with pytest.raises(KnowledgeError, match="standalone claim"):
+        knowledge_module._hydrate_candidate_draft(fact_suffix, bank)
+
     tautological_coverage = deepcopy(draft)
     start_id = tautological_coverage["coverage"]["start"]["evidence_id"]
-    tautological_coverage["coverage"]["start"]["statement"] = next(
+    start_quote = next(
         item.quote for item in bank if item.candidate_id == start_id
     )
+    tautological_coverage["coverage"]["start"]["statement"] = start_quote
     with pytest.raises(KnowledgeError, match="describe the segment"):
         knowledge_module._hydrate_candidate_draft(tautological_coverage, bank)
+
+    coverage_fragment = deepcopy(draft)
+    coverage_fragment["coverage"]["start"]["statement"] = " ".join(
+        knowledge_module._evidence_tokens(start_quote)[:-1]
+    )
+    with pytest.raises(KnowledgeError, match="describe the segment"):
+        knowledge_module._hydrate_candidate_draft(coverage_fragment, bank)
 
 
 def test_candidate_contract_discards_valid_non_fact_evidence_id() -> None:
@@ -1079,6 +1101,54 @@ def test_tautological_fact_quote_is_action_required_before_semantic_review(
             return super().__call__(args, timeout)
 
     runner = TautologicalFactRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    ).process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert queue.job["failure_code"] == "NLM_DRAFT_CONTRACT_INVALID"
+    assert len([
+        call for call in runner.calls
+        if call[:2] == ["notebook", "query"]
+    ]) == 1
+    assert not (tmp_path / "reviews" / f"{JOB_ID}.json").exists()
+
+
+@pytest.mark.parametrize("target", ["fact", "coverage"])
+def test_transcript_fragment_is_action_required_before_semantic_review(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    class TranscriptFragmentRunner(FakeRunner):
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"] and "EVIDENCE_CANDIDATES=" in args[3]:
+                self.calls.append(args)
+                response = candidate_contract_response(args[3], valid_draft())
+                candidates = json.loads(
+                    next(
+                        line for line in args[3].splitlines()
+                        if line.startswith("EVIDENCE_CANDIDATES=")
+                    ).split("=", 1)[1]
+                )
+                by_id = {item["id"]: item for item in candidates}
+                if target == "fact":
+                    item = next(claim for claim in response["claims"] if claim["type"] == "fact")
+                else:
+                    item = response["coverage"]["start"]
+                quote_tokens = knowledge_module._evidence_tokens(
+                    by_id[item["evidence_id"]]["quote"]
+                )
+                item["statement"] = " ".join(quote_tokens[1:-1])
+                return json.dumps({"answer": json.dumps(response, ensure_ascii=False)})
+            return super().__call__(args, timeout)
+
+    runner = TranscriptFragmentRunner()
     queue = FakeQueue()
     report = KnowledgeService(
         NotebookLmClient(runner),
