@@ -1391,6 +1391,195 @@ def test_new_source_add_fails_closed_without_allowlist_and_positive_limit(
     assert runner.add_calls == 0
 
 
+def test_source_add_partial_success_is_reconciled_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    class PartialSuccessRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.add_calls = 0
+            self.added = False
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["source", "list"]:
+                self.calls.append(args)
+                sources = []
+                if self.added:
+                    sources.append(
+                        {
+                            "id": "source-added-after-error",
+                            "title": VIDEO_URL,
+                            "url": None,
+                            "type": "youtube",
+                            "status": 3,
+                        }
+                    )
+                return json.dumps({"sources": sources})
+            if args[:2] == ["source", "add"]:
+                self.calls.append(args)
+                self.add_calls += 1
+                self.added = True
+                raise knowledge_module.NotebookLmCommandError(
+                    "NLM_PROCESSING_FAILED",
+                    "NotebookLM source add returned an error after creating the source.",
+                )
+            return super().__call__(args, timeout)
+
+    runner = PartialSuccessRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={
+            "KNOWLEDGE_NOTEBOOK_DEFAULT_ID": "nb1",
+            "KNOWLEDGE_NOTEBOOK_ALLOWLIST": '["nb1"]',
+            "KNOWLEDGE_NOTEBOOK_SOURCE_LIMIT": "100",
+            "KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1",
+        },
+    ).process(limit=1)
+
+    assert report["review_required"] == [JOB_ID]
+    assert report["action_required"] == []
+    assert runner.add_calls == 1
+    assert queue.job["notebook_id"] == "nb1"
+    assert queue.job["notebook_source_id"] == "source-added-after-error"
+
+
+def test_source_add_error_without_exact_reconciliation_never_readds(
+    tmp_path: Path,
+) -> None:
+    class UncertainAddRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.add_calls = 0
+            self.added = False
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["source", "list"]:
+                self.calls.append(args)
+                sources = []
+                if self.added:
+                    sources.append(
+                        {
+                            "id": "source-without-url-after-error",
+                            "title": "Unresolved YouTube source",
+                            "url": None,
+                            "type": "youtube",
+                            "status": 2,
+                        }
+                    )
+                return json.dumps({"sources": sources})
+            if args[:2] == ["source", "add"]:
+                self.calls.append(args)
+                self.add_calls += 1
+                self.added = True
+                raise knowledge_module.NotebookLmCommandError(
+                    "NLM_PROCESSING_FAILED",
+                    "NotebookLM source add outcome is unknown.",
+                )
+            return super().__call__(args, timeout)
+
+    runner = UncertainAddRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={
+            "KNOWLEDGE_NOTEBOOK_DEFAULT_ID": "nb1",
+            "KNOWLEDGE_NOTEBOOK_ALLOWLIST": '["nb1"]',
+            "KNOWLEDGE_NOTEBOOK_SOURCE_LIMIT": "100",
+            "KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1",
+        },
+    ).process(limit=1)
+
+    assert report["review_required"] == []
+    assert report["action_required"] == [JOB_ID]
+    assert runner.add_calls == 1
+    assert queue.job["failure_code"] == "NOTEBOOKLM_SOURCE_IDENTITY_REQUIRED"
+    assert queue.job.get("notebook_source_id") is None
+
+
+def test_source_add_error_without_side_effect_preserves_original_failure(
+    tmp_path: Path,
+) -> None:
+    class NoMutationRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.add_calls = 0
+
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["source", "list"]:
+                self.calls.append(args)
+                return json.dumps({"sources": []})
+            if args[:2] == ["source", "add"]:
+                self.calls.append(args)
+                self.add_calls += 1
+                raise knowledge_module.NotebookLmCommandError(
+                    "NOTEBOOKLM_AUTH_REQUIRED",
+                    "NotebookLM authentication is required.",
+                )
+            return super().__call__(args, timeout)
+
+    runner = NoMutationRunner()
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(runner),
+        NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        caption_provider=FakeCaptionProvider(),
+        env={
+            "KNOWLEDGE_NOTEBOOK_DEFAULT_ID": "nb1",
+            "KNOWLEDGE_NOTEBOOK_ALLOWLIST": '["nb1"]',
+            "KNOWLEDGE_NOTEBOOK_SOURCE_LIMIT": "100",
+            "KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1",
+        },
+    ).process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert runner.add_calls == 1
+    assert queue.job["failure_code"] == "NOTEBOOKLM_AUTH_REQUIRED"
+
+
+def test_source_identity_is_checkpointed_before_registry_append(
+    tmp_path: Path,
+) -> None:
+    class EmptyRunner(FakeRunner):
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["source", "list"]:
+                self.calls.append(args)
+                return json.dumps({"sources": []})
+            return super().__call__(args, timeout)
+
+    class FailingAppendRegistry(NotebookRegistry):
+        def append(self, source: SourceInfo) -> None:
+            del source
+            raise OSError("registry write failed")
+
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(EmptyRunner()),
+        FailingAppendRegistry(tmp_path / "registry.json"),
+        queue=queue,
+        caption_provider=FakeCaptionProvider(),
+        env={
+            "KNOWLEDGE_NOTEBOOK_DEFAULT_ID": "nb1",
+            "KNOWLEDGE_NOTEBOOK_ALLOWLIST": '["nb1"]',
+            "KNOWLEDGE_NOTEBOOK_SOURCE_LIMIT": "100",
+            "KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1",
+        },
+    ).process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert queue.job["notebook_id"] == "nb1"
+    assert queue.job["notebook_source_id"] == "source-added"
+
+
 def test_checkpointed_source_is_reused_and_never_readded(tmp_path: Path) -> None:
     job = make_job()
     job.update({"notebook_id": "nb1", "notebook_source_id": "source-nb1"})

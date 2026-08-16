@@ -3215,6 +3215,62 @@ class KnowledgeService:
         report, _, _ = self._doctor_snapshot(job_id)
         return report
 
+    def _reconcile_failed_source_add(
+        self,
+        *,
+        notebook_id: str,
+        source_url: str,
+        before: RegistrySnapshot,
+        add_error: KnowledgeError,
+    ) -> SourceInfo:
+        """Resolve an add command that may have mutated NotebookLM before failing."""
+        before_ids = {
+            (source.notebook_id, source.source_id)
+            for source in before.sources
+        }
+        try:
+            after = self.registry.refresh(self.notebooklm)
+        except Exception as refresh_error:
+            raise KnowledgeError(
+                "manual source identity confirmation required: "
+                "NotebookLM source add failed and its side effect could not be checked"
+            ) from refresh_error
+
+        exact_matches = [
+            source
+            for source in self.registry.find(source_url)
+            if source.notebook_id == notebook_id
+        ]
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+
+        new_target_sources = [
+            source
+            for source in after.sources
+            if source.notebook_id == notebook_id
+            and (source.notebook_id, source.source_id) not in before_ids
+        ]
+        expected_video_id = youtube_video_id(source_url)
+        exact_new_title_matches = [
+            source
+            for source in new_target_sources
+            if source.source_type.casefold() == "youtube"
+            and expected_video_id is not None
+            and youtube_video_id(source.title) == expected_video_id
+        ]
+        if len(exact_new_title_matches) == 1:
+            # NotebookLM can expose a newly added YouTube source with
+            # ``url=null`` and the submitted URL as its temporary title.  The
+            # before/after source-id delta plus the exact video id makes this
+            # recovery deterministic without trusting an arbitrary title.
+            return exact_new_title_matches[0]
+        if exact_matches or new_target_sources:
+            raise KnowledgeError(
+                "manual source identity confirmation required: "
+                "NotebookLM source add had an ambiguous partial side effect"
+            ) from add_error
+        raise add_error
+
     def process(
         self,
         limit: int = MAX_BATCH,
@@ -3285,6 +3341,7 @@ class KnowledgeService:
             job = claimed
             source_id: str | None = str(job.get("notebook_source_id") or "") or None
             notebook_id: str | None = str(job.get("notebook_id") or "") or None
+            pending_registry_source: SourceInfo | None = None
             try:
                 job = queue.checkpoint(job)
                 source_url = str(job.get("source_url") or "")
@@ -3384,11 +3441,26 @@ class KnowledgeService:
                                 f"NotebookLM source limit 80% reached ({current_count}/{source_limit}). "
                                 "Notebook rotation approval is required."
                             )
-                        source_id = self.notebooklm.add_youtube_source(notebook_id, source_url)
-                        notebook_name = notebook_id
-                        source_added_at = isoformat(utc_now())
-                        self.registry.append(
-                            SourceInfo(
+                        try:
+                            source_id = self.notebooklm.add_youtube_source(notebook_id, source_url)
+                        except KnowledgeError as add_error:
+                            recovered = self._reconcile_failed_source_add(
+                                notebook_id=notebook_id,
+                                source_url=source_url,
+                                before=snapshot,
+                                add_error=add_error,
+                            )
+                            source_id = recovered.source_id
+                            notebook_name = recovered.notebook_name
+                            source_added_at = (
+                                recovered.first_seen_at
+                                or recovered.checked_at
+                                or isoformat(utc_now())
+                            )
+                        else:
+                            notebook_name = notebook_id
+                            source_added_at = isoformat(utc_now())
+                            pending_registry_source = SourceInfo(
                                 notebook_id,
                                 notebook_name,
                                 source_id,
@@ -3399,14 +3471,15 @@ class KnowledgeService:
                                 status=2,
                                 source_type="youtube",
                             )
-                        )
-                job = queue.checkpoint(
-                    job,
-                    notebook_id=notebook_id,
-                    notebook_name=notebook_name,
-                    notebook_source_id=source_id,
-                    notebook_source_added_at=source_added_at,
-                )
+                    job = queue.checkpoint(
+                        job,
+                        notebook_id=notebook_id,
+                        notebook_name=notebook_name,
+                        notebook_source_id=source_id,
+                        notebook_source_added_at=source_added_at,
+                    )
+                    if pending_registry_source is not None:
+                        self.registry.append(pending_registry_source)
                 content = self.notebooklm.get_source(source_id)
                 source_hash = sha256_text(content)
                 self.review_store.write_source_text(str(job.get("id") or ""), content)
