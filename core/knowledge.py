@@ -1002,6 +1002,19 @@ def _evidence_tokens(value: str) -> list[str]:
     return [token.casefold() for token in _raw_evidence_tokens(value)]
 
 
+def _statement_is_evidence_fragment(statement: str, quote: str) -> bool:
+    """Reject a claim that is only a contiguous transcript excerpt."""
+    statement_tokens = tuple(_evidence_tokens(statement))
+    quote_tokens = tuple(_evidence_tokens(quote))
+    if not statement_tokens or len(statement_tokens) > len(quote_tokens):
+        return False
+    width = len(statement_tokens)
+    return any(
+        quote_tokens[start : start + width] == statement_tokens
+        for start in range(len(quote_tokens) - width + 1)
+    )
+
+
 _CRITICAL_NUMBER_WORDS = {
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
     "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
@@ -2262,21 +2275,20 @@ def _hydrate_candidate_draft(
             if candidate_id in fact_candidate_ids:
                 raise DraftContractError("Fact claims contain a duplicate evidence ID conflict.")
             model_statement = claim["statement"]
-            # The model chooses evidence; the system owns factual wording.
-            # Discard every model-added detail and persist only the verified quote.
-            claim["statement"] = candidate.quote
+            # The model proposes a standalone claim while the system owns the
+            # immutable quote and timestamp.  A quote cannot explain or
+            # validate itself, so never admit a tautological transcript
+            # fragment into the human review queue.
+            if _statement_is_evidence_fragment(model_statement, candidate.quote):
+                raise DraftContractError(
+                    "Fact statement must be a standalone claim, not the evidence quote."
+                )
             fact_candidate_ids.add(candidate_id)
             claim["evidence_quote"] = candidate.quote
-            # A quote cannot meaningfully validate itself. Preserve the model's
-            # non-persisted statement only for semantic comparison, and leave a
-            # tautological fact marked for human cross-check.
-            if _canonical_evidence_lexemes(model_statement) != _canonical_evidence_lexemes(
-                candidate.quote
-            ):
-                selected.append({
-                    "item_id": f"F{index:02d}", "candidate_id": candidate_id,
-                    "quote": candidate.quote, "statement": model_statement,
-                })
+            selected.append({
+                "item_id": f"F{index:02d}", "candidate_id": candidate_id,
+                "quote": candidate.quote, "statement": model_statement,
+            })
         elif candidate_id is not None:
             # NotebookLM occasionally attaches one of the supplied candidate
             # IDs to an interpretation or recommendation even though the
@@ -2305,6 +2317,10 @@ def _hydrate_candidate_draft(
         if candidate.part != part:
             raise DraftContractError("Coverage selected an evidence ID from another part.")
         statement = _contract_text(raw_item.get("statement"), maximum=4_000)
+        if _statement_is_evidence_fragment(statement, candidate.quote):
+            raise DraftContractError(
+                "Coverage statement must describe the segment, not repeat the evidence quote."
+            )
         hydrated_coverage[part] = {"statement": statement, "evidence_quote": candidate.quote}
         selected.append({
             "item_id": f"C{part.upper()}", "candidate_id": candidate_id,
@@ -2630,8 +2646,10 @@ def build_candidate_query_prompt(
         "Each evidence_id must be exactly one four-character ID such as CS01; never output multiple IDs, lists, commas, spaces, or explanations in evidence_id.",
         "Interpretation and recommendation claims must omit evidence_id.",
         "Never output evidence_quote, caption_quote, citation, or an unknown ID.",
-        "Every fact statement must copy the selected evidence candidate quote exactly, without paraphrasing or adding any detail.",
+        "Every fact statement must be a concise, complete, standalone claim directly supported by the selected evidence candidate.",
+        "Do not copy, lightly restate, or continue the evidence quote as a fact statement. The system attaches the immutable quote and timestamp.",
         "Put broader analysis only in interpretation or recommendation claims.",
+        "Every coverage statement must describe what happens in that video third and must not copy the selected evidence quote.",
         "Coverage start/middle/end may select only CS/CM/CE IDs respectively.",
         "The system owns review flags. Do not output requires_crosscheck. Return one JSON object only.",
         f"EVIDENCE_CANDIDATES={payload}",
@@ -2649,7 +2667,8 @@ def build_semantic_evaluator_prompt(items: tuple[dict[str, str], ...]) -> str:
     }
     prompt = "\n".join((
         "Verdict-only semantic check for immutable evidence. Do not rewrite any field.",
-        "Return exact JSON only. Mark supported=false unless the quote directly supports the statement.",
+        "Return exact JSON only. Mark supported=false unless the quote directly supports the complete standalone statement.",
+        "A fragment, tautology, or statement that merely copies or lightly restates the quote is unsupported.",
         f"ITEMS={json.dumps([dict(item) for item in items], ensure_ascii=False, separators=(',', ':'))}",
         json.dumps(skeleton, ensure_ascii=False, separators=(",", ":")),
     ))
