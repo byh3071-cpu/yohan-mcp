@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import uuid
+from pathlib import Path
 
 from qdrant_client import AsyncQdrantClient, models
 
@@ -86,8 +87,12 @@ def load_type_weights() -> dict[str, float]:
 class QdrantAdapter(BackendAdapter):
     name = "qdrant"
 
-    def __init__(self, client=None, url: str | None = None, collection: str | None = None, embedder=None) -> None:
+    def __init__(self, client=None, url: str | None = None, collection: str | None = None, embedder=None, path: str | None = None) -> None:
         self.url = url if url is not None else os.getenv("QDRANT_URL")
+        # QDRANT_PATH = Docker 없이 영속하는 내장 로컬 모드(qdrant-client 가 파일에 직접 쓴다).
+        # 명시 설정이므로 QDRANT_URL 보다 **우선** — 서버를 안 띄우기로 한 기계에서 예전
+        # .env 의 QDRANT_URL 이 남아 연결 실패로 회수 0 이 되는 사고를 막는다.
+        self.path = path if path is not None else os.getenv("QDRANT_PATH")
         self.collection = collection or os.getenv("QDRANT_COLLECTION", COLLECTION)
         # 검색 대상 = 쓰기 컬렉션(레거시 호환) + 관제탑 4컬렉션 + brain 2컬렉션(brain_memory·
         # ontology_triples), 이 기본 목록은 env 유무와 무관하게 항상 유지한다. env
@@ -119,7 +124,12 @@ class QdrantAdapter(BackendAdapter):
 
     def _get_client(self) -> AsyncQdrantClient:
         if self._client is None:
-            if self.url:
+            if self.path:
+                # 내장 로컬 모드 — Docker 불필요, 디스크 영속. 단일 프로세스 전용(파일 락)이라
+                # MCP 서버와 시딩 스크립트를 **동시에** 띄우면 뒤쪽이 락에서 막힌다(순차 실행).
+                Path(self.path).mkdir(parents=True, exist_ok=True)
+                self._client = AsyncQdrantClient(path=self.path)
+            elif self.url:
                 self._client = AsyncQdrantClient(url=self.url)
             else:
                 # Docker/서버 없으면 임베디드 메모리 모드 (휘발성, 데모/테스트용)
@@ -304,7 +314,7 @@ class QdrantAdapter(BackendAdapter):
                             dims.add(d)
             except Exception as exc:
                 return health(False, t.elapsed_ms, f"Qdrant 연결 실패: {type(exc).__name__}: {exc}")
-            mode = self.url or ":memory:"
+            mode = f"local:{self.path}" if self.path else (self.url or ":memory:")
             if not counts:
                 return health(False, t.elapsed_ms, f"Qdrant [{mode}] 검색 컬렉션 없음 — 시딩 필요 ({', '.join(self.search_collections)})")
             total = sum(counts.values())

@@ -14,11 +14,15 @@ ollama 가 죽었거나 모델 미설치면 hash(dim 384)로 graceful 폴백한�
 """
 from __future__ import annotations
 
+import atexit
 import hashlib
 import logging
 import math
 import os
 import re
+import shutil
+import subprocess
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +119,103 @@ def _ollama_timeout(default: float = 60.0) -> float:
     return timeout
 
 
+# ── ollama 온디맨드 기동 ─────────────────────────────────────────
+# 상주 금지 정책: ollama 를 부팅 자동시작에 두지 않는다. 임베딩이 실제로 필요해진
+# 순간에만 `ollama serve` 를 띄우고, **우리가 띄운 것만** 인터프리터 종료 시 함께
+# 내린다(사용자가 손수 켜 둔 서버는 남의 것이므로 건드리지 않는다).
+# env OLLAMA_AUTOSTART=0 으로 이 자동 기동을 끌 수 있다.
+_spawned: subprocess.Popen | None = None
+
+
+def _ollama_alive(url: str, timeout: float = 1.5) -> bool:
+    """서버 생존 확인 — 모델 로딩과 무관한 가벼운 엔드포인트로 찌른다."""
+    import httpx  # lazy
+
+    try:
+        return httpx.get(f"{url}/api/version", timeout=timeout).status_code == 200
+    except Exception:
+        return False
+
+
+def _find_ollama_exe() -> str | None:
+    """ollama 실행파일 위치. PATH → env OLLAMA_EXE → OS 기본 설치 경로 순.
+
+    설치 직후에는 갱신된 PATH 가 이미 떠 있는 프로세스(MCP 서버 등)에 반영되지 않아
+    which 가 빈손으로 돌아온다. 기본 설치 경로까지 뒤져야 재로그인 없이 첫 기동이 된다.
+    """
+    if exe := os.getenv("OLLAMA_EXE"):
+        return exe if os.path.isfile(exe) else None
+    if found := shutil.which("ollama"):
+        return found
+    local = os.getenv("LOCALAPPDATA") or ""
+    candidates = [
+        os.path.join(local, "Programs", "Ollama", "ollama.exe") if local else "",
+        r"C:\Program Files\Ollama\ollama.exe",
+        "/usr/local/bin/ollama",
+        "/opt/homebrew/bin/ollama",
+        "/usr/bin/ollama",
+    ]
+    return next((c for c in candidates if c and os.path.isfile(c)), None)
+
+
+def _stop_spawned() -> None:
+    """우리가 띄운 ollama 만 종료 — 상주 금지 정책의 마무리."""
+    global _spawned
+    proc, _spawned = _spawned, None
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            logger.debug("ollama 종료 실패(무시)", exc_info=True)
+
+
+def ensure_ollama_server(url: str, wait_s: float | None = None) -> bool:
+    """ollama 가 떠 있으면 True. 없으면 백그라운드로 띄우고 응답할 때까지 기다린다.
+
+    콜드 스타트(첫 질의)에서만 수 초가 들고 이후 요청은 즉시 처리된다. 실패해도
+    예외를 내지 않는다 — 호출자(OllamaEmbedder 생성자)가 hash 로 폴백하기 때문.
+    """
+    global _spawned
+    if _ollama_alive(url):
+        return True
+    if (os.getenv("OLLAMA_AUTOSTART", "1") or "").strip().lower() in ("0", "false", "no"):
+        return False
+    if _spawned is None or _spawned.poll() is not None:
+        exe = _find_ollama_exe()
+        if not exe:
+            logger.warning("ollama 실행파일을 못 찾음(PATH/OLLAMA_EXE/기본경로) — 자동 기동 생략")
+            return False
+        flags = 0
+        if os.name == "nt":
+            # 콘솔 창을 띄우지 않고, 부모의 Ctrl+C 시그널 그룹과 분리해 기동
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        _spawned = subprocess.Popen(
+            [exe, "serve"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        atexit.register(_stop_spawned)
+        logger.info("ollama 온디맨드 기동 (pid=%s)", _spawned.pid)
+    deadline = time.monotonic() + (
+        wait_s if wait_s is not None else float(os.getenv("OLLAMA_START_TIMEOUT", "30"))
+    )
+    while time.monotonic() < deadline:
+        if _ollama_alive(url):
+            return True
+        time.sleep(0.4)
+    logger.warning("ollama 기동 대기 초과 — hash 폴백 예정")
+    return False
+
+
 class OllamaEmbedder:
     """로컬 ollama 서버 임베딩 (REST /api/embed, 모델 기본 bge-m3).
 
@@ -137,12 +238,21 @@ class OllamaEmbedder:
         self.url = (url if url is not None else os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip("/")
         # 첫 호출은 모델 로딩이 끼어 느릴 수 있어 타임아웃을 넉넉히 (env OLLAMA_TIMEOUT 조절).
         self._client = client or httpx.Client(base_url=self.url, timeout=_ollama_timeout())
+        # 상주 금지 — 서버가 꺼져 있으면 이 시점에 띄운다(실패해도 아래 dim 실측이
+        # 예외를 내 get_embedder 가 hash 로 폴백하므로 여기서 막지 않는다).
+        if client is None:
+            ensure_ollama_server(self.url)
         # dim 실측 — 모델 미설치면 여기서 예외가 나 폴백을 유도한다
         self.dim = len(self._embed_batch(["dim probe"])[0])
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         """ollama /api/embed (배치 input 지원). 실패 시 명확한 예외."""
-        resp = self._client.post("/api/embed", json={"model": self.model_name, "input": list(texts)})
+        payload: dict = {"model": self.model_name, "input": list(texts)}
+        # 유휴 시 모델을 VRAM/RAM 에서 내리는 시간. 상주 금지 정책이라 env 로 조절한다
+        # (시딩처럼 연속 호출이 이어지는 구간은 길게, 평상시 단발 질의는 짧게).
+        if ka := os.getenv("OLLAMA_KEEP_ALIVE"):
+            payload["keep_alive"] = ka
+        resp = self._client.post("/api/embed", json=payload)
         resp.raise_for_status()
         body = resp.json()
         if "error" in body:
