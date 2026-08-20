@@ -141,18 +141,56 @@ def _assert_ollama_embedder(embedder, allow_fallback: bool) -> None:
     )
 
 
+# ── 벡터 색인 전용 확장 소스 ──────────────────────────────────────
+# memory_adapter 의 _BRAIN_KNOWLEDGE_DIRS 에서 core 를 뺀 판단("회수 노이즈·config 중복")은
+# **substring 회수 기준에선 여전히 맞다** — 문자열이 걸리기만 하면 무조건 결과에 오르니
+# config 파일이 노이즈가 된다. 반면 벡터 회수는 유사도 순위라 저관련 문서가 위로 안 올라온다.
+# 그래서 공유 allowlist 는 건드리지 않고, 확장은 이 시딩 스크립트(벡터 경로) 안에서만 한다.
+# 결과적으로 두 경로의 대상이 갈라지므로 아래 목록이 벡터 색인 범위의 SoT 다.
+_VECTOR_EXTRA_MD_DIRS = ("core",)  # core/*.md — anti-patterns·az-protocol 등 규범 문서
+_VECTOR_STATE_YAML = ("active-project.yaml", "profile.yaml", "soul.yaml")  # memory/ 루트
+_VECTOR_YAML_DIRS = ("core",)  # core/*.yaml — roster·ruleset·projects 등 상태 정본
+
+# yaml 선두 주석(`# 현재 집중 중인 작업`)이 md 헤딩으로 파싱돼 13자짜리 껍데기 청크가
+# 생긴다(active-project.yaml 실측). 임베딩 비용만 먹고 회수 가치는 0이라 버린다.
+# 실측상 yaml 의 유효 청크는 최소 500자대라 80 은 껍데기만 걸러내는 안전한 하한이다.
+_MIN_YAML_CHUNK_CHARS = 80
+
+
 # ── memory 서브커맨드 ────────────────────────────────────────────
-def _iter_brain_md_files(base: Path):
-    """allowlist 6폴더의 .md 를 정렬 순회 — memory_adapter._iter_all 과 동일 폴더 규약 공유."""
+def _iter_brain_source_files(base: Path):
+    """벡터 색인 대상을 정렬 순회 — allowlist .md + core/*.md + 상태·core *.yaml.
+
+    yield 하는 kdir 은 payload 의 `type: brain:<kdir>` 로 그대로 쓰인다.
+    루트 yaml 은 폴더 순회가 아니라 **파일명 명시**로 집는다 — memory/ 루트를 전수
+    순회하면 나중에 생기는 임시·산출물 yaml 까지 조용히 색인에 섞이기 때문이다.
+    """
     base_resolved = base.resolve()
-    for kdir in _BRAIN_KNOWLEDGE_DIRS:
+
+    def _inside(p: Path) -> bool:
+        # 경로 봉쇄(심링크 등으로 base 밖 탈출 차단)
+        return p.resolve().is_relative_to(base_resolved)
+
+    for kdir in (*_BRAIN_KNOWLEDGE_DIRS, *_VECTOR_EXTRA_MD_DIRS):
         root = base / kdir
         if not root.exists():
             continue
         for p in sorted(root.rglob("*.md")):
-            if not p.resolve().is_relative_to(base_resolved):
-                continue
-            yield kdir, p
+            if _inside(p):
+                yield kdir, p
+
+    for name in _VECTOR_STATE_YAML:
+        p = base / name
+        if p.exists() and _inside(p):
+            yield "state", p
+
+    for kdir in _VECTOR_YAML_DIRS:
+        root = base / kdir
+        if not root.exists():
+            continue
+        for p in sorted(root.glob("*.yaml")):  # rglob 아님 — core/ 바로 아래만
+            if _inside(p):
+                yield kdir, p
 
 
 def _title_of(rel_path: str, fm: dict) -> str:
@@ -247,13 +285,15 @@ async def seed_memory(
         if manifest_path is not None:
             print(f"{'전량(--full)' if full else '증분'} 시딩 — 매니페스트 {manifest_path} (기존 {len(known)}건)")
 
-        all_files = list(_iter_brain_md_files(base))
+        all_files = list(_iter_brain_source_files(base))
         files = all_files[offset:]
         if limit:
             files = files[:limit]
+        md_dirs = ", ".join((*_BRAIN_KNOWLEDGE_DIRS, *_VECTOR_EXTRA_MD_DIRS))
         print(
             f"대상 파일: {len(files)}건(전체 {len(all_files)}건 중 offset={offset}) "
-            f"(allowlist: {', '.join(_BRAIN_KNOWLEDGE_DIRS)})"
+            f"(md: {md_dirs} / yaml: {', '.join(_VECTOR_STATE_YAML)}, "
+            f"{'·'.join(f'{d}/*.yaml' for d in _VECTOR_YAML_DIRS)})"
         )
         # 삭제 감지는 슬라이스 전 디스크 전수 기준 — limit/offset 분할 실행이 삭제로 오인되지 않게.
         disk_rels = {str(p.relative_to(base)).replace("\\", "/") for _, p in all_files}
@@ -311,15 +351,34 @@ async def seed_memory(
             if not full and prev is not None and prev.get("sha256") == sha:
                 n_unchanged += 1  # hash 불변 — 임베딩/upsert 없이 스킵(U8)
                 continue
-            rec = MemoryAdapter._read_md_uncapped(path)
-            if rec is None:
-                skipped_files += 1
-                print(f"  스킵 [{i}/{len(files)}] {path}: 읽기 실패")
-                continue
-            body = rec.get("body", "")
-            title = _title_of(rel, rec)
-            base_line = int(rec.get("_body_start_line", 1))
+            is_yaml = path.suffix in (".yaml", ".yml")
+            if is_yaml:
+                # yaml 엔 frontmatter 가 없다 — 파일 전체가 본문이고 줄 오프셋도 없다(base_line=1).
+                # utf-8-sig — 이 PC 도구체인이 BOM 을 붙이는 경우가 있어 ﻿ 가 본문 선두에
+                # 섞이면 첫 청크 임베딩이 오염된다. BOM 이 없으면 utf-8 과 동일 동작.
+                try:
+                    body = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    skipped_files += 1
+                    print(f"  스킵 [{i}/{len(files)}] {path}: UTF-8 디코드 실패")
+                    continue
+                title = path.stem
+                base_line = 1
+            else:
+                rec = MemoryAdapter._read_md_uncapped(path)
+                if rec is None:
+                    skipped_files += 1
+                    print(f"  스킵 [{i}/{len(files)}] {path}: 읽기 실패")
+                    continue
+                body = rec.get("body", "")
+                title = _title_of(rel, rec)
+                base_line = int(rec.get("_body_start_line", 1))
             chunks = chunk_markdown(_blank_source_footers(body), base_line=base_line)
+            if is_yaml:
+                # 껍데기 청크 제거(_MIN_YAML_CHUNK_CHARS 주석 참조).
+                # md 경로엔 적용하지 않는다 — 기존 청크 수가 바뀌면 매니페스트가 전부
+                # "축소된 파일"로 잡혀 stale 보고가 무의미하게 폭발한다.
+                chunks = [c for c in chunks if len(c.text.strip()) >= _MIN_YAML_CHUNK_CHARS]
             if prev is None:
                 n_new += 1
             else:
