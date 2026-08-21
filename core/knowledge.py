@@ -135,6 +135,18 @@ class EvidenceGroundingError(KnowledgeError):
 class SemanticEvidenceError(KnowledgeError):
     """The verdict-only semantic pass rejected immutable candidate evidence."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        unsupported_ids: tuple[str, ...] = (),
+        evaluated: int = 0,
+    ) -> None:
+        super().__init__(message)
+        # 어느 근거 항목이 떨어졌는지 남긴다. 이 값이 없으면 실패 원인을 매번 처음부터 다시 파야 한다.
+        self.unsupported_ids = unsupported_ids
+        self.evaluated = evaluated
+
 
 class DraftContractError(EvidenceGroundingError):
     """A model draft violated the strict persistence allowlist."""
@@ -2711,8 +2723,13 @@ def validate_semantic_verdict(raw: str, expected: tuple[dict[str, str], ...]) ->
         observed[item_id] = supported
     if set(observed) != set(expected_ids) or len(observed) != len(expected_ids):
         raise SemanticEvidenceError("Semantic evaluator items are missing or extra.")
-    if not all(observed[item_id] for item_id in expected_ids):
-        raise SemanticEvidenceError("Semantic evaluator did not support every evidence item.")
+    unsupported = tuple(item_id for item_id in expected_ids if not observed[item_id])
+    if unsupported:
+        raise SemanticEvidenceError(
+            "Semantic evaluator did not support every evidence item.",
+            unsupported_ids=unsupported,
+            evaluated=len(expected_ids),
+        )
 
 
 def build_format_retry_prompt(prompt: str) -> str:
@@ -3666,10 +3683,22 @@ class KnowledgeService:
             except Exception as error:  # boundary: every claimed row must leave a clear state
                 try:
                     failure_code = processing_failure_code(error)
+                    failure_result: dict[str, Any] = {
+                        "notebook_id": notebook_id,
+                        "notebook_source_id": source_id,
+                    }
+                    # 어느 근거 항목이 떨어졌는지 남긴다. 원문·인용구는 넣지 않고 항목 ID만 남긴다.
+                    unsupported_ids = getattr(error, "unsupported_ids", ())
+                    if unsupported_ids:
+                        failure_result["semantic_unsupported"] = {
+                            "item_ids": list(unsupported_ids),
+                            "unsupported": len(unsupported_ids),
+                            "evaluated": int(getattr(error, "evaluated", 0)),
+                        }
                     queue.complete(
                         job,
                         "action_required",
-                        result={"notebook_id": notebook_id, "notebook_source_id": source_id},
+                        result=failure_result,
                         failure_code=failure_code,
                         failure_message=safe_error(error),
                     )
