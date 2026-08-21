@@ -232,6 +232,61 @@ def test_semantic_verdict_rejects_prose_wrong_fence_and_multiple_fences(raw: str
         knowledge_module.validate_semantic_verdict(raw, expected)
 
 
+def test_semantic_verdict_reports_which_items_were_unsupported() -> None:
+    expected = (
+        {
+            "item_id": "F01",
+            "candidate_id": "CS01",
+            "quote": "eight grounded words remain immutable for this semantic evidence check",
+            "statement": "The quote supports the statement.",
+        },
+        {
+            "item_id": "F02",
+            "candidate_id": "CS02",
+            "quote": "another eight grounded words remain immutable for this semantic check",
+            "statement": "The second quote supports the statement.",
+        },
+        {
+            "item_id": "CSTART",
+            "candidate_id": "CS03",
+            "quote": "opening eight grounded words remain immutable for this semantic check",
+            "statement": "The opening segment is described.",
+        },
+    )
+    verdict = {
+        "contract_version": "notebooklm-semantic-verdict-v1",
+        "items": [
+            {"id": "F01", "supported": True},
+            {"id": "F02", "supported": False},
+            {"id": "CSTART", "supported": False},
+        ],
+    }
+
+    with pytest.raises(knowledge_module.SemanticEvidenceError) as raised:
+        knowledge_module.validate_semantic_verdict(json.dumps(verdict), expected)
+
+    # 실패한 항목만, 물어본 순서대로 남아야 원인을 되짚을 수 있다.
+    assert raised.value.unsupported_ids == ("F02", "CSTART")
+    assert raised.value.evaluated == 3
+
+
+def test_semantic_verdict_shape_errors_carry_no_item_diagnostics() -> None:
+    expected = (
+        {
+            "item_id": "F01",
+            "candidate_id": "CS01",
+            "quote": "eight grounded words remain immutable for this semantic evidence check",
+            "statement": "The quote supports the statement.",
+        },
+    )
+
+    with pytest.raises(knowledge_module.SemanticEvidenceError) as raised:
+        knowledge_module.validate_semantic_verdict("not json at all", expected)
+
+    assert raised.value.unsupported_ids == ()
+    assert raised.value.evaluated == 0
+
+
 class FakeCaptionProvider:
     def __init__(
         self,
@@ -1053,6 +1108,61 @@ def test_semantic_verdict_failures_are_action_required_without_retry(
     assert queue.job["failure_code"] == "NLM_EVIDENCE_NOT_SUPPORTED"
     assert runner.query_calls == 2
     assert not (tmp_path / "reviews" / f"{JOB_ID}.json").exists()
+
+
+def test_unsupported_evidence_items_are_recorded_on_the_failed_job(tmp_path: Path) -> None:
+    class VerdictRunner(FakeRunner):
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"]:
+                prompt = args[3]
+                if prompt.startswith("Verdict-only semantic check"):
+                    self.calls.append(args)
+                    return json.dumps(
+                        {"answer": json.dumps(semantic_verdict_response(prompt, supported=False))}
+                    )
+            return super().__call__(args, timeout)
+
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(VerdictRunner()), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    ).process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    # 실패한 작업에 어느 항목이 떨어졌는지 남아야 다음 세션이 처음부터 다시 파지 않는다.
+    diagnostics = queue.job["result"]["semantic_unsupported"]
+    assert diagnostics["item_ids"]
+    assert diagnostics["unsupported"] == len(diagnostics["item_ids"])
+    assert diagnostics["evaluated"] == diagnostics["unsupported"]
+    # 인용구·원문은 남기지 않는다.
+    assert all(
+        isinstance(item_id, str) and len(item_id) <= 16 for item_id in diagnostics["item_ids"]
+    )
+
+
+def test_shape_failures_record_no_semantic_diagnostics(tmp_path: Path) -> None:
+    class MalformedRunner(FakeRunner):
+        def __call__(self, args: list[str], timeout: int) -> str:
+            if args[:2] == ["notebook", "query"]:
+                prompt = args[3]
+                if prompt.startswith("Verdict-only semantic check"):
+                    self.calls.append(args)
+                    return json.dumps({"answer": "not json"})
+            return super().__call__(args, timeout)
+
+    queue = FakeQueue()
+    report = KnowledgeService(
+        NotebookLmClient(MalformedRunner()), NotebookRegistry(tmp_path / "registry.json"),
+        queue=queue, review_store=ReviewStore(tmp_path / "reviews"),
+        caption_provider=FakeCaptionProvider(),
+        env={"KNOWLEDGE_ALLOW_EXTERNAL_TRANSCRIPT_FETCH": "1"},
+    ).process(limit=1)
+
+    assert report["action_required"] == [JOB_ID]
+    assert queue.job["failure_code"] == "NLM_EVIDENCE_NOT_SUPPORTED"
+    assert "semantic_unsupported" not in queue.job["result"]
 
 
 def test_candidate_semantic_success_is_human_approval_ready_with_visible_limitation(
