@@ -36,8 +36,6 @@ _SPECIAL_ALIASES: dict[str, tuple[str, ...]] = {
     "yohan-brain": ("yohan-brain", "yohan brain", "요한 브레인"),
     "yohan-mcp": ("yohan-mcp", "yohan mcp", "요한 mcp"),
 }
-_ASCII_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+")
-_UPPER_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]{2,}(?![A-Za-z0-9])")
 
 
 @dataclass(frozen=True)
@@ -65,6 +63,132 @@ class ResolvedContext:
     max_matches: int
     char_budget: int
     supplemental_result: dict | None = None
+
+
+@dataclass(frozen=True)
+class RetrievalReceipt:
+    """Volatile, read-only evidence receipt returned by ``get_context``.
+
+    This is candidate-retrieval telemetry, not a domain decision, evaluation or
+    learning record.  The MCP server never persists it.
+    """
+
+    index_revision: str | None
+    index_fresh: bool | None
+    freshness_reason_code: str | None
+    recognized_entities: list[dict]
+    sources_attempted: list[str]
+    sources_used: list[str]
+    source_errors: dict[str, str]
+    collections_requested: list[str]
+    collections_available: list[str]
+    collections_unavailable: list[dict]
+    evidence: list[dict]
+    graph_edge_count: int
+    supplemental_searches: int
+    budgets: dict
+    latency_ms: dict
+
+    @classmethod
+    def from_retrieval(
+        cls,
+        *,
+        query: str,
+        matches: list[dict],
+        entities: list[dict],
+        graph_edges: list[dict],
+        sources_used: list[str],
+        errors: dict[str, str],
+        diagnostics: dict,
+        supplemental_searches: int,
+        char_budget: int,
+        max_matches: int,
+    ) -> "RetrievalReceipt":
+        del query  # query text is already the tool input; avoid duplicating it in telemetry.
+        backend_details = diagnostics.get("backend_details") or {}
+        memory = backend_details.get("memory") or {}
+        qdrant_details: list[dict] = []
+        primary_qdrant = backend_details.get("qdrant")
+        if isinstance(primary_qdrant, dict):
+            qdrant_details.append(primary_qdrant)
+        supplemental = (diagnostics.get("context_resolver") or {}).get("supplemental_diagnostics") or {}
+        supplemental_qdrant = (supplemental.get("backend_details") or {}).get("qdrant")
+        if isinstance(supplemental_qdrant, dict):
+            qdrant_details.append(supplemental_qdrant)
+
+        requested: list[str] = []
+        available: list[str] = []
+        unavailable_by_name: dict[str, dict] = {}
+        for detail in qdrant_details:
+            for name in detail.get("requested_collections") or []:
+                if name not in requested:
+                    requested.append(name)
+            for name in detail.get("available_collections") or []:
+                if name not in available:
+                    available.append(name)
+            for item in detail.get("unavailable_collections") or []:
+                if isinstance(item, dict) and item.get("name"):
+                    unavailable_by_name[str(item["name"])] = dict(item)
+
+        evidence = []
+        for record in matches:
+            data = record.get("data") or {}
+            evidence.append({
+                "type": record.get("type"),
+                "id": record.get("id"),
+                "backend": record.get("backend"),
+                "path": data.get("_path") or data.get("path"),
+                "sources": list(record.get("sources") or []),
+            })
+        return cls(
+            index_revision=memory.get("index_revision"),
+            index_fresh=memory.get("fresh"),
+            freshness_reason_code=memory.get("freshness_reason_code"),
+            recognized_entities=list(entities),
+            sources_attempted=list((diagnostics.get("backend_timings_ms") or {}).keys()),
+            sources_used=list(sources_used),
+            source_errors=dict(errors),
+            collections_requested=requested,
+            collections_available=available,
+            collections_unavailable=list(unavailable_by_name.values()),
+            evidence=evidence,
+            graph_edge_count=len(graph_edges),
+            supplemental_searches=supplemental_searches,
+            budgets={"character": char_budget, "matches": max_matches},
+            latency_ms={
+                "backends": dict(diagnostics.get("backend_timings_ms") or {}),
+                "cold_index_build": memory.get("cold_index_build_ms"),
+                "warm_lexical_query": memory.get("warm_query_ms"),
+            },
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "schema": "retrieval-diagnostics/v1",
+            "volatile": True,
+            "persisted": False,
+            "index": {
+                "revision": self.index_revision,
+                "fresh": self.index_fresh,
+                "reason_code": self.freshness_reason_code,
+            },
+            "recognized_entities": self.recognized_entities,
+            "sources": {
+                "attempted": self.sources_attempted,
+                "used": self.sources_used,
+                "errors": self.source_errors,
+            },
+            "collections": {
+                "requested": self.collections_requested,
+                "available": self.collections_available,
+                "unavailable": self.collections_unavailable,
+            },
+            "evidence": self.evidence,
+            "graph_edge_count": self.graph_edge_count,
+            "supplemental_searches": self.supplemental_searches,
+            "budgets": self.budgets,
+            "latency_ms": self.latency_ms,
+        }
 
 
 SearchPort = Callable[[str, dict], Awaitable[dict]]
@@ -160,8 +284,8 @@ def resolve_entities(
         return []
     candidates: list[tuple[int, int, str, str, tuple[str, ...], str]] = []
     explicit = _catalog_canonical(project, catalog) if project else None
-    if project:
-        canonical, alias = explicit or (str(project).strip(), str(project).strip())
+    if explicit:
+        canonical, alias = explicit
         aliases = catalog.get(canonical, _unique((canonical, alias)))
         kind = "ecosystem" if canonical == "요한 생태계" else "project"
         # 명시 project는 질의에 없는 경우의 폴백이다. 질의에 실제 등장한 엔티티의
@@ -189,18 +313,9 @@ def resolve_entities(
         if len(found) >= max(0, max_entities):
             return found
 
-    # 레지스트리에 아직 없는 명시적 슬러그·대문자 프로젝트도 제한적으로 인식한다.
-    # 일반 자연어 단어까지 엔티티로 승격하지 않아 보충 검색 폭주를 막는다.
-    for match in [*_ASCII_WORD_RE.finditer(query), *_UPPER_TOKEN_RE.finditer(query)]:
-        alias = match.group(0)
-        key = _normalized(alias)
-        if key in seen:
-            continue
-        seen.add(key)
-        canonical = alias.casefold()
-        found.append(EntityMatch(canonical, alias, _unique((canonical, alias)), "project"))
-        if len(found) >= max(0, max_entities):
-            break
+    # Strict catalog contract: an unknown slug or uppercase concept is not a
+    # project.  In particular, "AGI" may be promoted to a concept only from an
+    # evidence-bearing ontology record; it must never become a fake project.
     return found
 
 

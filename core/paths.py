@@ -17,6 +17,28 @@ def resolve_memory_dir() -> Path:
     return ROOT / "memory"
 
 
+def resolve_brain_root(memory_dir: Path | None = None) -> Path | None:
+    """Return the yohan-brain repository root for a linked ``memory/``.
+
+    A caller-provided test/cache directory is not silently promoted to a Brain
+    repository.  The repository-level retrieval corpus is available only when
+    the resolved directory is literally named ``memory``.
+    """
+    memory = (memory_dir or resolve_memory_dir()).expanduser().resolve()
+    if memory.name.casefold() != "memory":
+        return None
+    candidate = memory.parent
+    # yohan-mcp's deprecated local memory/ is runtime cache, never Brain SoT.
+    if candidate == ROOT.resolve():
+        return None
+    if (candidate / "YOHAN-ECOSYSTEM-SOT.md").is_file():
+        return candidate
+    configured = os.getenv("YOHAN_BRAIN_ROOT")
+    if configured and candidate == Path(configured).expanduser().resolve():
+        return candidate
+    return None
+
+
 def resolve_mcp_runtime_dir() -> Path:
     """Operational JSONL journals — isolated under ops/mcp-runtime when brain-linked."""
     if rd := os.getenv("MCP_RUNTIME_DIR"):

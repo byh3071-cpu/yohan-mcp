@@ -77,6 +77,11 @@ def test_resolve_entities_for_three_golden_queries():
     assert [e.canonical for e in resolve_entities("yohan mcp 검색 배관", CATALOG)] == ["yohan-mcp"]
 
 
+def test_unknown_uppercase_concept_is_not_promoted_to_project():
+    assert resolve_entities("퍼스널 AGI 경험 복리", CATALOG) == []
+    assert resolve_entities("퍼스널 AGI 경험 복리", CATALOG, project="AGI") == []
+
+
 def test_punctuation_only_registry_name_never_matches_hyphenated_query():
     catalog = {**CATALOG, "yohan-brain": ("yohan-brain",), "---": ("---",)}
 

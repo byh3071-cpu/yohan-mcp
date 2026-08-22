@@ -94,6 +94,10 @@ class QdrantAdapter(BackendAdapter):
         # 명시 설정이므로 QDRANT_URL 보다 **우선** — 서버를 안 띄우기로 한 기계에서 예전
         # .env 의 QDRANT_URL 이 남아 연결 실패로 회수 0 이 되는 사고를 막는다.
         self.path = path if path is not None else os.getenv("QDRANT_PATH")
+        if self.url and self.path:
+            raise ValueError(
+                "qdrant_config_conflict:path_and_url — configure exactly one of QDRANT_PATH or QDRANT_URL"
+            )
         self.collection = collection or os.getenv("QDRANT_COLLECTION", COLLECTION)
         # 검색 대상 = 쓰기 컬렉션(레거시 호환) + 관제탑 4컬렉션 + brain 2컬렉션(brain_memory·
         # ontology_triples), 이 기본 목록은 env 유무와 무관하게 항상 유지한다. env
@@ -241,6 +245,9 @@ class QdrantAdapter(BackendAdapter):
                 "collections_attempted": 0,
                 "collections_succeeded": 0,
                 "collections_failed": 0,
+                "requested_collections": list(self.search_collections),
+                "available_collections": [],
+                "unavailable_collections": [],
                 "collections": {},
             })
         top_k = int(opts.get("top_k", 5))
@@ -291,14 +298,22 @@ class QdrantAdapter(BackendAdapter):
                 failed.append(coll)
                 if diagnostics is not None:
                     diagnostics["collections_failed"] += 1
+                    diagnostics["unavailable_collections"].append({
+                        "name": coll,
+                        "reason_code": "collection_query_failed",
+                        "error_type": type(exc).__name__,
+                        "detail": str(exc)[:300],
+                    })
                     diagnostics["collections"][coll] = {
-                        "status": "error",
+                        "status": "unavailable",
+                        "reason_code": "collection_query_failed",
                         "error_type": type(exc).__name__,
                         "elapsed_ms": round((perf_counter() - collection_started) * 1000, 1),
                     }
                 continue
             if diagnostics is not None:
                 diagnostics["collections_succeeded"] += 1
+                diagnostics["available_collections"].append(coll)
                 diagnostics["collections"][coll] = {
                     "status": "ok",
                     "result_count": len(res.points),

@@ -32,6 +32,7 @@ from adapters.studio_adapter import StudioAdapter
 from core.router import PER_PAGE_CAP_DEFAULT, SmartRouter
 from core.context_resolver import (
     GraphAwareContextResolver,
+    RetrievalReceipt,
     load_project_catalog,
     resolve_entities,
 )
@@ -501,15 +502,24 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
     # 후보풀만 제한적으로 넓혀 혼합 컬렉션에서 ontology_triples가 선절단되지 않게 한다.
     # resolver는 원래 opts를 받아 최종 결과 수·문자 수를 다시 제한한다.
     search_opts = dict(opts)
+    # Preserve the public vector-on router default. Callers may still pass an
+    # explicit ``backends`` list for lexical-only operation; unavailable
+    # Qdrant collections are surfaced in retrieval_diagnostics.
     search_opts["top_k"] = _context_search_candidate_limit(
         opts,
         has_entities=bool(pre_entities),
     )
     res = await ctx.router.search(query, search_opts)
+
+    async def _supplemental_search(supplemental_query: str, supplemental_opts: dict) -> dict:
+        bounded = dict(supplemental_opts)
+        bounded["backends"] = list(search_opts.get("backends") or [])
+        return await ctx.router.search(supplemental_query, bounded)
+
     resolved = await GraphAwareContextResolver(ctx.entity_catalog).resolve(
         query,
         res,
-        ctx.router.search,
+        _supplemental_search,
         opts,
     )
     matches = resolved.matches
@@ -568,11 +578,24 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         "primary_candidate_limit": search_opts["top_k"],
         "supplemental_diagnostics": supplemental.get("diagnostics", {}) if supplemental else {},
     }
+    retrieval_diagnostics = RetrievalReceipt.from_retrieval(
+        query=query,
+        matches=matches,
+        entities=resolved.entities,
+        graph_edges=resolved.graph_edges,
+        sources_used=sources,
+        errors=errors,
+        diagnostics=diagnostics,
+        supplemental_searches=resolved.supplemental_searches,
+        char_budget=resolved.char_budget,
+        max_matches=resolved.max_matches,
+    ).as_dict()
     env = _envelope(
         {"matches": matches, "entities": resolved.entities,
          "graph_edges": resolved.graph_edges, "related_links": related,
          "devlog": devlog, "patterns": patterns, "count": len(matches),
          "resolver": diagnostics["context_resolver"],
+         "retrieval_diagnostics": retrieval_diagnostics,
          "diagnostics": diagnostics},
         True,
         sources,

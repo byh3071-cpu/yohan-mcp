@@ -55,7 +55,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv
 from qdrant_client import models
 
-from adapters.memory_adapter import MemoryAdapter, _BRAIN_KNOWLEDGE_DIRS
+from adapters.memory_adapter import (
+    MemoryAdapter,
+    _BRAIN_KNOWLEDGE_DIRS,
+    iter_priority_brain_files,
+)
 from adapters.qdrant_adapter import (
     BRAIN_MEMORY_COLLECTION,
     ONTOLOGY_TRIPLES_COLLECTION,
@@ -184,6 +188,12 @@ def _iter_brain_source_files(base: Path):
         for p in sorted(root.rglob("*.md")):
             if _inside(p):
                 yield kdir, p
+
+    # R1 priority corpus outside memory/: canonical root SoTs and non-DONE
+    # Goals. core is already covered above by the md/yaml loops.
+    for kdir, p in iter_priority_brain_files(base):
+        if kdir in {"root", "goal"}:
+            yield kdir, p
 
     repo_root = base_resolved.parent
 
