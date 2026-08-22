@@ -212,6 +212,19 @@ def _iter_brain_source_files(base: Path):
                 yield kdir, p
 
 
+def _rel_of(p: Path, base: Path) -> str:
+    """매니페스트·payload 용 상대경로.
+
+    memory/ 안은 base 기준(`decisions/x.md`), 밖은 저장소 루트 기준(`docs/patterns/x.md`).
+    prefix 가 갈리므로 두 출처가 같은 키로 충돌하지 않는다.
+    """
+    pr, br = Path(p).resolve(), Path(base).resolve()
+    try:
+        return str(pr.relative_to(br)).replace("\\", "/")
+    except ValueError:
+        return str(pr.relative_to(br.parent)).replace("\\", "/")
+
+
 def _title_of(rel_path: str, fm: dict) -> str:
     return str(fm.get("title") or fm.get("id") or Path(rel_path).stem)
 
@@ -315,7 +328,7 @@ async def seed_memory(
             f"{'·'.join(f'{d}/*.yaml' for d in _VECTOR_YAML_DIRS)})"
         )
         # 삭제 감지는 슬라이스 전 디스크 전수 기준 — limit/offset 분할 실행이 삭제로 오인되지 않게.
-        disk_rels = {str(p.relative_to(base)).replace("\\", "/") for _, p in all_files}
+        disk_rels = {_rel_of(p, base) for _, p in all_files}
 
         total_chunks = 0
         skipped_files = 0
@@ -358,7 +371,7 @@ async def seed_memory(
                     _save_manifest(manifest_path, manifest)
 
         for i, (kdir, path) in enumerate(files, 1):
-            rel = str(path.relative_to(base)).replace("\\", "/")
+            rel = _rel_of(path, base)
             try:
                 raw = path.read_bytes()
             except OSError:
