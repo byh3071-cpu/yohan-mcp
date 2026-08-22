@@ -25,6 +25,10 @@ foreach ($p in @($py, $seed)) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "경로 없음: $p" }
 }
 
+# PS 5.1 콘솔 기본 인코딩(CP949)이라 Write-Host 한국어가 깨진다 — docs/patterns/env-windows-console-utf8.md
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$OutputEncoding = [Text.Encoding]::UTF8
+
 Write-Host "브레인 재시딩 시작 — 증분(변경/신규 파일만)" -ForegroundColor Cyan
 Write-Host "  brain : $env:YOHAN_BRAIN_ROOT"
 Write-Host "  qdrant: $env:QDRANT_PATH`n"

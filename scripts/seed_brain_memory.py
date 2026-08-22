@@ -147,7 +147,13 @@ def _assert_ollama_embedder(embedder, allow_fallback: bool) -> None:
 # config 파일이 노이즈가 된다. 반면 벡터 회수는 유사도 순위라 저관련 문서가 위로 안 올라온다.
 # 그래서 공유 allowlist 는 건드리지 않고, 확장은 이 시딩 스크립트(벡터 경로) 안에서만 한다.
 # 결과적으로 두 경로의 대상이 갈라지므로 아래 목록이 벡터 색인 범위의 SoT 다.
-_VECTOR_EXTRA_MD_DIRS = ("core",)  # core/*.md — anti-patterns·az-protocol 등 규범 문서
+_VECTOR_EXTRA_MD_DIRS = ("core", "design-intelligence")  # core/*.md — anti-patterns·az-protocol 등 규범 문서
+# design-intelligence: 2026-08 신설 — allowlist·제외목록 어디에도 없어 조용히 빠져 있었다(누락 수정).
+
+# 저장소 루트(= memory 의 부모) 기준 색인 폴더 — memory/ 밖이지만 실전 회수 가치가 높은 것만.
+# docs/ 246건 전체는 계획서·핸드오프·아카이브가 섞여 노이즈라 넣지 않는다. 규칙("에러 시
+# 패턴 사전 먼저 조회")이 지목하는 문서가 검색에 안 걸리던 구멍만 메운다.
+_VECTOR_REPO_MD_DIRS = {"docs/patterns": "patterns", "docs/troubleshooting": "troubleshooting"}
 _VECTOR_STATE_YAML = ("active-project.yaml", "profile.yaml", "soul.yaml")  # memory/ 루트
 _VECTOR_YAML_DIRS = ("core",)  # core/*.yaml — roster·ruleset·projects 등 상태 정본
 
@@ -177,6 +183,19 @@ def _iter_brain_source_files(base: Path):
             continue
         for p in sorted(root.rglob("*.md")):
             if _inside(p):
+                yield kdir, p
+
+    repo_root = base_resolved.parent
+
+    def _inside_repo(p: Path) -> bool:
+        return p.resolve().is_relative_to(repo_root)
+
+    for rel, kdir in _VECTOR_REPO_MD_DIRS.items():
+        root = repo_root / rel
+        if not root.exists():
+            continue
+        for p in sorted(root.rglob("*.md")):
+            if _inside_repo(p):
                 yield kdir, p
 
     for name in _VECTOR_STATE_YAML:
@@ -289,7 +308,7 @@ async def seed_memory(
         files = all_files[offset:]
         if limit:
             files = files[:limit]
-        md_dirs = ", ".join((*_BRAIN_KNOWLEDGE_DIRS, *_VECTOR_EXTRA_MD_DIRS))
+        md_dirs = ", ".join((*_BRAIN_KNOWLEDGE_DIRS, *_VECTOR_EXTRA_MD_DIRS, *_VECTOR_REPO_MD_DIRS))
         print(
             f"대상 파일: {len(files)}건(전체 {len(all_files)}건 중 offset={offset}) "
             f"(md: {md_dirs} / yaml: {', '.join(_VECTOR_STATE_YAML)}, "
