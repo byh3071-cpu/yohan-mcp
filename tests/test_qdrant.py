@@ -38,6 +38,27 @@ async def test_qdrant_create_search_health():
     await qa.aclose()
 
 
+async def test_qdrant_search_reports_stage_diagnostics():
+    qa = _adapter()
+    await qa.create("resource", RESOURCE)
+    diagnostics = {}
+
+    res = await qa.search(
+        "어텐션 메커니즘",
+        {"top_k": 5, "_search_diagnostics": diagnostics},
+    )
+
+    assert res
+    assert diagnostics["embed_ms"] >= 0
+    assert diagnostics["embed_status"] == "ok"
+    assert diagnostics["collections_attempted"] == len(qa.search_collections)
+    assert diagnostics["collections_succeeded"] == 1
+    assert diagnostics["collections_failed"] == len(qa.search_collections) - 1
+    assert diagnostics["collections"][qa.collection]["status"] == "ok"
+    assert diagnostics["collections"][qa.collection]["result_count"] == 1
+    await qa.aclose()
+
+
 async def test_qdrant_idempotent_upsert():
     qa = _adapter()
     await qa.create("resource", RESOURCE)

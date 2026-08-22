@@ -9,19 +9,49 @@ RRF 공식: 각 백엔드 결과의 순위 rank(1부터) 를 1/(k+rank) 로 변�
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
+import os
+from time import perf_counter
 
 from adapters.base import BackendAdapter
 
 RRF_K = 60
+DEFAULT_BACKEND_TIMEOUT_S = 20.0
+MAX_BACKEND_TIMEOUT_S = 300.0
+logger = logging.getLogger(__name__)
 # get_context 표출 기본값(#21) — tool_get_context 가 opts 에 주입한다. router 자체 기본은
 # 무제한(cap 미적용): raw search(tool_search·protocol step)의 회수를 조용히 줄이지 않기 위함.
 PER_PAGE_CAP_DEFAULT = 3
 
 
+def _valid_timeout(value, fallback: float) -> float:
+    """검색 timeout 을 유한 양수로 정규화한다. 무한 대기는 허용하지 않는다."""
+    if value is None:
+        return fallback
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        logger.warning("검색 백엔드 timeout 무효(%r) — %.3fs 사용", value, fallback)
+        return fallback
+    if not math.isfinite(parsed) or parsed <= 0:
+        logger.warning("검색 백엔드 timeout 무효(%r) — %.3fs 사용", value, fallback)
+        return fallback
+    return min(parsed, MAX_BACKEND_TIMEOUT_S)
+
+
 class SmartRouter:
-    def __init__(self, adapters: dict[str, BackendAdapter], k: int = RRF_K) -> None:
+    def __init__(
+        self,
+        adapters: dict[str, BackendAdapter],
+        k: int = RRF_K,
+        backend_timeout_s: float | None = None,
+    ) -> None:
         self.adapters = adapters
         self.k = k
+        env_timeout = os.getenv("SEARCH_BACKEND_TIMEOUT_SEC")
+        configured = backend_timeout_s if backend_timeout_s is not None else env_timeout
+        self.backend_timeout_s = _valid_timeout(configured, DEFAULT_BACKEND_TIMEOUT_S)
 
     # ── 백엔드 선택 ──────────────────────────────────────────────
     def select_backends(self, query: str, opts: dict | None = None) -> list[str]:
@@ -48,13 +78,19 @@ class SmartRouter:
         """
         opts = opts or {}
         names = self.select_backends(query, opts)
-        tasks = [self._safe_search(n, query, opts) for n in names]
+        timeout_s = _valid_timeout(opts.get("backend_timeout_s"), self.backend_timeout_s)
+        tasks = [self._safe_search(n, query, opts, timeout_s) for n in names]
         per_backend = await asyncio.gather(*tasks)
 
         sources_used: list[str] = []
         errors: dict[str, str] = {}
         ranked_lists: list[tuple[str, list[dict]]] = []
-        for name, (records, err) in zip(names, per_backend):
+        timings_ms: dict[str, float] = {}
+        backend_details: dict[str, dict] = {}
+        for name, (records, err, elapsed_ms, details) in zip(names, per_backend):
+            timings_ms[name] = elapsed_ms
+            if details:
+                backend_details[name] = details
             if err is not None:
                 errors[name] = err
                 continue
@@ -74,18 +110,50 @@ class SmartRouter:
         top_k = int(opts.get("top_k", 5))
         if top_k >= 0:
             fused = fused[:top_k]
-        return {"results": fused, "sources_used": sources_used, "errors": errors}
+        return {
+            "results": fused,
+            "sources_used": sources_used,
+            "errors": errors,
+            "diagnostics": {
+                "backend_timeout_s": timeout_s,
+                "backend_timings_ms": timings_ms,
+                "backend_details": backend_details,
+            },
+        }
 
-    async def _safe_search(self, name: str, query: str, opts: dict | None):
-        """개별 백엔드 검색 — 예외/미구현은 잡아서 (records, error) 로 변환."""
+    async def _safe_search(
+        self,
+        name: str,
+        query: str,
+        opts: dict | None,
+        timeout_s: float,
+    ):
+        """개별 백엔드 검색 — timeout/예외를 격리하고 소요시간을 반환."""
         adapter = self.adapters[name]
+        started = perf_counter()
+        details: dict = {}
+        adapter_opts = dict(opts or {})
+        adapter_opts["_search_diagnostics"] = details
         try:
-            records = await adapter.search(query, opts)
-            return records, None
+            records = await asyncio.wait_for(
+                adapter.search(query, adapter_opts), timeout=timeout_s
+            )
+            elapsed_ms = round((perf_counter() - started) * 1000, 1)
+            return records, None, elapsed_ms, details
+        except TimeoutError:
+            elapsed_ms = round((perf_counter() - started) * 1000, 1)
+            return (
+                [],
+                f"{name}: timeout after {timeout_s:g}s",
+                elapsed_ms,
+                details,
+            )
         except NotImplementedError:
-            return [], f"{name}: search 미구현(P2.5 예정) — skip"
+            elapsed_ms = round((perf_counter() - started) * 1000, 1)
+            return [], f"{name}: search 미구현(P2.5 예정) — skip", elapsed_ms, details
         except Exception as exc:  # 백엔드 장애가 전체 검색을 깨지 않게
-            return [], f"{name}: {type(exc).__name__}: {exc}"
+            elapsed_ms = round((perf_counter() - started) * 1000, 1)
+            return [], f"{name}: {type(exc).__name__}: {exc}", elapsed_ms, details
 
     @staticmethod
     def _cap_per_page(results: list[dict], cap: int) -> list[dict]:

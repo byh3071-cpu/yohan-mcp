@@ -17,6 +17,7 @@ import math
 import os
 import uuid
 from pathlib import Path
+from time import perf_counter
 
 from qdrant_client import AsyncQdrantClient, models
 
@@ -230,6 +231,18 @@ class QdrantAdapter(BackendAdapter):
     # ── 검색 ────────────────────────────────────────────────────
     async def search(self, query: str, opts: dict | None = None) -> list[dict]:
         opts = opts or {}
+        diagnostics = opts.get("_search_diagnostics")
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else None
+        search_started = perf_counter()
+        if diagnostics is not None:
+            diagnostics.update({
+                "embed_ms": 0.0,
+                "embed_status": "pending",
+                "collections_attempted": 0,
+                "collections_succeeded": 0,
+                "collections_failed": 0,
+                "collections": {},
+            })
         top_k = int(opts.get("top_k", 5))
         # 후보풀은 top_k 보다 크게(fetch_k) 확보한다. 최종 top_k 절단은 어댑터/컬렉션 단계가
         # 아니라 router 가 RRF 융합 '이후'에 수행한다(랭킹 전 선절단 금지). 어댑터에서 미리
@@ -237,12 +250,36 @@ class QdrantAdapter(BackendAdapter):
         fetch_k = int(opts.get("fetch_k", max(top_k * 5, 50)))
         # 읽기 경로에서는 컬렉션을 생성하지 않는다(ensure_collection 부작용 제거 — MAJOR-1).
         client = self._get_client()
-        vec = (await self._embed([query or ""]))[0]
+        embed_started = perf_counter()
+        try:
+            vec = (await self._embed([query or ""]))[0]
+        except BaseException as exc:
+            if diagnostics is not None:
+                diagnostics["embed_ms"] = round((perf_counter() - embed_started) * 1000, 1)
+                diagnostics["embed_status"] = (
+                    "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+                )
+                diagnostics["total_ms"] = round((perf_counter() - search_started) * 1000, 1)
+            raise
+        if diagnostics is not None:
+            diagnostics["embed_ms"] = round((perf_counter() - embed_started) * 1000, 1)
+            diagnostics["embed_status"] = "ok"
         records: list[dict] = []
         failed: list[str] = []
         for coll in self.search_collections:
+            collection_started = perf_counter()
+            if diagnostics is not None:
+                diagnostics["collections_attempted"] += 1
             try:
                 res = await client.query_points(coll, query=vec, limit=fetch_k, with_payload=True)
+            except asyncio.CancelledError:
+                if diagnostics is not None:
+                    diagnostics["collections"][coll] = {
+                        "status": "cancelled",
+                        "elapsed_ms": round((perf_counter() - collection_started) * 1000, 1),
+                    }
+                    diagnostics["total_ms"] = round((perf_counter() - search_started) * 1000, 1)
+                raise
             except Exception as exc:
                 # 컬렉션 미존재(레거시 삭제 등)/차원불일치(bge-m3 미설치 등) — 건너뛰고 계속.
                 # 개별 실패는 DEBUG(기본 비표시)로만 남긴다: search_collections 는 레거시 쓰기
@@ -252,7 +289,21 @@ class QdrantAdapter(BackendAdapter):
                 # 1회 집계 경고로 표면화한다 — 개별 컬렉션 진단은 health_check 가 상시 표면화.
                 logger.debug("Qdrant 컬렉션 '%s' 검색 실패(스킵): %s: %s", coll, type(exc).__name__, exc)
                 failed.append(coll)
+                if diagnostics is not None:
+                    diagnostics["collections_failed"] += 1
+                    diagnostics["collections"][coll] = {
+                        "status": "error",
+                        "error_type": type(exc).__name__,
+                        "elapsed_ms": round((perf_counter() - collection_started) * 1000, 1),
+                    }
                 continue
+            if diagnostics is not None:
+                diagnostics["collections_succeeded"] += 1
+                diagnostics["collections"][coll] = {
+                    "status": "ok",
+                    "result_count": len(res.points),
+                    "elapsed_ms": round((perf_counter() - collection_started) * 1000, 1),
+                }
             # 레거시(yohan_resources)=resource, 관제탑 컬렉션=컬렉션명(스키마 없는 벡터청크 — 검증 제외).
             rtype = "resource" if coll == self.collection else coll
             for p in res.points:
@@ -278,6 +329,8 @@ class QdrantAdapter(BackendAdapter):
             # 주장하게 된다(봉투 계약 위반). router._safe_search 는 백엔드 예외를 errors 로
             # 승격하는 채널을 이미 갖고 있으므로, 총체적 실패만 raise 로 그 채널에 태운다.
             # 부분 실패(하나라도 성공)는 기존대로 스킵 — 레거시 컬렉션 404 노이즈 억제 유지.
+            if diagnostics is not None:
+                diagnostics["total_ms"] = round((perf_counter() - search_started) * 1000, 1)
             raise RuntimeError(
                 "Qdrant 검색 대상 컬렉션 전부 회수 실패(%d/%d): %s "
                 "(연결/임베딩 차원/시딩 확인 필요, health_check 참고)"
@@ -297,6 +350,8 @@ class QdrantAdapter(BackendAdapter):
         # U3 가중이 이미 곱해진 score 로 정렬하므로 type 부스트/감쇠가 RRF 입력 순위에 반영된다.
         records.sort(key=lambda r: r["score"] if r["score"] is not None else float("-inf"), reverse=True)
         # fetch_k 로만 상한(후보풀 크기). 최종 top_k 절단은 router 가 RRF 융합 이후 적용.
+        if diagnostics is not None:
+            diagnostics["total_ms"] = round((perf_counter() - search_started) * 1000, 1)
         return records[:fetch_k]
 
     # ── health ──────────────────────────────────────────────────

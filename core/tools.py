@@ -301,7 +301,11 @@ async def tool_search(ctx: ToolContext, query: str, opts: dict | None = None) ->
         valids.append(ok)
     schema_valid = all(valids) if valids else True
     return _envelope(
-        {"results": results, "count": len(results)},
+        {
+            "results": results,
+            "count": len(results),
+            "diagnostics": res["diagnostics"],
+        },
         schema_valid,
         res["sources_used"],
         errors=res["errors"],
@@ -477,7 +481,8 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         sources.append("notion:pattern")
     env = _envelope(
         {"matches": matches, "related_links": related,
-         "devlog": devlog, "patterns": patterns, "count": len(matches)},
+         "devlog": devlog, "patterns": patterns, "count": len(matches),
+         "diagnostics": res["diagnostics"]},
         True,
         sources,
         errors=errors,
