@@ -33,3 +33,6 @@ memory/
 
 # 발행 멱등 저널(런타임 데이터)
 data/
+
+# 로컬 MCP 등록 — 기기마다 경로가 다르다 (ASSETS.md §4)
+.mcp.json
