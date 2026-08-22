@@ -47,7 +47,41 @@ from core import verify as V
 
 ROOT = Path(__file__).resolve().parent.parent
 
+CONTEXT_GRAPH_CANDIDATE_FLOOR = 20
+CONTEXT_GRAPH_CANDIDATE_MAX = 50
+
 logger = logging.getLogger(__name__)
+
+
+def _context_search_candidate_limit(opts: dict, *, has_entities: bool) -> int:
+    """get_context의 출력 예산과 별도로 그래프 후보를 확보할 1차 검색 상한을 계산한다.
+
+    ontology_triples는 일반 문서보다 벡터 점수가 조금 낮을 수 있다. 출력 top_k만큼만
+    먼저 잘라 resolver에 넘기면 관련 트리플이 후보 단계에서 사라진다. 엔티티 질의일
+    때만 bounded reserve를 열고, resolver는 원래 opts로 최종 match/문자 예산을 지킨다.
+    """
+    try:
+        top_k = int(opts.get("top_k", 5))
+    except (TypeError, ValueError):
+        top_k = 5
+    if top_k == 0:
+        return 0
+    if top_k < 0:
+        return CONTEXT_GRAPH_CANDIDATE_MAX
+    requested = min(max(top_k, 0), CONTEXT_GRAPH_CANDIDATE_MAX)
+    if not has_entities:
+        return requested
+    try:
+        max_edges = int(opts.get("context_max_edges", 8))
+    except (TypeError, ValueError):
+        max_edges = 8
+    max_edges = min(max(max_edges, 0), 30)
+    if max_edges == 0:
+        return requested
+    return min(
+        CONTEXT_GRAPH_CANDIDATE_MAX,
+        max(requested, CONTEXT_GRAPH_CANDIDATE_FLOOR, requested + max_edges * 2),
+    )
 
 
 def _envelope(data, schema_valid, sources_used, **extra) -> dict:
@@ -463,7 +497,15 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         )
         if detected_project:
             opts["project"] = detected_project
-    res = await ctx.router.search(query, opts)
+    # 최종 출력 예산(top_k/context_max_matches)은 그대로 두되, 엔티티 질의의 1차
+    # 후보풀만 제한적으로 넓혀 혼합 컬렉션에서 ontology_triples가 선절단되지 않게 한다.
+    # resolver는 원래 opts를 받아 최종 결과 수·문자 수를 다시 제한한다.
+    search_opts = dict(opts)
+    search_opts["top_k"] = _context_search_candidate_limit(
+        opts,
+        has_entities=bool(pre_entities),
+    )
+    res = await ctx.router.search(query, search_opts)
     resolved = await GraphAwareContextResolver(ctx.entity_catalog).resolve(
         query,
         res,
@@ -523,6 +565,7 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         "entity_count": len(resolved.entities),
         "graph_edge_count": len(resolved.graph_edges),
         "detected_project": opts.get("project"),
+        "primary_candidate_limit": search_opts["top_k"],
         "supplemental_diagnostics": supplemental.get("diagnostics", {}) if supplemental else {},
     }
     env = _envelope(

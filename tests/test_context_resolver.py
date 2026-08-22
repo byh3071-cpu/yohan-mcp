@@ -77,6 +77,22 @@ def test_resolve_entities_for_three_golden_queries():
     assert [e.canonical for e in resolve_entities("yohan mcp 검색 배관", CATALOG)] == ["yohan-mcp"]
 
 
+def test_punctuation_only_registry_name_never_matches_hyphenated_query():
+    catalog = {**CATALOG, "yohan-brain": ("yohan-brain",), "---": ("---",)}
+
+    entities = resolve_entities(
+        "요한 생태계에서 yohan-mcp와 yohan-brain은 어떤 관계야?",
+        catalog,
+        max_entities=3,
+    )
+
+    assert [entity.canonical for entity in entities] == [
+        "요한 생태계",
+        "yohan-mcp",
+        "yohan-brain",
+    ]
+
+
 def test_extract_one_hop_edges_excludes_two_hop_and_unrelated():
     entities = resolve_entities("yohan-mcp 배관", CATALOG)
     records = [
@@ -181,9 +197,11 @@ async def test_supplemental_failure_preserves_primary_context():
 class _TrackingRouter:
     def __init__(self):
         self.calls: list[str] = []
+        self.call_opts: list[dict] = []
 
     async def search(self, query, opts=None):
         self.calls.append(query)
+        self.call_opts.append(dict(opts or {}))
         if len(self.calls) == 1:
             return _search_result([_edge("e1", "요한 생태계", "comprises", "MOVA")])
         return _search_result(
@@ -198,7 +216,35 @@ async def test_tool_get_context_wires_entities_graph_and_single_supplement(tmp_p
     env = await tool_get_context(ctx, "요한 생태계에서 MOVA가 뭐야", {"top_k": 5})
 
     assert len(router.calls) == 2
+    assert router.call_opts[0]["top_k"] > 5
     assert [e["canonical"] for e in env["data"]["entities"]] == ["요한 생태계", "mova"]
     assert env["data"]["graph_edges"][0]["relation"] == "comprises"
     assert env["data"]["resolver"]["supplemental_searches"] == 1
+    assert env["data"]["resolver"]["primary_candidate_limit"] == router.call_opts[0]["top_k"]
     assert env["data"]["matches"][0]["id"] == "d1"
+
+
+class _GraphBelowOutputCutoffRouter:
+    def __init__(self):
+        self.seen_top_k = 0
+
+    async def search(self, query, opts=None):
+        self.seen_top_k = int((opts or {}).get("top_k", 0))
+        candidates = [
+            _record(f"d{i}", "brain_memory", {"path": f"docs/{i}.md", "text": f"yohan-mcp 근거 {i}"})
+            for i in range(8)
+        ]
+        candidates.append(_edge("e1", "yohan-mcp", "depends_on", "yohan-brain"))
+        return _search_result(candidates[: self.seen_top_k])
+
+
+async def test_tool_get_context_reserves_candidates_but_keeps_output_budget(tmp_path: Path):
+    catalog = {**CATALOG, "yohan-brain": ("yohan-brain",)}
+    router = _GraphBelowOutputCutoffRouter()
+    ctx = ToolContext({}, router, SchemaValidator(), entity_catalog=catalog)
+
+    env = await tool_get_context(ctx, "yohan-mcp와 yohan-brain 관계", {"top_k": 5})
+
+    assert router.seen_top_k >= 9
+    assert len(env["data"]["matches"]) <= 5
+    assert env["data"]["graph_edges"][0]["relation"] == "depends_on"

@@ -127,6 +127,11 @@ def _alias_position(query: str, alias: str) -> int | None:
         return None
     if all(ord(char) < 128 for char in a):
         pieces = [re.escape(piece) for piece in re.split(r"[-_\s]+", a) if piece]
+        # punctuation-only legacy names (예: registry의 "---")는 검색 엔티티가 아니다.
+        # 빈 pattern을 정규식으로 실행하면 모든 문자열의 경계에 매치되어 실제 프로젝트
+        # 엔티티 슬롯을 밀어내므로 명시적으로 거부한다.
+        if not pieces:
+            return None
         pattern = r"[-_\s]+".join(pieces)
         match = re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", q)
         return match.start() if match else None
