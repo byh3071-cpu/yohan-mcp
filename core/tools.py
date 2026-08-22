@@ -30,6 +30,11 @@ from adapters.notion_adapter import NotionAdapter
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.studio_adapter import StudioAdapter
 from core.router import PER_PAGE_CAP_DEFAULT, SmartRouter
+from core.context_resolver import (
+    GraphAwareContextResolver,
+    load_project_catalog,
+    resolve_entities,
+)
 from core.schema_validator import SchemaValidator
 from core.links import LinkStore
 from core.approval import ApprovalQueue
@@ -246,6 +251,7 @@ class ToolContext:
         policy: "PolicyEngine | None" = None,
         scheduler: "S.Scheduler | None" = None,
         create_store: "CreateStore | None" = None,
+        entity_catalog: dict[str, tuple[str, ...]] | None = None,
     ):
         self.adapters = adapters
         self.router = router
@@ -260,6 +266,9 @@ class ToolContext:
         # P5 — 정책 엔진(감사 로그) + 스케줄러(트리거). 정책 자동승인/사람 폴백.
         self.policy = policy or PolicyEngine(log_path=Path(base) / "policy_log.jsonl")
         self.scheduler = scheduler or S.Scheduler(runlog_path=Path(base) / "trigger_runs.jsonl")
+        # 작은 inheritance-registry.yaml 한 파일에서 만든 런타임 카탈로그.
+        # 전체 brain 문서를 순회하지 않으며 테스트는 dict 를 직접 주입한다.
+        self.entity_catalog = entity_catalog if entity_catalog is not None else load_project_catalog()
 
     @classmethod
     def from_env(cls) -> "ToolContext":
@@ -441,8 +450,27 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
     # raw search(tool_search·protocol search step)는 router 기본(무제한)이라 회수가 조용히
     # 줄지 않는다. 호출자가 명시하면(0=끔 포함) 그 값이 우선.
     opts = {"per_page_cap": PER_PAGE_CAP_DEFAULT, **(opts or {})}
+    pre_entities = resolve_entities(
+        query,
+        ctx.entity_catalog,
+        project=opts.get("project"),
+        max_entities=3,
+    )
+    if not opts.get("project"):
+        detected_project = next(
+            (entity.canonical for entity in pre_entities if entity.kind == "project"),
+            None,
+        )
+        if detected_project:
+            opts["project"] = detected_project
     res = await ctx.router.search(query, opts)
-    matches = res["results"]
+    resolved = await GraphAwareContextResolver(ctx.entity_catalog).resolve(
+        query,
+        res,
+        ctx.router.search,
+        opts,
+    )
+    matches = resolved.matches
     matched_types = {r.get("type") for r in matches}
     related = [
         link for link in ctx._links()
@@ -458,6 +486,14 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
     # 회수 실패는 봉투 errors 에 실어 '패턴 0건'과 '회수 전멸'을 구분 가능하게 한다
     # (안 실으면 호출자가 무음 0건과 예외 삼킴을 구분 못 함). router search errors 에 합류.
     errors = dict(res["errors"])
+    sources = list(res["sources_used"])
+    supplemental = resolved.supplemental_result
+    if supplemental:
+        for source in supplemental.get("sources_used") or []:
+            if source not in sources:
+                sources.append(source)
+        for name, message in (supplemental.get("errors") or {}).items():
+            errors[f"supplemental:{name}"] = message
     devlog_q = getattr(notion, "devlog_query", None)
     pattern_q = getattr(notion, "pattern_query", None)
     if devlog_q and project:
@@ -474,15 +510,27 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
             logger.warning("pattern 회수 실패: %s: %s", type(exc).__name__, exc)
             patterns = []
             errors["notion:pattern"] = f"{type(exc).__name__}: {exc}"
-    sources = list(res["sources_used"])
     if devlog:
         sources.append("notion:devlog")
     if patterns:
         sources.append("notion:pattern")
+    diagnostics = dict(res["diagnostics"])
+    diagnostics["context_resolver"] = {
+        "supplemental_searches": resolved.supplemental_searches,
+        "context_chars": resolved.context_chars,
+        "context_char_budget": resolved.char_budget,
+        "max_matches": resolved.max_matches,
+        "entity_count": len(resolved.entities),
+        "graph_edge_count": len(resolved.graph_edges),
+        "detected_project": opts.get("project"),
+        "supplemental_diagnostics": supplemental.get("diagnostics", {}) if supplemental else {},
+    }
     env = _envelope(
-        {"matches": matches, "related_links": related,
+        {"matches": matches, "entities": resolved.entities,
+         "graph_edges": resolved.graph_edges, "related_links": related,
          "devlog": devlog, "patterns": patterns, "count": len(matches),
-         "diagnostics": res["diagnostics"]},
+         "resolver": diagnostics["context_resolver"],
+         "diagnostics": diagnostics},
         True,
         sources,
         errors=errors,
