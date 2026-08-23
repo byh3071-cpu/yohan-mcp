@@ -2797,6 +2797,9 @@ def build_candidate_query_prompt(
             "they are proposals, never registered facts.",
             f"triples[].relation must be exactly one of: {chr(44).join(relation_palette)}.",
             "Use related_to when the relation is uncertain; never invent a code.",
+            "Include 2-3 application triples that connect the source to how it would be used, "
+            "not only relations internal to the video: [concept] applied_as [where it is used], "
+            "[practice] addresses [problem or limit], [concept] candidate_for [project or protocol].",
             f"triples[].domain must be exactly one of: {chr(44).join(sorted(_TRIPLE_DOMAINS))}.",
             "triples[].confidence is 1-5: official docs 5, expert lecture 4, analysis 3, "
             "inference 2, impression 1.",
