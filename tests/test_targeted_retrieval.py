@@ -149,6 +149,12 @@ async def test_priority_corpus_golden_queries_land_in_top_five(
     assert expected_path in paths[:5]
     receipt = env["data"]["retrieval_diagnostics"]
     assert receipt["volatile"] is True and receipt["persisted"] is False
+    assert receipt["runtime"]["repository"] == "yohan-mcp"
+    assert len(receipt["runtime"]["implementation_digest"]) == 64
+    assert receipt["query_binding"] == {
+        "scheme": "sha256-utf8-v1",
+        "digest": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+    }
     assert receipt["index"]["fresh"] is True
     assert len(receipt["index"]["revision"]) == 64
     assert len(receipt["index"]["generation_id"]) == 64

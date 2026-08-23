@@ -32,6 +32,27 @@ MAX_CONTEXT_CHAR_BUDGET = 100_000
 MAX_CONTEXT_MATCHES = 50
 MAX_GRAPH_EDGES = 30
 
+_RUNTIME_BUNDLE_PATHS = (
+    "adapters/memory_adapter.py",
+    "core/context_resolver.py",
+    "core/router.py",
+)
+
+
+def _runtime_bundle_digest() -> str:
+    repository_root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for relative_path in sorted(_RUNTIME_BUNDLE_PATHS):
+        raw = (repository_root / relative_path).read_bytes()
+        normalized = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        if not normalized.endswith(b"\n"):
+            normalized += b"\n"
+        digest.update(relative_path.encode("utf-8") + b"\n" + normalized)
+    return digest.hexdigest()
+
+
+RETRIEVAL_RUNTIME_BUNDLE_DIGEST = _runtime_bundle_digest()
+
 _RANK_QUERY_STOPWORDS = {
     "그", "무엇", "무엇이고", "무엇인가", "어떤", "어디", "어디에",
     "서로", "현재", "중인", "하는가", "해야", "문서",
@@ -89,6 +110,7 @@ class RetrievalDiagnostics:
     corpus_contract_version: str | None
     index_fresh: bool | None
     freshness_reason_code: str | None
+    query_binding_digest: str
     recognized_entities: list[dict]
     entity_catalog: dict
     sources_attempted: list[str]
@@ -118,7 +140,7 @@ class RetrievalDiagnostics:
         char_budget: int,
         max_matches: int,
     ) -> "RetrievalDiagnostics":
-        del query  # query text is already the tool input; avoid duplicating it in telemetry.
+        query_binding_digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
         backend_details = diagnostics.get("backend_details") or {}
         memory = backend_details.get("memory") or {}
         qdrant_details: list[dict] = []
@@ -165,6 +187,7 @@ class RetrievalDiagnostics:
             corpus_contract_version=memory.get("corpus_contract_version"),
             index_fresh=memory.get("fresh"),
             freshness_reason_code=memory.get("freshness_reason_code"),
+            query_binding_digest=query_binding_digest,
             recognized_entities=list(entities),
             entity_catalog=dict(diagnostics.get("entity_catalog") or {}),
             sources_attempted=list((diagnostics.get("backend_timings_ms") or {}).keys()),
@@ -189,6 +212,14 @@ class RetrievalDiagnostics:
             "schema": "retrieval-diagnostics/v1",
             "volatile": True,
             "persisted": False,
+            "runtime": {
+                "repository": "yohan-mcp",
+                "implementation_digest": RETRIEVAL_RUNTIME_BUNDLE_DIGEST,
+            },
+            "query_binding": {
+                "scheme": "sha256-utf8-v1",
+                "digest": self.query_binding_digest,
+            },
             "index": {
                 "revision": self.index_revision,
                 "generation_id": self.index_generation_id,
