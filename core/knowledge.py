@@ -38,6 +38,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from core.paths import resolve_knowledge_runtime_dir
+from core.triple_map import parse_triple_map
 
 
 NOTEBOOKLM_PACKAGE_SPEC = "notebooklm-mcp-cli==0.9.4"
@@ -2125,6 +2126,7 @@ def parse_draft(raw: str) -> dict[str, Any] | None:
 _DRAFT_DIRECTIONS = {"계속 공부", "필요할 때 학습", "관찰만", "중단"}
 _DRAFT_CONFIDENCE = {"높음", "중간", "낮음"}
 _CRITICAL_JUDGMENT_FIELDS = {"steelman", "attack", "failure_cost", "confidence"}
+_TRIPLE_FIELDS = {"subject", "relation", "object", "domain", "confidence"}
 
 _DRAFT_TOP_LEVEL_FIELDS = {
     "headline_conclusion",
@@ -2275,6 +2277,38 @@ def _sanitize_draft_contract(draft: Mapping[str, Any]) -> dict[str, Any]:
     if len(json.dumps(promotion, ensure_ascii=False).encode("utf-8")) > MAX_PROMOTION_CANDIDATE_BYTES:
         raise DraftContractError("NotebookLM promotion candidate input exceeds the size limit.")
 
+    # 후보는 보존하되 자동 승격하지 않는다. 등록은 source-to-summary Step 4.7 에서
+    # 사람이 triple-map.md 에 append-only 로 한다. 여기서는 형태만 강제한다.
+    sanitized_promotion: dict[str, Any] = {"concepts": [], "people": [], "triples": []}
+    for kind in ("concepts", "people"):
+        items = promotion.get(kind) or []
+        if len(items) > MAX_PROMOTION_ITEMS_PER_KIND:
+            raise DraftContractError(f"NotebookLM {kind} 후보가 너무 많습니다.")
+        sanitized_promotion[kind] = [_contract_text(item, maximum=200) for item in items]
+    raw_triples = promotion.get("triples") or []
+    if len(raw_triples) > MAX_PROMOTION_ITEMS_PER_KIND:
+        raise DraftContractError("NotebookLM 트리플 후보가 너무 많습니다.")
+    for raw_triple in raw_triples:
+        if not isinstance(raw_triple, dict) or not set(raw_triple).issubset(_TRIPLE_FIELDS):
+            raise DraftContractError("NotebookLM 트리플 후보에 허용되지 않은 필드가 있습니다.")
+        triple = {
+            "subject": _contract_text(raw_triple.get("subject"), maximum=200),
+            "relation": _contract_text(raw_triple.get("relation"), maximum=64),
+            "object": _contract_text(raw_triple.get("object"), maximum=200),
+        }
+        # 후보는 제안일 뿐이다. 닫힌집합을 벗어난 값은 잡을 실패시키지 않고 그 항목만
+        # 버린다. 제안 하나 때문에 영상 전체를 폐기하면 의미 게이트에서 바로잡은 원칙과
+        # 어긋난다. 등록은 어차피 Step 4.7 에서 사람이 다시 본다.
+        domain = _contract_text(raw_triple.get("domain"), maximum=32) if raw_triple.get("domain") else ""
+        if domain and domain not in _TRIPLE_DOMAINS:
+            continue
+        confidence = raw_triple.get("confidence")
+        if confidence is not None and (not isinstance(confidence, int) or not 1 <= confidence <= 5):
+            continue
+        triple["domain"] = domain
+        triple["confidence"] = confidence if isinstance(confidence, int) else None
+        sanitized_promotion["triples"].append(triple)
+
     judgment = draft.get("critical_judgment")
     if not isinstance(judgment, dict) or set(judgment) != _CRITICAL_JUDGMENT_FIELDS:
         raise DraftContractError("NotebookLM 비판적 판단 필드가 올바르지 않습니다.")
@@ -2302,8 +2336,7 @@ def _sanitize_draft_contract(draft: Mapping[str, Any]) -> dict[str, Any]:
         "coverage": coverage,
         "yohan_relevance": _contract_text(draft.get("yohan_relevance"), maximum=8_000),
         "uncertainties": _contract_text_list(draft.get("uncertainties")),
-        # P0 never promotes model-proposed entities automatically.
-        "promotion_candidates": {"concepts": [], "people": [], "triples": []},
+        "promotion_candidates": sanitized_promotion,
     }
 
 
@@ -2696,6 +2729,7 @@ def build_query_prompt(job: Mapping[str, Any]) -> str:
 
 def build_candidate_query_prompt(
     job: Mapping[str, Any], candidates: tuple[EvidenceCandidate, ...],
+    relation_palette: tuple[str, ...] = (),
 ) -> str:
     skeleton = {
         "title": "video title",
@@ -2722,7 +2756,14 @@ def build_candidate_query_prompt(
         },
         "yohan_relevance": "application",
         "uncertainties": ["none"],
-        "promotion_candidates": {"concepts": [], "people": [], "triples": []},
+        "promotion_candidates": {
+            "concepts": ["concept worth registering"],
+            "people": ["person named in the source"],
+            "triples": [{
+                "subject": "subject", "relation": "related_to", "object": "object",
+                "domain": "AI/자동화", "confidence": 3,
+            }],
+        },
     }
     payload = json.dumps(
         [candidate.prompt_payload() for candidate in candidates],
@@ -2751,6 +2792,15 @@ def build_candidate_query_prompt(
         "Every coverage statement must describe what happens in that video third and must not copy the selected evidence quote.",
         "Coverage start/middle/end may select only CS/CM/CE IDs respectively.",
         "The system owns review flags. Do not output requires_crosscheck. Return one JSON object only.",
+        *((
+            "promotion_candidates collects graph candidates for human registration; "
+            "they are proposals, never registered facts.",
+            f"triples[].relation must be exactly one of: {chr(44).join(relation_palette)}.",
+            "Use related_to when the relation is uncertain; never invent a code.",
+            f"triples[].domain must be exactly one of: {chr(44).join(sorted(_TRIPLE_DOMAINS))}.",
+            "triples[].confidence is 1-5: official docs 5, expert lecture 4, analysis 3, "
+            "inference 2, impression 1.",
+        ) if relation_palette else ()),
         f"EVIDENCE_CANDIDATES={payload}",
         json.dumps(skeleton, ensure_ascii=False, separators=(",", ":")),
     ))
@@ -3117,6 +3167,23 @@ class BrainWriter:
             if isinstance(claim, dict)
         )
         uncertainty = "\n".join(f"- {self._clean(item, 1000)}" for item in draft.get("uncertainties", [])) or "- 없음"
+        promotion = draft.get("promotion_candidates")
+        promotion = promotion if isinstance(promotion, dict) else {}
+        triple_lines = "\n".join(
+            "- [{s}] --{r}--> [{o}]{extra}".format(
+                s=self._clean(item.get("subject"), 200),
+                r=self._clean(item.get("relation"), 64),
+                o=self._clean(item.get("object"), 200),
+                extra="".join((
+                    f" · {self._clean(item.get('domain'), 32)}" if item.get("domain") else "",
+                    f" · 신뢰도 {item.get('confidence')}" if item.get("confidence") else "",
+                )),
+            )
+            for item in promotion.get("triples") or []
+            if isinstance(item, dict)
+        )
+        concept_line = ", ".join(self._clean(x, 200) for x in promotion.get("concepts") or [])
+        people_line = ", ".join(self._clean(x, 200) for x in promotion.get("people") or [])
         raw_judgment = draft.get("critical_judgment")
         judgment = raw_judgment if isinstance(raw_judgment, dict) else {}
         direction = self._clean(draft.get("direction"), 32) or "미분류"
@@ -3179,6 +3246,15 @@ class BrainWriter:
                 "### 불확실성",
                 uncertainty,
                 "",
+                "### 온톨로지 후보 (미등록)",
+                triple_lines or "- 없음",
+                "",
+                f"- 개념: {concept_line or '없음'}",
+                f"- 인물: {people_line or '없음'}",
+                "",
+                "> 등록은 source-to-summary Step 4.7 에서 사람이 판단한다.",
+                "> triple-map.md 는 append-only 정본이며 자동 승격하지 않는다.",
+                "",
                 "### 출처·원문",
                 f"- {relative_resource}",
                 f"- {source_url}",
@@ -3192,6 +3268,27 @@ class BrainWriter:
             "resource_written": resource_written,
             "insight_written": insight_written,
         }
+
+
+# 트리플 도메인은 knowledge-hub/triple-map.md 가 정본이다(프로즈라 파싱 불가해 여기 명시).
+_TRIPLE_DOMAINS = {"AI/자동화", "비즈니스", "개발", "자기이해", "학습"}
+MAX_PROMOTION_ITEMS_PER_KIND = 20
+
+
+def load_triple_relation_palette(env: Mapping[str, str]) -> tuple[str, ...]:
+    """관계 코드 allowlist 를 brain 정본에서 읽는다. 없으면 빈 튜플(후보 요청 생략)."""
+    root = (env.get("YOHAN_BRAIN_ROOT") or "").strip()
+    if not root:
+        return ()
+    try:
+        text = (Path(root) / "memory" / "knowledge-hub" / "triple-map.md").read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    try:
+        palette, _ = parse_triple_map(text)
+    except Exception:
+        return ()
+    return tuple(sorted(palette))
 
 
 def _allowlist(env: Mapping[str, str]) -> list[str]:
@@ -3673,7 +3770,10 @@ class KnowledgeService:
                     _validate_caption_input_bounds(caption_evidence)
                     evidence_candidates = caption_evidence.candidate_bank(content)
                 prompt = (
-                    build_candidate_query_prompt(job, evidence_candidates)
+                    build_candidate_query_prompt(
+                        job, evidence_candidates,
+                        load_triple_relation_palette(self.env),
+                    )
                     if evidence_candidates
                     else build_query_prompt(job)
                 )

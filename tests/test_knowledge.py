@@ -2421,7 +2421,7 @@ def test_format_retry_prompt_over_cap_fails_before_second_query(
                 return json.dumps({"answer": "not valid json"})
             return super().__call__(args, timeout)
 
-    monkeypatch.setattr(knowledge_module, "build_candidate_query_prompt", lambda job, candidates: first_prompt)
+    monkeypatch.setattr(knowledge_module, "build_candidate_query_prompt", lambda job, candidates, relation_palette=(): first_prompt)
     runner = BoundaryRunner()
     queue = FakeQueue()
     report = KnowledgeService(
