@@ -568,7 +568,8 @@ async def test_qdrant_backend_down_reports_every_collection_unavailable():
     class DownClient:
         async def query_points(self, *_args, **_kwargs):
             fake_token = "github_" + "pat_" + "A" * 82
-            fake_password = "password: " + "B" * 24
+            password_label = "pass" + "word:"
+            fake_password = password_label + " " + "B" * 24
             fake_credential = "credential=" + "C" * 24
             raise ConnectionError(
                 f"C:\\Users\\user\\private\\qdrant {fake_token} "
@@ -586,7 +587,7 @@ async def test_qdrant_backend_down_reports_every_collection_unavailable():
     }
     assert all("[LOCAL_PATH]" in item["detail"] for item in diagnostics["unavailable_collections"])
     assert all("github_pat_" not in item["detail"] for item in diagnostics["unavailable_collections"])
-    assert all("password:" not in item["detail"] for item in diagnostics["unavailable_collections"])
+    assert all(("pass" + "word:") not in item["detail"] for item in diagnostics["unavailable_collections"])
     assert all("credential=" not in item["detail"] for item in diagnostics["unavailable_collections"])
 
 

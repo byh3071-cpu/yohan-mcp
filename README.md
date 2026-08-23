@@ -482,3 +482,13 @@ python scripts/validate_schemas.py   # 스키마 정합성
 ```
 
 > 테스트는 `python -m pytest` 로 실행한다. 기준(2026-07): `pytest -m "not integration"` 292 collected / 291 passed / 1 deselected. E4-01 SoT 리팩터의 저널 공유 오염 회귀는 `tests/conftest.py` autouse 격리로 해소됐다(#7 closed). `integration` 마커는 실 Qdrant(`QDRANT_URL`)가 있을 때만 돈다.
+
+### Brain 교차저장소 골든 테스트
+
+`YOHAN_BRAIN_GOLDEN_ROOT`는 `tests/test_targeted_retrieval.py`의 교차저장소 fixture에만 쓰는 테스트 전용 변수다. 운영 런타임 연결은 기존 `YOHAN_BRAIN_ROOT` 계약을 그대로 사용한다.
+
+```powershell
+$env:YOHAN_BRAIN_GOLDEN_ROOT = 'C:\path\to\yohan-brain'
+python -m pytest tests/test_targeted_retrieval.py -q
+Remove-Item Env:YOHAN_BRAIN_GOLDEN_ROOT
+```
