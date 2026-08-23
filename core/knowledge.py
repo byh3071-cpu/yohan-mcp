@@ -47,6 +47,9 @@ REGISTRY_TTL = timedelta(hours=24)
 LEASE_SECONDS = 900
 MIN_EVIDENCE_QUOTE_CHARS = 10
 MIN_EVIDENCE_QUOTE_WORDS = 8
+# 8단어에서 끊으면 한국어 서술어(문장 끝)가 잘려 근거가 주장을 못 지탱한다.
+# 최소 단어를 채운 뒤 종결어미까지 확장하고, 이 토큰 수를 넘기지 않는다.
+MAX_EVIDENCE_QUOTE_TOKENS = 60
 MAX_PUBLIC_CAPTION_VTT_BYTES = 2 * 1024 * 1024
 MAX_NOTEBOOKLM_SOURCE_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_CAPTION_CUE_GAP_SECONDS = 1.0
@@ -1014,6 +1017,22 @@ def _evidence_tokens(value: str) -> list[str]:
     return [token.casefold() for token in _raw_evidence_tokens(value)]
 
 
+_SENTENCE_FINAL_SUFFIXES = (
+    "니다", "거든요", "는데요", "네요", "군요", "세요", "예요", "에요",
+    "죠", "잖아요", "라고요", "합니다", "됩니다",
+)
+
+
+def _is_sentence_final(token: str) -> bool:
+    """자막에 구두점이 없는 경우가 많아 한국어 종결어미로 문장 끝을 판정한다."""
+    if token in {".", "!", "?", "…", "。"} or token.endswith((".", "!", "?")):
+        return True
+    if token.endswith(_SENTENCE_FINAL_SUFFIXES):
+        return True
+    # "중요"·"필요"처럼 어미가 아닌 "요" 단독은 제외하고, 평서형 "-다"만 받는다.
+    return len(token) >= 2 and token.endswith("다")
+
+
 def _statement_is_evidence_fragment(statement: str, quote: str) -> bool:
     """Reject a claim that is only a contiguous transcript excerpt."""
     statement_tokens = tuple(_evidence_tokens(statement))
@@ -1236,7 +1255,11 @@ class CaptionEvidence:
             start_part = "start" if start_ratio < 1 / 3 else "middle" if start_ratio < 2 / 3 else "end"
             words = 0
             phrase: list[str] = []
-            for offset, token in enumerate(self.token_stream[start : start + 15]):
+            base_key: tuple[str, ...] | None = None
+            chosen_key: tuple[str, ...] | None = None
+            for offset, token in enumerate(
+                self.token_stream[start : start + MAX_EVIDENCE_QUOTE_TOKENS]
+            ):
                 if token == _CAPTION_GAP_SENTINEL:
                     break
                 ratio = self.token_timestamps[start + offset] / max(self.duration_seconds, 0.001)
@@ -1246,10 +1269,16 @@ class CaptionEvidence:
                 phrase.append(token)
                 words += int(token.isalnum())
                 if words >= MIN_EVIDENCE_QUOTE_WORDS:
-                    key = tuple(phrase)
-                    spans.append((start, key, start_part))
-                    counts[key] = counts.get(key, 0) + 1
-                    break
+                    if base_key is None:
+                        base_key = tuple(phrase)
+                    if _is_sentence_final(token):
+                        chosen_key = tuple(phrase)
+                        break
+            # 종결어미를 찾으면 문장 끝까지, 못 찾으면 기존 최소 길이로 되돌린다.
+            key = chosen_key if chosen_key is not None else base_key
+            if key is not None:
+                spans.append((start, key, start_part))
+                counts[key] = counts.get(key, 0) + 1
 
         candidates: list[EvidenceCandidate] = []
         prefixes = {"start": "CS", "middle": "CM", "end": "CE"}
@@ -2092,7 +2121,16 @@ def parse_draft(raw: str) -> dict[str, Any] | None:
     return None
 
 
+# source-to-summary-protocol-v2 E3 구조. LLM이 뱉는 닫힌집합은 코드에서 대조한다.
+_DRAFT_DIRECTIONS = {"계속 공부", "필요할 때 학습", "관찰만", "중단"}
+_DRAFT_CONFIDENCE = {"높음", "중간", "낮음"}
+_CRITICAL_JUDGMENT_FIELDS = {"steelman", "attack", "failure_cost", "confidence"}
+
 _DRAFT_TOP_LEVEL_FIELDS = {
+    "headline_conclusion",
+    "critical_judgment",
+    "two_week_experiment",
+    "direction",
     "title",
     "summary",
     "key_points",
@@ -2237,7 +2275,26 @@ def _sanitize_draft_contract(draft: Mapping[str, Any]) -> dict[str, Any]:
     if len(json.dumps(promotion, ensure_ascii=False).encode("utf-8")) > MAX_PROMOTION_CANDIDATE_BYTES:
         raise DraftContractError("NotebookLM promotion candidate input exceeds the size limit.")
 
+    judgment = draft.get("critical_judgment")
+    if not isinstance(judgment, dict) or set(judgment) != _CRITICAL_JUDGMENT_FIELDS:
+        raise DraftContractError("NotebookLM 비판적 판단 필드가 올바르지 않습니다.")
+    confidence = _contract_text(judgment.get("confidence"), maximum=16)
+    if confidence not in _DRAFT_CONFIDENCE:
+        raise DraftContractError("NotebookLM 확신도 값이 허용 목록에 없습니다.")
+    direction = _contract_text(draft.get("direction"), maximum=32)
+    if direction not in _DRAFT_DIRECTIONS:
+        raise DraftContractError("NotebookLM 방향 값이 허용 목록에 없습니다.")
+
     return {
+        "headline_conclusion": _contract_text(draft.get("headline_conclusion"), maximum=500),
+        "critical_judgment": {
+            "steelman": _contract_text(judgment.get("steelman"), maximum=4_000),
+            "attack": _contract_text(judgment.get("attack"), maximum=4_000),
+            "failure_cost": _contract_text(judgment.get("failure_cost"), maximum=4_000),
+            "confidence": confidence,
+        },
+        "two_week_experiment": _contract_text(draft.get("two_week_experiment"), maximum=2_000),
+        "direction": direction,
         "title": _contract_text(draft.get("title"), maximum=1_000),
         "summary": _contract_text(draft.get("summary")),
         "key_points": _contract_text_list(draft.get("key_points")),
@@ -2334,10 +2391,9 @@ def _hydrate_candidate_draft(
                 "Coverage statement must describe the segment, not repeat the evidence quote."
             )
         hydrated_coverage[part] = {"statement": statement, "evidence_quote": candidate.quote}
-        selected.append({
-            "item_id": f"C{part.upper()}", "candidate_id": candidate_id,
-            "quote": candidate.quote, "statement": statement,
-        })
+        # 커버리지 statement는 "이 구간이 무엇을 다루는가"라는 메타 서술이라 인용이 그것을
+        # 함의할 수 없다. 근거성은 이미 위치로 기계 검증된다(CS/CM/CE는 해당 구간에서만
+        # 선택 가능). 여기에 의미 함의 검사를 걸면 정상 서술이 전량 불합격한다.
 
     hydrated = dict(draft)
     hydrated["claims"] = hydrated_claims
@@ -2372,6 +2428,10 @@ def ground_draft_with_caption_evidence(
     """Replace model timestamps with verified caption positions and strip quotes."""
     sanitized = _sanitize_draft_contract(draft)
     grounded = {
+        "headline_conclusion": sanitized["headline_conclusion"],
+        "critical_judgment": sanitized["critical_judgment"],
+        "two_week_experiment": sanitized["two_week_experiment"],
+        "direction": sanitized["direction"],
         "title": sanitized["title"],
         "summary": sanitized["summary"],
         "key_points": sanitized["key_points"],
@@ -2605,7 +2665,15 @@ def build_query_prompt(job: Mapping[str, Any]) -> str:
                 "evidence_quote": "끝 구간에서 그대로 복사한 짧은 원문 구절",
             },
         },
-        "yohan_relevance": "요한의 1인 AI 운영 적용점",
+        "headline_conclusion": "핵심 문제와 결론 한 문장",
+        "critical_judgment": {
+            "steelman": "이 주장이 성립하는 가장 강한 조건",
+            "attack": "반례·분야별 차이·책임 소재·장기 감가상각",
+            "failure_cost": "주장이 틀렸을 때 놓치는 것",
+            "confidence": "중간",
+        },
+        "two_week_experiment": "2주 안에 검증할 구체 행동 하나",
+        "direction": "필요할 때 학습",        "yohan_relevance": "요한의 1인 AI 운영 적용점",
         "uncertainties": ["없음"],
         "promotion_candidates": {"concepts": [], "people": [], "triples": []},
     }
@@ -2631,12 +2699,22 @@ def build_candidate_query_prompt(
 ) -> str:
     skeleton = {
         "title": "video title",
-        "summary": "grounded summary",
-        "key_points": ["point 1", "point 2", "point 3"],
-        "claims": [{
-            "type": "fact", "statement": "fact statement",
-            "evidence_id": "CS01",
-        }],
+        "headline_conclusion": "one sentence: the central problem and the conclusion",
+        "critical_judgment": {
+            "steelman": "strongest condition under which the claim holds",
+            "attack": "counterexamples, domain differences, accountability, long-term decay",
+            "failure_cost": "what is lost if the claim is wrong",
+            "confidence": "중간",
+        },
+        "two_week_experiment": "one concrete action verifiable within two weeks",
+        "direction": "필요할 때 학습",        "summary": "2 to 4 short paragraphs",
+        "key_points": ["point 1", "point 2", "point 3", "point 4", "point 5", "point 6"],
+        "claims": [
+            {"type": "fact", "statement": "fact statement", "evidence_id": "CS01"},
+            {"type": "fact", "statement": "another fact", "evidence_id": "CM01"},
+            {"type": "interpretation", "statement": "analysis"},
+            {"type": "recommendation", "statement": "what to do"},
+        ],
         "coverage": {
             "start": {"statement": "start", "evidence_id": "CS01"},
             "middle": {"statement": "middle", "evidence_id": "CM01"},
@@ -2661,6 +2739,15 @@ def build_candidate_query_prompt(
         "Every fact statement must be a concise, complete, standalone claim directly supported by the selected evidence candidate.",
         "Do not copy, lightly restate, or continue the evidence quote as a fact statement. The system attaches the immutable quote and timestamp.",
         "Put broader analysis only in interpretation or recommendation claims.",
+        "Cover the whole video. The example counts are a shape, not a limit: produce every "
+        "fact the evidence candidates can support, plus the interpretations and recommendations "
+        "the source warrants.",
+        "summary must be 2 to 4 short paragraphs of prose, never a bullet list.",
+        "Separate what the speaker tells you to keep studying from what the speaker tells you "
+        "to stop chasing; put each in an interpretation or recommendation claim.",
+        "List every unverified proper noun, number, and causal link as its own uncertainties entry.",
+        "critical_judgment.confidence must be exactly one of 높음, 중간, 낮음.",
+        "direction must be exactly one of 계속 공부, 필요할 때 학습, 관찰만, 중단.",
         "Every coverage statement must describe what happens in that video third and must not copy the selected evidence quote.",
         "Coverage start/middle/end may select only CS/CM/CE IDs respectively.",
         "The system owns review flags. Do not output requires_crosscheck. Return one JSON object only.",
@@ -2679,8 +2766,14 @@ def build_semantic_evaluator_prompt(items: tuple[dict[str, str], ...]) -> str:
     }
     prompt = "\n".join((
         "Verdict-only semantic check for immutable evidence. Do not rewrite any field.",
-        "Return exact JSON only. Mark supported=false unless the quote directly supports the complete standalone statement.",
-        "A fragment, tautology, or statement that merely copies or lightly restates the quote is unsupported.",
+        "Return exact JSON only.",
+        "supported=true when the quote substantiates the core assertion of the statement, "
+        "even if the statement paraphrases it in different words or more formal language.",
+        "supported=false when the statement asserts specifics, causes, or scope "
+        "that the quote does not contain.",
+        # 복사·조각 판정은 _statement_is_evidence_fragment() 기계 검사가 결정론적으로 끝낸다.
+        # 평가기에 "가벼운 재진술도 불합격"까지 맡기면 인용에서 충실히 도출한 주장까지 잘려
+        # 전량 불합격이 된다(#72 회귀, 2026-08-23 실측 8/8). 평가기는 뒷받침 여부만 본다.
         f"ITEMS={json.dumps([dict(item) for item in items], ensure_ascii=False, separators=(',', ':'))}",
         json.dumps(skeleton, ensure_ascii=False, separators=(",", ":")),
     ))
@@ -3024,6 +3117,9 @@ class BrainWriter:
             if isinstance(claim, dict)
         )
         uncertainty = "\n".join(f"- {self._clean(item, 1000)}" for item in draft.get("uncertainties", [])) or "- 없음"
+        raw_judgment = draft.get("critical_judgment")
+        judgment = raw_judgment if isinstance(raw_judgment, dict) else {}
+        direction = self._clean(draft.get("direction"), 32) or "미분류"
         relative_resource = f"memory/ingest/url/{resource_path.name}"
         insight = "\n".join(
             (
@@ -3040,25 +3136,50 @@ class BrainWriter:
                 "",
                 f"# {title}",
                 "",
+                f"> {self._clean(draft.get('headline_conclusion'), 1000)}",
+                "",
+                "## 목적",
+                f"방향 판정 「{direction}」 — 2주 실험을 설계하거나 같은 주제를 다시 결정할 때 연다.",
+                "",
                 "## 핵심 요약",
                 self._clean(draft.get("summary"), 8000),
                 "",
-                "## 본문 — 논지 전개",
+                "## 영상의 논지",
                 points or "- 없음",
                 "",
-                "## 주장·근거 장부",
-                claims or "- 없음",
+                "## 비판적 판단",
+                "",
+                "### 가장 강한 조건",
+                self._clean(judgment.get("steelman"), 4000) or "- 없음",
+                "",
+                "### 반례·한계",
+                self._clean(judgment.get("attack"), 4000) or "- 없음",
+                "",
+                "### 틀렸을 때의 비용",
+                self._clean(judgment.get("failure_cost"), 4000) or "- 없음",
+                "",
+                f"### 확신도: {self._clean(judgment.get('confidence'), 16) or '미상'}",
                 "",
                 "## 내 생각",
                 self._clean(human_note, 4000) or "- 없음",
                 "",
-                "## 인사이트 → 적용",
+                "## 요한 생태계 적용",
                 self._clean(draft.get("yohan_relevance"), 3000),
                 "",
-                "## 불확실성",
+                "### 2주 실험",
+                self._clean(draft.get("two_week_experiment"), 2000) or "- 없음",
+                "",
+                "---",
+                "",
+                "## 검증 부록",
+                "",
+                "### 주장·근거 장부",
+                claims or "- 없음",
+                "",
+                "### 불확실성",
                 uncertainty,
                 "",
-                "## 출처·원문",
+                "### 출처·원문",
                 f"- {relative_resource}",
                 f"- {source_url}",
             )
@@ -3630,23 +3751,55 @@ class KnowledgeService:
                         source_id,
                         build_semantic_evaluator_prompt(semantic_items),
                     )
-                    validate_semantic_verdict(semantic_raw, semantic_items)
+                    # 근거 미달 주장 하나가 영상 전체를 죽이던 정책을 바꾼다. 평가기의 일은
+                    # 주장을 거르는 것이지 작업을 폐기하는 것이 아니다. 미달 주장은 장부에서
+                    # 빼고, 통과한 사실 주장이 하나도 남지 않을 때만 실패시킨다.
+                    unsupported_ids: tuple[str, ...] = ()
+                    try:
+                        validate_semantic_verdict(semantic_raw, semantic_items)
+                    except SemanticEvidenceError as verdict_error:
+                        unsupported_ids = tuple(getattr(verdict_error, "unsupported_ids", ()))
+                        if not unsupported_ids:
+                            raise  # 계약 위반(형식·누락)은 그대로 실패시킨다
                     verified_fact_ids = {
                         item["item_id"]
                         for item in semantic_items
                         if item["item_id"].startswith("F")
+                        and item["item_id"] not in unsupported_ids
                     }
+                    if not verified_fact_ids:
+                        raise SemanticEvidenceError(
+                            "Semantic evaluator supported no evidence item.",
+                            unsupported_ids=unsupported_ids,
+                            evaluated=len(semantic_items),
+                        )
+                    kept_claims: list[Any] = []
                     for index, claim in enumerate(draft["claims"], 1):
-                        if (
-                            claim.get("type") == "fact"
-                            and f"F{index:02d}" in verified_fact_ids
-                        ):
+                        item_id = f"F{index:02d}"
+                        if claim.get("type") == "fact" and item_id in unsupported_ids:
+                            continue
+                        if claim.get("type") == "fact" and item_id in verified_fact_ids:
                             claim["requires_crosscheck"] = False
+                        kept_claims.append(claim)
+                    if unsupported_ids:
+                        draft["claims"] = kept_claims
+                        # 장부가 바뀌었으니 품질 점수를 다시 매긴다.
+                        quality = evaluate_draft(
+                            draft,
+                            True,
+                            str(job.get("tier") or "T2"),
+                            evidence_contract=evidence_contract,
+                        )
                     quality["semantic_evaluator"] = "notebooklm-second-pass-semantic-consistency-v1"
                     quality["semantic_evaluator_independent"] = False
                     quality.setdefault("warnings", []).append(
                         "동일 NotebookLM의 2차 의미 일관성 검사이며 독립 모델 검증이 아닙니다. 최종 인간 판단이 필요합니다."
                     )
+                    if unsupported_ids:
+                        quality["semantic_unsupported_dropped"] = list(unsupported_ids)
+                        quality["warnings"].append(
+                            f"근거가 뒷받침하지 못한 사실 주장 {len(unsupported_ids)}건을 장부에서 제외했습니다."
+                        )
                 if not quality["passed"]:
                     queue.complete(
                         job,
