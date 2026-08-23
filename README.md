@@ -21,8 +21,8 @@
 | --- | --- | --- | --- |
 | 1 | `pip install -r requirements.txt` | 의존성 | 필수 |
 | 2 | `ollama pull bge-m3` | 임베딩 모델(1024d, 한국어 강함) | 의미검색 시 |
-| 3 | `docker compose up -d` | Qdrant 벡터DB(6333) | 의미검색 시 |
-| 4 | `copy .env.example .env` | 시크릿·설정 | 선택 |
+| 3 | `copy .env.example .env` | 로컬 Qdrant 경로·시크릿 설정 | 의미검색 시 |
+| 4 | `docker compose up -d` | 다중 MCP용 Qdrant 서버(선택) | 동시 세션 시 |
 | 5 | `python server.py` | MCP 서버(stdio) | 필수 |
 
 ### 1. 의존성 설치
@@ -41,21 +41,21 @@ ollama pull bge-m3
 
 Qdrant 의미검색은 임베딩이 있어야 의미가 있다. 기본 임베딩 백엔드는 `auto` 로 **ollama → local → hash** 순서로 폴백한다. ollama 가 없거나 모델 미설치면 의존성 0짜리 `hash`(384d) 로 떨어지는데, 이건 파이프라인 동작용일 뿐 의미품질이 낮다. 제대로 된 의미검색을 원하면 `bge-m3`(1024d) 를 깔아라.
 
-### 3. Qdrant (docker-compose)
-
-```powershell
-docker compose up -d
-```
-
-`docker-compose.yml` 은 Qdrant 컨테이너 하나를 띄운다 — REST `6333`, gRPC `6334`, 영속 볼륨 `./.qdrant_storage`. Docker 가 없으면 QdrantAdapter 가 임베디드 `:memory:` 모드로 자동 폴백하지만, 프로세스 종료 시 휘발하므로 **영속 시딩엔 컨테이너가 필요**하다.
-
-### 4. .env 작성
+### 3. Qdrant (로컬 파일 또는 서버)
 
 ```powershell
 copy .env.example .env
 ```
 
-`.env.example` 를 복사해 필요한 값만 채운다. **`.env` 는 커밋 금지**(`.gitignore` 대상). 대부분 선택값이라 비워둬도 서버는 뜨고, 미설정 백엔드는 `status` 에서 FAIL/미설정으로 표시된다. 전체 변수는 아래 [환경변수](#환경변수-env) 참조.
+기본 예시는 `QDRANT_PATH=./.qdrant_storage`에 해당하는 로컬 파일 영속 모드다. Docker가 필요 없지만 단일 프로세스만 접근할 수 있다. 여러 Claude Code/Codex 세션이 각자 MCP 서버를 띄우면 락이 경합하므로, 동시 세션이 필요할 때는 `QDRANT_PATH`를 비우고 `QDRANT_URL`을 Qdrant 서버로 지정한다.
+
+### 4. Qdrant 서버 (동시 세션 선택)
+
+```powershell
+docker compose up -d
+```
+
+`docker-compose.yml`은 Qdrant 서버를 REST `6333`, gRPC `6334`로 띄운다. 이 모드에서는 `.env`의 `QDRANT_PATH`를 비우고 `QDRANT_URL=http://localhost:6333`을 설정한다. **`.env`는 커밋 금지**다. 전체 변수는 아래 [환경변수](#환경변수-env) 참조.
 
 ### 5. 서버 실행
 
@@ -159,14 +159,16 @@ FastMCP 진입점. **도구 16개 + Resources + Prompts** 를 등록한다. impo
 | 어댑터 | 백엔드 | 상태 |
 | --- | --- | --- |
 | `notion_adapter` | Notion API v1 | 실동작 — `NOTION_TOKEN` 없으면 create 가 드라이런 폴백 |
-| `memory_adapter` | 로컬 `memory/`(yaml) + brain `.md`(읽기) | 실동작 — 무설정(profile/decision/ingest CRUD) + ADR-008 B.3: brain 지식폴더(decisions·wiki·ingest·knowledge-hub·projects·rules)의 `.md`+frontmatter 를 **읽기 전용** 회수(type `brain:<folder>`) |
+| `memory_adapter` | 로컬 `memory/`(yaml) + Brain 계약 corpus(읽기) | 실동작 — 무설정(profile/decision/ingest CRUD) + startup lexical snapshot으로 P0/P1/P2 문서를 읽기 전용 회수. 질의 중 source open/rglob 없이 stat 신선도만 검사 |
 | `qdrant_adapter` | Qdrant 벡터DB | 실동작 — `QDRANT_URL` 없으면 `:memory:` 폴백 |
 | `studio_adapter` | yohan-studio 레포(MDX) | 실동작 — 기본 `dry_run`(파일 미작성) |
 | `n8n_adapter` | n8n | `health_check` 만(search/create 미구현) |
 
 ### 검색·융합 (RRF)
 
-`search`/`get_context` 는 라우터가 활성 백엔드를 골라 병렬 호출한 뒤 **RRF(k=60)** 로 순위 융합한다. 융합 키는 `타입::id` 라 서로 다른 엔티티를 오융합하지 않는다. Qdrant 는 쓰기 컬렉션(`yohan_resources`)에 더해 **yohan-control-tower 의 읽기전용 4컬렉션**(`knowledge_base`·`system_rules`·`semantic_cache`·`execution_history`, 동일 bge-m3 1024d)과 **brain 2컬렉션**(`brain_memory`·`ontology_triples`)까지 검색한다 — 기본 7컬렉션. `QDRANT_SEARCH_COLLECTIONS`(CSV) 는 이 기본 목록을 **덮어쓰지 않고 추가(append)만** 한다(env 를 설정하면 기본 컬렉션이 통째로 사라져 회수가 조용히 줄던 풋건 방지 — MINOR I). 검색 대상을 특정 컬렉션으로 **격리**하려면 어댑터 생성 후 `.search_collections` 를 직접 덮어써라(`tests/test_integration_qdrant.py` 참고).
+`search`/`get_context` 는 라우터가 활성 백엔드를 골라 병렬 호출한 뒤 **RRF(k=60)** 로 순위 융합한다. 융합 키는 `타입::id` 라 서로 다른 엔티티를 오융합하지 않는다. 백엔드별 기본 상한은 20초(`SEARCH_BACKEND_TIMEOUT_SEC`)이며 호출별 `opts.backend_timeout_s` 로 재정의할 수 있다. 한 백엔드가 시간 초과해도 다른 결과는 부분 성공으로 보존하고 `errors` 에 timeout 을 남긴다. 응답 `data.diagnostics` 는 백엔드별 소요시간을, Qdrant 는 임베딩·컬렉션별 소요시간과 성공/실패 수를 추가로 제공한다.
+
+Qdrant 는 쓰기 컬렉션(`yohan_resources`)에 더해 **yohan-control-tower 의 읽기전용 4컬렉션**(`knowledge_base`·`system_rules`·`semantic_cache`·`execution_history`, 동일 bge-m3 1024d)과 **brain 2컬렉션**(`brain_memory`·`ontology_triples`)까지 검색한다 — 기본 7컬렉션. `QDRANT_SEARCH_COLLECTIONS`(CSV) 는 이 기본 목록을 **덮어쓰지 않고 추가(append)만** 한다(env 를 설정하면 기본 컬렉션이 통째로 사라져 회수가 조용히 줄던 풋건 방지 — MINOR I). 검색 대상을 특정 컬렉션으로 **격리**하려면 어댑터 생성 후 `.search_collections` 를 직접 덮어써라(`tests/test_integration_qdrant.py` 참고).
 
 ---
 
@@ -402,9 +404,11 @@ python scripts/validate_schemas.py
 
 | 변수 | 기본 | 설명 |
 | --- | --- | --- |
-| `QDRANT_URL` | (없음→`:memory:`) | 예: `http://localhost:6333` |
+| `QDRANT_PATH` | (없음) | Docker 없는 로컬 파일 영속 모드. 단일 프로세스 전용이며 `QDRANT_URL`과 동시 설정 시 하드 실패 |
+| `QDRANT_URL` | (없음→`:memory:`) | 다중 MCP 프로세스가 함께 쓸 Qdrant 서버 URL. `QDRANT_PATH`와 동시 설정 금지. 예: `http://localhost:6333` |
 | `QDRANT_COLLECTION` | `yohan_resources` | 쓰기 컬렉션 |
 | `QDRANT_SEARCH_COLLECTIONS` | (없음) | 기본 검색셋(쓰기 + 관제탑 4 + brain 2)에 **추가**할 컬렉션 CSV — override 아님(격리는 `.search_collections` 직접 설정) |
+| `SEARCH_BACKEND_TIMEOUT_SEC` | `20` | 통합 검색 백엔드별 시간 상한(초, 유한 양수·최대 300). 호출별 `opts.backend_timeout_s` 우선 |
 | `EMBED_BACKEND` (구 `EMBEDDING_BACKEND`) | `auto` | `auto`·`ollama`·`local`·`openai`·`hash` |
 | `EMBEDDING_MODEL` | 백엔드별 상이 | ollama=`bge-m3`, openai=`text-embedding-3-small`, local=`paraphrase-multilingual-MiniLM-L12-v2` |
 | `OLLAMA_URL` | `http://localhost:11434` | ollama 서버 |
@@ -462,7 +466,9 @@ docker compose ps           # 상태 확인
 docker compose down         # 정지(볼륨 유지)
 ```
 
-- Docker 없으면 QdrantAdapter 가 임베디드 `:memory:` 로 자동 폴백한다 — **단, 휘발성**(프로세스 종료 시 소실)이라 영속 시딩엔 컨테이너가 필요하다.
+- `QDRANT_PATH` 파일 모드는 Docker 없이 영속하지만 **단일 프로세스 전용**이다. 여러 MCP 서버가 떠 있으면 락 경합이 나므로 재시딩 전 연결된 클라이언트를 모두 종료한다.
+- `scripts/reseed-brain.ps1`은 `brain_memory` 증분 시딩 뒤 `ontology_triples`를 멱등 시딩한다. `--rebuild`를 쓰지 않아 기존 컬렉션을 삭제하지 않는다.
+- 여러 MCP 프로세스가 동시에 검색해야 하면 `QDRANT_PATH`를 비우고 위 Docker 서버의 `QDRANT_URL`을 사용한다.
 - **Ollama 는 compose 에 없다** — 별도로 설치하고 `ollama pull bge-m3` 로 모델만 받으면 된다(기본 `http://localhost:11434`).
 - 기동 후 `status` 도구로 5개 백엔드 + (설정 시) headroom 헬스를 한 번에 확인한다.
 

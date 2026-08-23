@@ -6,6 +6,7 @@
 # 택했으므로 이 제약은 설계상 감수한 대가다.
 #
 # 실행:  powershell -NoProfile -File "C:\Users\Public\dev\yohan-ecosystem\yohan-mcp\scripts\reseed-brain.ps1"
+# 결과: brain_memory 증분 upsert + ontology_triples 멱등 upsert. 컬렉션 삭제/재생성 없음.
 
 $ErrorActionPreference = 'Stop'
 
@@ -29,19 +30,26 @@ foreach ($p in @($py, $seed)) {
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $OutputEncoding = [Text.Encoding]::UTF8
 
-Write-Host "브레인 재시딩 시작 — 증분(변경/신규 파일만)" -ForegroundColor Cyan
+Write-Host "브레인 재시딩 시작 — memory 증분 + ontology triples 멱등" -ForegroundColor Cyan
 Write-Host "  brain : $env:YOHAN_BRAIN_ROOT"
 Write-Host "  qdrant: $env:QDRANT_PATH`n"
 
+Write-Host "[1/2] brain_memory 증분 시딩" -ForegroundColor Cyan
 & $py $seed
 $code = $LASTEXITCODE
 
+if ($code -eq 0) {
+    Write-Host "`n[2/2] ontology_triples 멱등 시딩" -ForegroundColor Cyan
+    & $py $seed triples
+    $code = $LASTEXITCODE
+}
+
 Write-Host ""
 if ($code -eq 0) {
-    Write-Host "완료 — Claude Code 를 다시 켜면 확장된 색인이 붙는다." -ForegroundColor Green
+    Write-Host "완료 — yohan MCP 클라이언트를 다시 켜면 두 컬렉션이 검색에 붙는다." -ForegroundColor Green
 } else {
     # 락 충돌이 압도적으로 흔한 실패라 원인을 콕 집어준다.
     Write-Host "실패 (exit $code)" -ForegroundColor Red
-    Write-Host "PermissionError/Errno 13 이면 Claude Code 가 아직 떠 있다는 뜻 — 완전히 종료 후 재실행." -ForegroundColor Yellow
+    Write-Host "PermissionError/Errno 13 이면 yohan MCP 서버가 아직 떠 있다는 뜻 — 연결된 클라이언트를 모두 종료 후 재실행." -ForegroundColor Yellow
 }
 exit $code

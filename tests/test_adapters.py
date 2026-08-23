@@ -61,6 +61,11 @@ async def test_memory_corrupt_yaml_isolated(tmp_path):
     (ddir / "broken.yaml").write_text("title: 'unterminated\nstatus: [", encoding="utf-8")  # ScannerError
     (ddir / "scalar.yaml").write_text("그냥 문자열", encoding="utf-8")  # dict 아닌 스칼라
 
+    # External membership changes invalidate the startup snapshot loudly.
+    with pytest.raises(RuntimeError, match="memory_index_stale:directory_membership_changed"):
+        await m.search("킵미")
+    m.refresh_search_index()
+
     found = await m.search("킵미")  # ParserError/AttributeError 로 죽지 않아야 함
     assert [r["id"] for r in found] == ["good"]
     all_ = await m.search("")  # 전건 나열도 정상 파일만

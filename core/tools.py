@@ -30,6 +30,12 @@ from adapters.notion_adapter import NotionAdapter
 from adapters.qdrant_adapter import QdrantAdapter
 from adapters.studio_adapter import StudioAdapter
 from core.router import PER_PAGE_CAP_DEFAULT, SmartRouter
+from core.context_resolver import (
+    GraphAwareContextResolver,
+    RetrievalDiagnostics,
+    load_project_catalog,
+    resolve_entities,
+)
 from core.schema_validator import SchemaValidator
 from core.links import LinkStore
 from core.approval import ApprovalQueue
@@ -42,7 +48,41 @@ from core import verify as V
 
 ROOT = Path(__file__).resolve().parent.parent
 
+CONTEXT_GRAPH_CANDIDATE_FLOOR = 20
+CONTEXT_GRAPH_CANDIDATE_MAX = 50
+
 logger = logging.getLogger(__name__)
+
+
+def _context_search_candidate_limit(opts: dict, *, has_entities: bool) -> int:
+    """get_context의 출력 예산과 별도로 그래프 후보를 확보할 1차 검색 상한을 계산한다.
+
+    ontology_triples는 일반 문서보다 벡터 점수가 조금 낮을 수 있다. 출력 top_k만큼만
+    먼저 잘라 resolver에 넘기면 관련 트리플이 후보 단계에서 사라진다. 엔티티 질의일
+    때만 bounded reserve를 열고, resolver는 원래 opts로 최종 match/문자 예산을 지킨다.
+    """
+    try:
+        top_k = int(opts.get("top_k", 5))
+    except (TypeError, ValueError):
+        top_k = 5
+    if top_k == 0:
+        return 0
+    if top_k < 0:
+        return CONTEXT_GRAPH_CANDIDATE_MAX
+    requested = min(max(top_k, 0), CONTEXT_GRAPH_CANDIDATE_MAX)
+    if not has_entities:
+        return requested
+    try:
+        max_edges = int(opts.get("context_max_edges", 8))
+    except (TypeError, ValueError):
+        max_edges = 8
+    max_edges = min(max(max_edges, 0), 30)
+    if max_edges == 0:
+        return requested
+    return min(
+        CONTEXT_GRAPH_CANDIDATE_MAX,
+        max(requested, CONTEXT_GRAPH_CANDIDATE_FLOOR, requested + max_edges * 2),
+    )
 
 
 def _envelope(data, schema_valid, sources_used, **extra) -> dict:
@@ -246,6 +286,7 @@ class ToolContext:
         policy: "PolicyEngine | None" = None,
         scheduler: "S.Scheduler | None" = None,
         create_store: "CreateStore | None" = None,
+        entity_catalog: dict[str, tuple[str, ...]] | None = None,
     ):
         self.adapters = adapters
         self.router = router
@@ -260,6 +301,18 @@ class ToolContext:
         # P5 — 정책 엔진(감사 로그) + 스케줄러(트리거). 정책 자동승인/사람 폴백.
         self.policy = policy or PolicyEngine(log_path=Path(base) / "policy_log.jsonl")
         self.scheduler = scheduler or S.Scheduler(runlog_path=Path(base) / "trigger_runs.jsonl")
+        # 작은 inheritance-registry.yaml 한 파일에서 만든 런타임 카탈로그.
+        # 전체 brain 문서를 순회하지 않으며 테스트는 dict 를 직접 주입한다.
+        self.entity_catalog = entity_catalog if entity_catalog is not None else load_project_catalog()
+        self.entity_catalog_diagnostics = dict(
+            getattr(self.entity_catalog, "diagnostics", {
+                "source": "injected",
+                "revision": None,
+                "degraded": False,
+                "reason_code": "injected_catalog",
+                "invalid_keys_excluded": 0,
+            })
+        )
 
     @classmethod
     def from_env(cls) -> "ToolContext":
@@ -301,7 +354,11 @@ async def tool_search(ctx: ToolContext, query: str, opts: dict | None = None) ->
         valids.append(ok)
     schema_valid = all(valids) if valids else True
     return _envelope(
-        {"results": results, "count": len(results)},
+        {
+            "results": results,
+            "count": len(results),
+            "diagnostics": res["diagnostics"],
+        },
         schema_valid,
         res["sources_used"],
         errors=res["errors"],
@@ -437,8 +494,44 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
     # raw search(tool_search·protocol search step)는 router 기본(무제한)이라 회수가 조용히
     # 줄지 않는다. 호출자가 명시하면(0=끔 포함) 그 값이 우선.
     opts = {"per_page_cap": PER_PAGE_CAP_DEFAULT, **(opts or {})}
-    res = await ctx.router.search(query, opts)
-    matches = res["results"]
+    pre_entities = resolve_entities(
+        query,
+        ctx.entity_catalog,
+        project=opts.get("project"),
+        max_entities=3,
+    )
+    if not opts.get("project"):
+        detected_project = next(
+            (entity.canonical for entity in pre_entities if entity.kind == "project"),
+            None,
+        )
+        if detected_project:
+            opts["project"] = detected_project
+    # 최종 출력 예산(top_k/context_max_matches)은 그대로 두되, 엔티티 질의의 1차
+    # 후보풀만 제한적으로 넓혀 혼합 컬렉션에서 ontology_triples가 선절단되지 않게 한다.
+    # resolver는 원래 opts를 받아 최종 결과 수·문자 수를 다시 제한한다.
+    search_opts = dict(opts)
+    # Preserve the public vector-on router default. Callers may still pass an
+    # explicit ``backends`` list for lexical-only operation; unavailable
+    # Qdrant collections are surfaced in retrieval_diagnostics.
+    search_opts["top_k"] = _context_search_candidate_limit(
+        opts,
+        has_entities=bool(pre_entities),
+    )
+    res = await ctx.router.search(query, search_opts)
+
+    async def _supplemental_search(supplemental_query: str, supplemental_opts: dict) -> dict:
+        bounded = dict(supplemental_opts)
+        bounded["backends"] = list(search_opts.get("backends") or [])
+        return await ctx.router.search(supplemental_query, bounded)
+
+    resolved = await GraphAwareContextResolver(ctx.entity_catalog).resolve(
+        query,
+        res,
+        _supplemental_search,
+        opts,
+    )
+    matches = resolved.matches
     matched_types = {r.get("type") for r in matches}
     related = [
         link for link in ctx._links()
@@ -454,6 +547,14 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
     # 회수 실패는 봉투 errors 에 실어 '패턴 0건'과 '회수 전멸'을 구분 가능하게 한다
     # (안 실으면 호출자가 무음 0건과 예외 삼킴을 구분 못 함). router search errors 에 합류.
     errors = dict(res["errors"])
+    sources = list(res["sources_used"])
+    supplemental = resolved.supplemental_result
+    if supplemental:
+        for source in supplemental.get("sources_used") or []:
+            if source not in sources:
+                sources.append(source)
+        for name, message in (supplemental.get("errors") or {}).items():
+            errors[f"supplemental:{name}"] = message
     devlog_q = getattr(notion, "devlog_query", None)
     pattern_q = getattr(notion, "pattern_query", None)
     if devlog_q and project:
@@ -470,14 +571,42 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
             logger.warning("pattern 회수 실패: %s: %s", type(exc).__name__, exc)
             patterns = []
             errors["notion:pattern"] = f"{type(exc).__name__}: {exc}"
-    sources = list(res["sources_used"])
     if devlog:
         sources.append("notion:devlog")
     if patterns:
         sources.append("notion:pattern")
+    diagnostics = dict(res["diagnostics"])
+    diagnostics["entity_catalog"] = dict(ctx.entity_catalog_diagnostics)
+    diagnostics["context_resolver"] = {
+        "supplemental_searches": resolved.supplemental_searches,
+        "context_chars": resolved.context_chars,
+        "context_char_budget": resolved.char_budget,
+        "max_matches": resolved.max_matches,
+        "entity_count": len(resolved.entities),
+        "graph_edge_count": len(resolved.graph_edges),
+        "detected_project": opts.get("project"),
+        "primary_candidate_limit": search_opts["top_k"],
+        "supplemental_diagnostics": supplemental.get("diagnostics", {}) if supplemental else {},
+    }
+    retrieval_diagnostics = RetrievalDiagnostics.from_retrieval(
+        query=query,
+        matches=matches,
+        entities=resolved.entities,
+        graph_edges=resolved.graph_edges,
+        sources_used=sources,
+        errors=errors,
+        diagnostics=diagnostics,
+        supplemental_searches=resolved.supplemental_searches,
+        char_budget=resolved.char_budget,
+        max_matches=resolved.max_matches,
+    ).as_dict()
     env = _envelope(
-        {"matches": matches, "related_links": related,
-         "devlog": devlog, "patterns": patterns, "count": len(matches)},
+        {"matches": matches, "entities": resolved.entities,
+         "graph_edges": resolved.graph_edges, "related_links": related,
+         "devlog": devlog, "patterns": patterns, "count": len(matches),
+         "resolver": diagnostics["context_resolver"],
+         "retrieval_diagnostics": retrieval_diagnostics,
+         "diagnostics": diagnostics},
         True,
         sources,
         errors=errors,

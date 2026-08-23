@@ -3,8 +3,8 @@
 """yohan-mcp v2 — yohan-brain memory/ 벡터 인제스트 (스프린트 필수 코어 ②).
 
 두 서브커맨드:
-  memory  (기본, 서브커맨드 생략 가능) — memory/ allowlist 6폴더(decisions·wiki·ingest·
-           knowledge-hub·projects·rules)의 .md 전수를 md-aware 청킹(core/chunking.py) 후
+  memory  (기본, 서브커맨드 생략 가능) — Brain retrieval contract의 P0/P1/P2 문서를
+           md-aware 청킹(core/chunking.py) 후
            임베딩해 Qdrant 'brain_memory' 컬렉션에 적재.
   triples — memory/knowledge-hub/triple-map.md 의 트리플 표를 파싱(core/triple_map.py)해
            문장화 임베딩 후 'ontology_triples' 컬렉션에 적재.
@@ -44,6 +44,7 @@ import sys
 import uuid
 from pathlib import Path
 
+import yaml
 # Windows 콘솔 UTF-8 (docs/patterns/env-windows-console-utf8.md)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -55,7 +56,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv
 from qdrant_client import models
 
-from adapters.memory_adapter import MemoryAdapter, _BRAIN_KNOWLEDGE_DIRS
+from adapters.memory_adapter import (
+    _BRAIN_CORE_FILES,
+    MemoryAdapter,
+    _BRAIN_KNOWLEDGE_DIRS,
+    _BRAIN_NESTED_DOC_DIRS,
+    _BRAIN_REPO_DOC_DIRS,
+    iter_priority_brain_files,
+)
 from adapters.qdrant_adapter import (
     BRAIN_MEMORY_COLLECTION,
     ONTOLOGY_TRIPLES_COLLECTION,
@@ -63,7 +71,7 @@ from adapters.qdrant_adapter import (
 )
 from core.chunking import chunk_markdown
 from core.embeddings import embed_lenient
-from core.paths import ROOT, resolve_memory_dir
+from core.paths import ROOT, resolve_brain_root, resolve_memory_dir
 from core.triple_map import parse_triple_map, sentence_for_triple
 
 logger = logging.getLogger(__name__)
@@ -147,15 +155,12 @@ def _assert_ollama_embedder(embedder, allow_fallback: bool) -> None:
 # config 파일이 노이즈가 된다. 반면 벡터 회수는 유사도 순위라 저관련 문서가 위로 안 올라온다.
 # 그래서 공유 allowlist 는 건드리지 않고, 확장은 이 시딩 스크립트(벡터 경로) 안에서만 한다.
 # 결과적으로 두 경로의 대상이 갈라지므로 아래 목록이 벡터 색인 범위의 SoT 다.
-_VECTOR_EXTRA_MD_DIRS = ("core", "design-intelligence")  # core/*.md — anti-patterns·az-protocol 등 규범 문서
-# design-intelligence: 2026-08 신설 — allowlist·제외목록 어디에도 없어 조용히 빠져 있었다(누락 수정).
+_VECTOR_EXTRA_MD_DIRS: tuple[str, ...] = ()
 
 # 저장소 루트(= memory 의 부모) 기준 색인 폴더 — memory/ 밖이지만 실전 회수 가치가 높은 것만.
 # docs/ 246건 전체는 계획서·핸드오프·아카이브가 섞여 노이즈라 넣지 않는다. 규칙("에러 시
 # 패턴 사전 먼저 조회")이 지목하는 문서가 검색에 안 걸리던 구멍만 메운다.
-_VECTOR_REPO_MD_DIRS = {"docs/patterns": "patterns", "docs/troubleshooting": "troubleshooting"}
-_VECTOR_STATE_YAML = ("active-project.yaml", "profile.yaml", "soul.yaml")  # memory/ 루트
-_VECTOR_YAML_DIRS = ("core",)  # core/*.yaml — roster·ruleset·projects 등 상태 정본
+_VECTOR_STATE_YAML = ("active-project.yaml", "soul.yaml")  # memory/ 루트
 
 # yaml 선두 주석(`# 현재 집중 중인 작업`)이 md 헤딩으로 파싱돼 13자짜리 껍데기 청크가
 # 생긴다(active-project.yaml 실측). 임베딩 비용만 먹고 회수 가치는 0이라 버린다.
@@ -177,20 +182,30 @@ def _iter_brain_source_files(base: Path):
         # 경로 봉쇄(심링크 등으로 base 밖 탈출 차단)
         return p.resolve().is_relative_to(base_resolved)
 
-    for kdir in (*_BRAIN_KNOWLEDGE_DIRS, *_VECTOR_EXTRA_MD_DIRS):
-        root = base / kdir
+    memory_dirs = [
+        *((kdir, kdir) for kdir in _BRAIN_KNOWLEDGE_DIRS),
+        *((rel, kind) for rel, kind, _tier in _BRAIN_NESTED_DOC_DIRS),
+        *((kdir, kdir) for kdir in _VECTOR_EXTRA_MD_DIRS),
+    ]
+    for rel_dir, kdir in memory_dirs:
+        root = base / rel_dir
         if not root.exists():
             continue
         for p in sorted(root.rglob("*.md")):
             if _inside(p):
                 yield kdir, p
 
+    # R1 priority corpus outside memory/: canonical root SoTs, live Goals/ADRs.
+    for kdir, p in iter_priority_brain_files(base):
+        if kdir in {"root", "goal", "adr"}:
+            yield kdir, p
+
     repo_root = base_resolved.parent
 
     def _inside_repo(p: Path) -> bool:
         return p.resolve().is_relative_to(repo_root)
 
-    for rel, kdir in _VECTOR_REPO_MD_DIRS.items():
+    for rel, kdir, _tier in _BRAIN_REPO_DOC_DIRS:
         root = repo_root / rel
         if not root.exists():
             continue
@@ -203,22 +218,24 @@ def _iter_brain_source_files(base: Path):
         if p.exists() and _inside(p):
             yield "state", p
 
-    for kdir in _VECTOR_YAML_DIRS:
-        root = base / kdir
-        if not root.exists():
-            continue
-        for p in sorted(root.glob("*.yaml")):  # rglob 아님 — core/ 바로 아래만
-            if _inside(p):
-                yield kdir, p
+    core = base / "core"
+    for name in _BRAIN_CORE_FILES:
+        p = core / name
+        if p.exists() and _inside(p):
+            yield "core", p
 
 
 def _rel_of(p: Path, base: Path) -> str:
     """매니페스트·payload 용 상대경로.
 
-    memory/ 안은 base 기준(`decisions/x.md`), 밖은 저장소 루트 기준(`docs/patterns/x.md`).
-    prefix 가 갈리므로 두 출처가 같은 키로 충돌하지 않는다.
+    A real Brain always uses repository-relative POSIX paths, identical to the
+    lexical manifest (for example ``memory/wiki/x.md``). Standalone fixtures
+    without a Brain root retain the legacy base-relative form.
     """
     pr, br = Path(p).resolve(), Path(base).resolve()
+    brain_root = resolve_brain_root(br)
+    if brain_root is not None:
+        return pr.relative_to(brain_root.resolve()).as_posix()
     try:
         return str(pr.relative_to(br)).replace("\\", "/")
     except ValueError:
@@ -236,6 +253,19 @@ def _title_of(rel_path: str, fm: dict) -> str:
 _SOURCE_FOOTER_RE = re.compile(
     r"^\*\*원문:\*\*[ \t]*\[열기\]\([^)\n]*\)[ \t]*$", re.MULTILINE
 )
+_EMBED_SECRET_RE = re.compile(
+    r"(?:Authorization\s*:\s*Bearer\s+(?!\$\{)[A-Za-z0-9._~+/-]{16,}|"
+    r"github_pat_[A-Za-z0-9_]{40,}|gh[oprsu]_[A-Za-z0-9]{30,}|"
+    r"secret_[A-Za-z0-9]{40,50}|"
+    r"sk-(?:proj-|ant-api03-|live-)[A-Za-z0-9_-]{16,}|"
+    r"(?:api[_-]?key|token|secret|password|credential)\s*[:=]\s*(?!\$\{)[\"']?[A-Za-z0-9._~+/-]{16,}|"
+    r"AKIA[0-9A-Z]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)",
+    re.IGNORECASE,
+)
+_LOCAL_ABSOLUTE_PATH_RE = re.compile(
+    r"(?i)(?:\b[A-Z]:[\\/][^\s\"']+|\\\\[^\\\s]+\\[^\s\"']+|"
+    r"/(?:Users|home|tmp|root|var/tmp)/[^\s\"']+)"
+)
 
 
 def _blank_source_footers(body: str) -> str:
@@ -245,6 +275,25 @@ def _blank_source_footers(body: str) -> str:
     삭제하면 뒤쪽 줄 번호가 전부 밀려 chunk_start_line 역링크가 어긋난다.
     """
     return _SOURCE_FOOTER_RE.sub("", body)
+
+
+def _safe_embedding_text(body: str, *, rel: str) -> str:
+    """Reject secret-bearing text and redact machine-local absolute paths."""
+    if _EMBED_SECRET_RE.search(body):
+        raise RuntimeError(f"brain_vector_secret_detected:{rel}")
+    return _LOCAL_ABSOLUTE_PATH_RE.sub("[LOCAL_PATH]", body)
+
+
+def _validate_yaml_for_embedding(body: str, *, kind: str, rel: str) -> object:
+    try:
+        parsed = yaml.safe_load(body)
+    except yaml.YAMLError as exc:
+        if kind in {"state", "core"}:
+            raise RuntimeError(f"brain_vector_invalid_priority_yaml:{rel}") from exc
+        raise
+    if kind in {"state", "core"} and not isinstance(parsed, dict):
+        raise RuntimeError(f"brain_vector_invalid_priority_yaml:{rel}")
+    return parsed
 
 
 async def seed_memory(
@@ -321,11 +370,16 @@ async def seed_memory(
         files = all_files[offset:]
         if limit:
             files = files[:limit]
-        md_dirs = ", ".join((*_BRAIN_KNOWLEDGE_DIRS, *_VECTOR_EXTRA_MD_DIRS, *_VECTOR_REPO_MD_DIRS))
+        md_dirs = ", ".join((
+            *_BRAIN_KNOWLEDGE_DIRS,
+            *(rel for rel, _kind, _tier in _BRAIN_NESTED_DOC_DIRS),
+            *(rel for rel, _kind, _tier in _BRAIN_REPO_DOC_DIRS),
+            *_VECTOR_EXTRA_MD_DIRS,
+        ))
+        yaml_files = ", ".join((*_VECTOR_STATE_YAML, *(f"core/{name}" for name in _BRAIN_CORE_FILES)))
         print(
             f"대상 파일: {len(files)}건(전체 {len(all_files)}건 중 offset={offset}) "
-            f"(md: {md_dirs} / yaml: {', '.join(_VECTOR_STATE_YAML)}, "
-            f"{'·'.join(f'{d}/*.yaml' for d in _VECTOR_YAML_DIRS)})"
+            f"(md: {md_dirs} / yaml: {yaml_files})"
         )
         # 삭제 감지는 슬라이스 전 디스크 전수 기준 — limit/offset 분할 실행이 삭제로 오인되지 않게.
         disk_rels = {_rel_of(p, base) for _, p in all_files}
@@ -394,6 +448,12 @@ async def seed_memory(
                     skipped_files += 1
                     print(f"  스킵 [{i}/{len(files)}] {path}: UTF-8 디코드 실패")
                     continue
+                try:
+                    _validate_yaml_for_embedding(body, kind=kdir, rel=rel)
+                except yaml.YAMLError:
+                    skipped_files += 1
+                    print(f"  스킵 [{i}/{len(files)}] {path}: YAML 구문 오류")
+                    continue
                 title = path.stem
                 base_line = 1
             else:
@@ -405,12 +465,17 @@ async def seed_memory(
                 body = rec.get("body", "")
                 title = _title_of(rel, rec)
                 base_line = int(rec.get("_body_start_line", 1))
+            body = _safe_embedding_text(body, rel=rel)
+            title = _safe_embedding_text(title, rel=rel)
             chunks = chunk_markdown(_blank_source_footers(body), base_line=base_line)
             if is_yaml:
                 # 껍데기 청크 제거(_MIN_YAML_CHUNK_CHARS 주석 참조).
                 # md 경로엔 적용하지 않는다 — 기존 청크 수가 바뀌면 매니페스트가 전부
                 # "축소된 파일"로 잡혀 stale 보고가 무의미하게 폭발한다.
-                chunks = [c for c in chunks if len(c.text.strip()) >= _MIN_YAML_CHUNK_CHARS]
+                filtered = [c for c in chunks if len(c.text.strip()) >= _MIN_YAML_CHUNK_CHARS]
+                # A valid priority YAML document must never disappear from the
+                # vector manifest just because it is concise.
+                chunks = filtered or chunks
             if prev is None:
                 n_new += 1
             else:

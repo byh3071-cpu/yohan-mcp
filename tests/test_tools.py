@@ -84,6 +84,10 @@ async def test_tool_search_rrf_envelope():
     results = env["data"]["results"]
     assert results[0]["id"] == "x2"  # 중복 → 최상위
     assert set(env["provenance"]["sources_used"]) == {"notion", "memory"}
+    assert set(env["data"]["diagnostics"]["backend_timings_ms"]) == {
+        "notion",
+        "memory",
+    }
 
 
 # ── create (타입→백엔드 자동선택 + 검증) ────────────────────────
