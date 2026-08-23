@@ -36,6 +36,8 @@ _RUNTIME_BUNDLE_PATHS = (
     "adapters/memory_adapter.py",
     "core/context_resolver.py",
     "core/router.py",
+    "core/tools.py",
+    "server.py",
 )
 
 
