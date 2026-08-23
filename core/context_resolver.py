@@ -85,6 +85,8 @@ class RetrievalDiagnostics:
     """
 
     index_revision: str | None
+    index_generation_id: str | None
+    corpus_contract_version: str | None
     index_fresh: bool | None
     freshness_reason_code: str | None
     recognized_entities: list[dict]
@@ -145,15 +147,22 @@ class RetrievalDiagnostics:
         evidence = []
         for record in matches:
             data = record.get("data") or {}
+            evidence_ref = record.get("evidence_ref") or {}
             evidence.append({
                 "type": record.get("type"),
                 "id": record.get("id"),
                 "backend": record.get("backend"),
                 "path": data.get("_path") or data.get("path"),
                 "sources": list(record.get("sources") or []),
+                "score": record.get("rrf_score", record.get("score")),
+                "document_id": evidence_ref.get("document_id"),
+                "content_hash": evidence_ref.get("content_hash"),
+                "locator": evidence_ref.get("locator"),
             })
         return cls(
             index_revision=memory.get("index_revision"),
+            index_generation_id=memory.get("index_generation_id"),
+            corpus_contract_version=memory.get("corpus_contract_version"),
             index_fresh=memory.get("fresh"),
             freshness_reason_code=memory.get("freshness_reason_code"),
             recognized_entities=list(entities),
@@ -182,6 +191,8 @@ class RetrievalDiagnostics:
             "persisted": False,
             "index": {
                 "revision": self.index_revision,
+                "generation_id": self.index_generation_id,
+                "corpus_contract_version": self.corpus_contract_version,
                 "fresh": self.index_fresh,
                 "reason_code": self.freshness_reason_code,
             },

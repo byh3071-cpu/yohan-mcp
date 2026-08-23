@@ -200,7 +200,7 @@ class SmartRouter:
                 counted_keys.add(key)
                 contrib = 1.0 / (self.k + rank)
                 if key not in agg:
-                    agg[key] = {
+                    fused_record = {
                         "id": rid,
                         "type": rec.get("type"),
                         "backend": rec.get("backend", backend),
@@ -208,6 +208,9 @@ class SmartRouter:
                         "rrf_score": 0.0,
                         "sources": [],
                     }
+                    if rec.get("evidence_ref"):
+                        fused_record["evidence_ref"] = rec["evidence_ref"]
+                    agg[key] = fused_record
                 agg[key]["rrf_score"] += contrib
                 if backend not in agg[key]["sources"]:
                     agg[key]["sources"].append(backend)

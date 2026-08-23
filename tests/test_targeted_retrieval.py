@@ -151,6 +151,52 @@ async def test_priority_corpus_golden_queries_land_in_top_five(
     assert receipt["volatile"] is True and receipt["persisted"] is False
     assert receipt["index"]["fresh"] is True
     assert len(receipt["index"]["revision"]) == 64
+    assert len(receipt["index"]["generation_id"]) == 64
+    assert receipt["index"]["corpus_contract_version"] is None
+    evidence = next(item for item in receipt["evidence"] if item["path"] == expected_path)
+    assert evidence["document_id"] == f"brain:{expected_path}"
+    assert len(evidence["content_hash"]) == 64
+    assert evidence["locator"] == expected_path
+    assert isinstance(evidence["score"], float)
+    assert query not in str(receipt)
+
+
+async def test_receipt_lineage_fields_come_from_the_captured_index_generation(tmp_path: Path):
+    brain, memory = _brain(tmp_path)
+    contract_path = _write_minimal_contract(brain)
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    for relative in contract["corpus"]["P0"]["exact_files"]:
+        path = brain / relative
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            body = "schema: fixture\n" if path.suffix == ".yaml" else "# Fixture\n"
+            path.write_text(body, encoding="utf-8")
+
+    adapter = MemoryAdapter(base_dir=memory)
+    adapters = {"memory": adapter}
+    ctx = ToolContext(adapters, SmartRouter(adapters), SchemaValidator(), entity_catalog={})
+    query = "ASSET_GOLDEN location contract"
+    env = await tool_get_context(
+        ctx,
+        query,
+        {"top_k": 5, "backends": ["memory"], "context_supplemental": False},
+    )
+
+    diagnostics = env["data"]["retrieval_diagnostics"]
+    assert diagnostics["index"]["corpus_contract_version"] == "fixture-1"
+    assert len(diagnostics["index"]["generation_id"]) == 64
+    evidence = next(item for item in diagnostics["evidence"] if item["path"] == "ASSETS.md")
+    raw = (brain / "ASSETS.md").read_bytes()
+    expected_hash = hashlib.sha256(raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")).hexdigest()
+    assert evidence["content_hash"] == expected_hash
+    assert evidence["document_id"] == "brain:ASSETS.md"
+    match = next(item for item in env["data"]["matches"] if item["data"].get("_path") == "ASSETS.md")
+    assert match["evidence_ref"] == {
+        "document_id": "brain:ASSETS.md",
+        "content_hash": expected_hash,
+        "locator": "ASSETS.md",
+    }
+    assert query not in str(diagnostics)
 
 
 async def test_index_build_is_deterministic_and_query_does_not_open_or_rglob(

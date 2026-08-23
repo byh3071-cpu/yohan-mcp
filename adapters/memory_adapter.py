@@ -863,6 +863,14 @@ class MemoryAdapter(BackendAdapter):
                     watched_directories[str(directory.resolve())] = directory.stat().st_mtime_ns
                 except OSError:
                     continue
+        manifest_by_path = {item.path: item for item in manifest_documents}
+        for row in rows:
+            locator = str(row.data.get("_path") or "").replace("\\", "/")
+            evidence = manifest_by_path.get(locator)
+            if evidence is not None:
+                row.data["_retrieval_document_id"] = evidence.document_id
+                row.data["_retrieval_content_hash"] = evidence.content_hash
+                row.data["_retrieval_locator"] = evidence.path
         source_revision = revision.hexdigest()
         generation_id = hashlib.sha256(
             f"{self._corpus_contract_version or 'legacy'}\0{source_revision}".encode("utf-8")
@@ -1147,11 +1155,20 @@ class MemoryAdapter(BackendAdapter):
                 q, row, index, generation, matching_postings, live_max_ids
             )
             if score > 0:
+                record_data = deepcopy(row.data)
+                document_id = record_data.pop("_retrieval_document_id", None)
+                content_hash = record_data.pop("_retrieval_content_hash", None)
+                locator = record_data.pop("_retrieval_locator", None)
+                record = make_record(row.id, row.type, self.name, record_data, score=score)
+                if document_id and content_hash and locator:
+                    record["evidence_ref"] = {
+                        "document_id": document_id,
+                        "content_hash": content_hash,
+                        "locator": locator,
+                    }
                 hits.append(
                     (score, matched_count, row.priority, row.id,
-                     make_record(
-                         row.id, row.type, self.name, deepcopy(row.data), score=score
-                     ))
+                     record)
                 )
         hits.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
         if diagnostics is not None:
