@@ -33,8 +33,10 @@ MAX_CONTEXT_MATCHES = 50
 MAX_GRAPH_EDGES = 30
 
 _RUNTIME_BUNDLE_PATHS = (
+    "adapters/base.py",
     "adapters/memory_adapter.py",
     "core/context_resolver.py",
+    "core/paths.py",
     "core/router.py",
     "core/tools.py",
     "server.py",
