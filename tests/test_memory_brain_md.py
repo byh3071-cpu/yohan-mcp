@@ -14,7 +14,7 @@ def _seed_brain(base):
     """tmp 에 brain 지식 폴더 + 제외 폴더 + 레거시 yaml 을 깐다."""
     (base / "decisions").mkdir(parents=True, exist_ok=True)
     (base / "wiki" / "concepts").mkdir(parents=True, exist_ok=True)
-    (base / "ingest").mkdir(parents=True, exist_ok=True)
+    (base / "ingest" / "insights").mkdir(parents=True, exist_ok=True)
     (base / "logs" / "sessions").mkdir(parents=True, exist_ok=True)
     (base / "metrics").mkdir(parents=True, exist_ok=True)
 
@@ -26,9 +26,9 @@ def _seed_brain(base):
     (base / "wiki" / "concepts" / "w1.md").write_text(
         "어텐션은 쿼리 키 값 내적으로 관련도를 계산한다.", encoding="utf-8")
     # 지식 md (frontmatter 깨짐 — graceful, body 유지)
-    (base / "ingest" / "i1.md").write_text(
+    (base / "ingest" / "insights" / "i1.md").write_text(
         "---\n: : : 깨진 yaml [\n---\n\n어텐션 청크 크기 재현율 실험 노트.", encoding="utf-8")
-    # 제외 폴더 md (노출되면 안 됨)
+    # logs 는 Retrieval Contract P2 corpus, metrics 는 제외 폴더다.
     (base / "logs" / "sessions" / "s1.md").write_text(
         "---\ntitle: 세션로그\n---\n어텐션 세션 잡음.", encoding="utf-8")
     (base / "metrics" / "m1.md").write_text("어텐션 지표 잡음.", encoding="utf-8")
@@ -57,9 +57,9 @@ async def test_excluded_folders_not_surfaced(tmp_path):
     qa = MemoryAdapter(base_dir=tmp_path)
     res = await qa.search("어텐션")  # logs/metrics 에도 "어텐션" 있음
     paths = {r["data"].get("_path", "") for r in res}
-    assert not any(p.startswith("logs/") for p in paths)     # 세션로그 제외
+    assert any(p.startswith("logs/") for p in paths)         # 세션로그 P2 포함
     assert not any(p.startswith("metrics/") for p in paths)  # 지표 제외
-    assert all(not str(r["type"]).startswith("brain:logs") for r in res)
+    assert any(str(r["type"]).startswith("brain:logs") for r in res)
 
 
 async def test_frontmatter_parse_variants(tmp_path):
@@ -156,13 +156,13 @@ async def test_more_excluded_folders(tmp_path):
     assert res == []  # 지식 폴더 아님 → 하나도 안 잡힘
 
 
-async def test_multiword_substring_limitation_documented(tmp_path):
-    # memory search 는 전체쿼리 연속 substring — 다어절(비연속)은 0건이 될 수 있음(의미검색은 Qdrant).
+async def test_multiword_noncontiguous_tokens_are_retrieved(tmp_path):
+    # R1 lexical index는 비연속 다어절도 token evidence로 회수한다.
     (tmp_path / "wiki").mkdir(parents=True)
     (tmp_path / "wiki" / "a.md").write_text("알파 중간말 베타", encoding="utf-8")
     qa = MemoryAdapter(base_dir=tmp_path)
     assert len(await qa.search("알파")) == 1          # 단일 토큰 매칭
-    assert await qa.search("알파 베타") == []          # 비연속 다어절 → 0(한계 명시)
+    assert len(await qa.search("알파 베타")) == 1
 
 
 async def test_brain_md_long_line_multiword_not_broken_by_dump_fold(tmp_path):

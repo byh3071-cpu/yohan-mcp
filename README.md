@@ -159,7 +159,7 @@ FastMCP 진입점. **도구 16개 + Resources + Prompts** 를 등록한다. impo
 | 어댑터 | 백엔드 | 상태 |
 | --- | --- | --- |
 | `notion_adapter` | Notion API v1 | 실동작 — `NOTION_TOKEN` 없으면 create 가 드라이런 폴백 |
-| `memory_adapter` | 로컬 `memory/`(yaml) + brain `.md`(읽기) | 실동작 — 무설정(profile/decision/ingest CRUD) + ADR-008 B.3: brain 지식폴더(decisions·wiki·ingest·knowledge-hub·projects·rules)의 `.md`+frontmatter 를 **읽기 전용** 회수(type `brain:<folder>`) |
+| `memory_adapter` | 로컬 `memory/`(yaml) + Brain 계약 corpus(읽기) | 실동작 — 무설정(profile/decision/ingest CRUD) + startup lexical snapshot으로 P0/P1/P2 문서를 읽기 전용 회수. 질의 중 source open/rglob 없이 stat 신선도만 검사 |
 | `qdrant_adapter` | Qdrant 벡터DB | 실동작 — `QDRANT_URL` 없으면 `:memory:` 폴백 |
 | `studio_adapter` | yohan-studio 레포(MDX) | 실동작 — 기본 `dry_run`(파일 미작성) |
 | `n8n_adapter` | n8n | `health_check` 만(search/create 미구현) |
@@ -404,8 +404,8 @@ python scripts/validate_schemas.py
 
 | 변수 | 기본 | 설명 |
 | --- | --- | --- |
-| `QDRANT_PATH` | (없음) | Docker 없는 로컬 파일 영속 모드. URL보다 우선하며 단일 프로세스 전용 |
-| `QDRANT_URL` | (없음→`:memory:`) | 다중 MCP 프로세스가 함께 쓸 Qdrant 서버 URL. 예: `http://localhost:6333` |
+| `QDRANT_PATH` | (없음) | Docker 없는 로컬 파일 영속 모드. 단일 프로세스 전용이며 `QDRANT_URL`과 동시 설정 시 하드 실패 |
+| `QDRANT_URL` | (없음→`:memory:`) | 다중 MCP 프로세스가 함께 쓸 Qdrant 서버 URL. `QDRANT_PATH`와 동시 설정 금지. 예: `http://localhost:6333` |
 | `QDRANT_COLLECTION` | `yohan_resources` | 쓰기 컬렉션 |
 | `QDRANT_SEARCH_COLLECTIONS` | (없음) | 기본 검색셋(쓰기 + 관제탑 4 + brain 2)에 **추가**할 컬렉션 CSV — override 아님(격리는 `.search_collections` 직접 설정) |
 | `SEARCH_BACKEND_TIMEOUT_SEC` | `20` | 통합 검색 백엔드별 시간 상한(초, 유한 양수·최대 300). 호출별 `opts.backend_timeout_s` 우선 |

@@ -56,7 +56,7 @@ def _search_result(results: list[dict]) -> dict:
     }
 
 
-def test_load_project_catalog_reads_only_registry(tmp_path: Path):
+def test_load_project_catalog_reports_registry_only_as_degraded(tmp_path: Path):
     registry = tmp_path / "core" / "inheritance-registry.yaml"
     registry.parent.mkdir(parents=True)
     registry.write_text(
@@ -69,6 +69,59 @@ def test_load_project_catalog_reads_only_registry(tmp_path: Path):
     assert catalog["mova"] == ("mova",)
     assert set(catalog["yohan-mcp"]) >= {"yohan-mcp", "yohan mcp"}
     assert "요한 생태계" in catalog
+    assert catalog.diagnostics["degraded"] is True
+    assert catalog.diagnostics["reason_code"] == "live_snapshot_missing"
+    assert len(catalog.diagnostics["revision"]) == 64
+
+
+def test_project_catalog_reports_missing_corrupt_and_invalid_keys(tmp_path: Path):
+    missing = load_project_catalog(tmp_path)
+    assert missing.diagnostics["degraded"] is True
+    assert missing.diagnostics["reason_code"] == (
+        "live_snapshot_missing+declarative_registry_missing"
+    )
+
+    registry = tmp_path / "core" / "inheritance-registry.yaml"
+    registry.parent.mkdir(parents=True)
+    registry.write_text("repos: [unterminated", encoding="utf-8")
+    corrupt = load_project_catalog(tmp_path)
+    assert corrupt.diagnostics["degraded"] is True
+    assert corrupt.diagnostics["reason_code"] == (
+        "live_snapshot_missing+declarative_registry_corrupt_or_invalid"
+    )
+
+    registry.write_text(
+        'repos:\n  mova: {}\n  "---": {}\n  "../escape": {}\n', encoding="utf-8"
+    )
+    loaded = load_project_catalog(tmp_path)
+    assert set(loaded) >= {"mova", "요한 생태계"}
+    assert "---" not in loaded and "../escape" not in loaded
+    assert loaded.diagnostics["invalid_keys_excluded"] == 2
+    assert resolve_entities("UNKNOWN-PROJECT", loaded, project="UNKNOWN-PROJECT") == []
+
+
+def test_project_catalog_includes_provider_observed_only_repository(tmp_path: Path):
+    core = tmp_path / "core"
+    core.mkdir(parents=True)
+    (core / "repository-live-snapshot.yaml").write_text(
+        "schema: repository-live-snapshot\n"
+        "repositories:\n"
+        "  - {repo_name: Birthday_app, source_status: observed}\n"
+        "  - {repo_name: '---', source_status: observed}\n",
+        encoding="utf-8",
+    )
+    (core / "inheritance-registry.yaml").write_text(
+        "repos:\n  mova: {}\n  ai-router: {}\n",
+        encoding="utf-8",
+    )
+
+    catalog = load_project_catalog(tmp_path)
+
+    assert catalog.diagnostics["degraded"] is False
+    assert catalog.diagnostics["observed_count"] == 1
+    assert resolve_entities("Birthday_app 진행 상황", catalog)[0].canonical == "Birthday_app"
+    assert "ai-router" in catalog
+    assert "---" not in catalog
 
 
 def test_resolve_entities_for_three_golden_queries():
@@ -169,6 +222,70 @@ async def test_match_and_character_budgets_are_enforced():
 
     assert len(result.matches) <= 2
     assert result.context_chars <= 12
+
+
+async def test_query_evidence_outranks_broad_entity_mention():
+    resolver = GraphAwareContextResolver(CATALOG)
+    primary = _search_result(
+        [
+            _record("broad", "brain_memory", {"text": "요한 생태계 일반 소개"}),
+            _record("target", "brain_memory", {"text": "퍼스널 AGI 관계와 정의"}),
+        ]
+    )
+
+    result = await resolver.resolve(
+        "요한 생태계와 퍼스널 AGI 관계",
+        primary,
+        None,
+        {"top_k": 2, "min_evidence": 1},
+    )
+
+    assert [record["id"] for record in result.matches] == ["target", "broad"]
+
+
+async def test_budget_preserves_locators_and_multiple_evidence_slots():
+    resolver = GraphAwareContextResolver(CATALOG)
+    primary = _search_result(
+        [
+            _record("d1", "brain_memory", {"body": "A" * 500, "_path": "docs/one.md"}),
+            _record("d2", "brain_memory", {"body": "B" * 500, "_path": "docs/two.md"}),
+            _record("d3", "brain_memory", {"body": "C" * 500, "_path": "docs/three.md"}),
+        ]
+    )
+
+    result = await resolver.resolve(
+        "evidence",
+        primary,
+        None,
+        {
+            "context_max_matches": 3,
+            "context_char_budget": 120,
+            "min_evidence": 1,
+        },
+    )
+
+    assert [record["data"]["_path"] for record in result.matches] == [
+        "docs/one.md",
+        "docs/two.md",
+        "docs/three.md",
+    ]
+    assert result.context_chars <= 120
+
+
+async def test_budget_excludes_record_instead_of_truncating_locator():
+    resolver = GraphAwareContextResolver(CATALOG)
+    primary = _search_result(
+        [_record("d1", "brain_memory", {"_path": "memory/wiki/evidence.md", "body": "A" * 100})]
+    )
+
+    result = await resolver.resolve(
+        "evidence",
+        primary,
+        None,
+        {"context_max_matches": 1, "context_char_budget": 8, "min_evidence": 1},
+    )
+
+    assert result.matches == []
 
 
 async def test_negative_top_k_keeps_bounded_unlimited_compatibility():

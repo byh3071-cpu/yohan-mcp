@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import uuid
 from pathlib import Path
 from time import perf_counter
@@ -25,6 +26,25 @@ from adapters.base import BackendAdapter, _Timer, health, make_record
 from core.embeddings import get_embedder
 
 logger = logging.getLogger(__name__)
+
+_SENSITIVE_ERROR_RE = re.compile(
+    r"(?:Authorization\s*:\s*Bearer\s+(?!\$\{)[A-Za-z0-9._~+/-]{16,}|"
+    r"github_pat_[A-Za-z0-9_]{40,}|gh[oprsu]_[A-Za-z0-9]{30,}|"
+    r"secret_[A-Za-z0-9]{40,50}|"
+    r"sk-(?:proj-|ant-api03-|live-)[A-Za-z0-9_-]{16,}|"
+    r"(?:api[_-]?key|token|secret|password|credential)\s*[:=]\s*(?!\$\{)[\"']?[A-Za-z0-9._~+/-]{16,}|"
+    r"AKIA[0-9A-Z]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)",
+    re.IGNORECASE,
+)
+_LOCAL_PATH_RE = re.compile(
+    r"(?i)(?:\b[A-Z]:[\\/][^\s\"']+|\\\\[^\\\s]+\\[^\s\"']+|"
+    r"/(?:Users|home|tmp|root|var/tmp)/[^\s\"']+)"
+)
+
+
+def _safe_error_detail(exc: BaseException) -> str:
+    detail = _SENSITIVE_ERROR_RE.sub("[REDACTED]", str(exc))
+    return _LOCAL_PATH_RE.sub("[LOCAL_PATH]", detail)[:300]
 
 COLLECTION = "yohan_resources"
 # 관제탑(yohan-control-tower)이 적재하는 읽기전용 4컬렉션 — get_context 검색 대상(bge-m3 1024d 동일 모델).
@@ -91,8 +111,8 @@ class QdrantAdapter(BackendAdapter):
     def __init__(self, client=None, url: str | None = None, collection: str | None = None, embedder=None, path: str | None = None) -> None:
         self.url = url if url is not None else os.getenv("QDRANT_URL")
         # QDRANT_PATH = Docker 없이 영속하는 내장 로컬 모드(qdrant-client 가 파일에 직접 쓴다).
-        # 명시 설정이므로 QDRANT_URL 보다 **우선** — 서버를 안 띄우기로 한 기계에서 예전
-        # .env 의 QDRANT_URL 이 남아 연결 실패로 회수 0 이 되는 사고를 막는다.
+        # 파일 모드와 서버 모드는 서로 다른 동시성 계약이다. 둘 다 설정되면 어느 쪽을
+        # 선택했는지 숨기지 않고 즉시 실패해 stale .env 를 드러낸다.
         self.path = path if path is not None else os.getenv("QDRANT_PATH")
         if self.url and self.path:
             raise ValueError(
@@ -294,7 +314,8 @@ class QdrantAdapter(BackendAdapter):
                 # 다른 컬렉션이 살아있는 한 이 실패는 매 질의 노이즈일 뿐 실질적 문제가 아니다
                 # (#qdrant-legacy-skip). 검색 자체가 총체적으로 비어버린 경우에만 아래에서
                 # 1회 집계 경고로 표면화한다 — 개별 컬렉션 진단은 health_check 가 상시 표면화.
-                logger.debug("Qdrant 컬렉션 '%s' 검색 실패(스킵): %s: %s", coll, type(exc).__name__, exc)
+                safe_detail = _safe_error_detail(exc)
+                logger.debug("Qdrant 컬렉션 '%s' 검색 실패(스킵): %s: %s", coll, type(exc).__name__, safe_detail)
                 failed.append(coll)
                 if diagnostics is not None:
                     diagnostics["collections_failed"] += 1
@@ -302,7 +323,7 @@ class QdrantAdapter(BackendAdapter):
                         "name": coll,
                         "reason_code": "collection_query_failed",
                         "error_type": type(exc).__name__,
-                        "detail": str(exc)[:300],
+                        "detail": safe_detail,
                     })
                     diagnostics["collections"][coll] = {
                         "status": "unavailable",
@@ -383,8 +404,8 @@ class QdrantAdapter(BackendAdapter):
                         if d is not None:
                             dims.add(d)
             except Exception as exc:
-                return health(False, t.elapsed_ms, f"Qdrant 연결 실패: {type(exc).__name__}: {exc}")
-            mode = f"local:{self.path}" if self.path else (self.url or ":memory:")
+                return health(False, t.elapsed_ms, f"Qdrant 연결 실패: {type(exc).__name__}: {_safe_error_detail(exc)}")
+            mode = "local:[configured]" if self.path else (self.url or ":memory:")
             if not counts:
                 return health(False, t.elapsed_ms, f"Qdrant [{mode}] 검색 컬렉션 없음 — 시딩 필요 ({', '.join(self.search_collections)})")
             total = sum(counts.values())

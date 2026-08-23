@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import re
 import unicodedata
@@ -30,6 +31,16 @@ DEFAULT_MIN_EVIDENCE = 2
 MAX_CONTEXT_CHAR_BUDGET = 100_000
 MAX_CONTEXT_MATCHES = 50
 MAX_GRAPH_EDGES = 30
+
+_RANK_QUERY_STOPWORDS = {
+    "그", "무엇", "무엇이고", "무엇인가", "어떤", "어디", "어디에",
+    "서로", "현재", "중인", "하는가", "해야", "문서",
+}
+_RANK_KOREAN_SUFFIXES = (
+    "에서는", "에게서", "으로", "에서", "까지", "부터", "하고",
+    "해야", "인가", "이며", "와", "과", "은", "는", "이", "가",
+    "을", "를", "에", "의", "된",
+)
 
 _SPECIAL_ALIASES: dict[str, tuple[str, ...]] = {
     "요한 생태계": ("요한 생태계", "yohan ecosystem"),
@@ -66,8 +77,8 @@ class ResolvedContext:
 
 
 @dataclass(frozen=True)
-class RetrievalReceipt:
-    """Volatile, read-only evidence receipt returned by ``get_context``.
+class RetrievalDiagnostics:
+    """Volatile, read-only candidate telemetry returned by ``get_context``.
 
     This is candidate-retrieval telemetry, not a domain decision, evaluation or
     learning record.  The MCP server never persists it.
@@ -77,6 +88,7 @@ class RetrievalReceipt:
     index_fresh: bool | None
     freshness_reason_code: str | None
     recognized_entities: list[dict]
+    entity_catalog: dict
     sources_attempted: list[str]
     sources_used: list[str]
     source_errors: dict[str, str]
@@ -103,7 +115,7 @@ class RetrievalReceipt:
         supplemental_searches: int,
         char_budget: int,
         max_matches: int,
-    ) -> "RetrievalReceipt":
+    ) -> "RetrievalDiagnostics":
         del query  # query text is already the tool input; avoid duplicating it in telemetry.
         backend_details = diagnostics.get("backend_details") or {}
         memory = backend_details.get("memory") or {}
@@ -145,6 +157,7 @@ class RetrievalReceipt:
             index_fresh=memory.get("fresh"),
             freshness_reason_code=memory.get("freshness_reason_code"),
             recognized_entities=list(entities),
+            entity_catalog=dict(diagnostics.get("entity_catalog") or {}),
             sources_attempted=list((diagnostics.get("backend_timings_ms") or {}).keys()),
             sources_used=list(sources_used),
             source_errors=dict(errors),
@@ -157,8 +170,8 @@ class RetrievalReceipt:
             budgets={"character": char_budget, "matches": max_matches},
             latency_ms={
                 "backends": dict(diagnostics.get("backend_timings_ms") or {}),
-                "cold_index_build": memory.get("cold_index_build_ms"),
-                "warm_lexical_query": memory.get("warm_query_ms"),
+                "index_build": memory.get("index_build_ms"),
+                "lexical_query": memory.get("query_latency_ms"),
             },
         )
 
@@ -173,6 +186,7 @@ class RetrievalReceipt:
                 "reason_code": self.freshness_reason_code,
             },
             "recognized_entities": self.recognized_entities,
+            "entity_catalog": self.entity_catalog,
             "sources": {
                 "attempted": self.sources_attempted,
                 "used": self.sources_used,
@@ -214,28 +228,117 @@ def _aliases_for_project(name: str) -> tuple[str, ...]:
     return _unique(aliases)
 
 
-def load_project_catalog(memory_dir: Path | None = None) -> dict[str, tuple[str, ...]]:
-    """inheritance-registry.yaml의 repos 키만 읽어 프로젝트 별칭 카탈로그를 만든다.
+class ProjectCatalog(dict[str, tuple[str, ...]]):
+    """Mapping-compatible strict catalog with explicit load diagnostics."""
 
-    레지스트리가 없거나 손상되어도 특수 생태계 별칭으로 안전하게 폴백한다. 문서 본문이나
-    디렉터리는 순회하지 않는다.
+    def __init__(self, *args, diagnostics: dict | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.diagnostics = dict(diagnostics or {})
+
+
+def load_project_catalog(memory_dir: Path | None = None) -> dict[str, tuple[str, ...]]:
+    """Build the strict project catalog from observed + declared Brain SoTs.
+
+    The provider-backed live snapshot contributes observed repositories; the
+    inheritance registry contributes declared intent. Neither source is
+    inferred from arbitrary document text or directory names.
     """
-    catalog = {name: _unique(aliases) for name, aliases in _SPECIAL_ALIASES.items()}
-    registry = (memory_dir or resolve_memory_dir()) / "core" / "inheritance-registry.yaml"
-    if not registry.is_file():
-        return catalog
-    try:
-        payload = yaml.safe_load(registry.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as exc:
-        logger.warning("프로젝트 레지스트리 로드 실패: %s: %s", type(exc).__name__, exc)
-        return catalog
-    repos = payload.get("repos")
-    if not isinstance(repos, dict):
-        return catalog
-    for name in repos:
+    base = memory_dir or resolve_memory_dir()
+    core = base / "core"
+    catalog = ProjectCatalog(
+        {name: _unique(aliases) for name, aliases in _SPECIAL_ALIASES.items()},
+        diagnostics={
+            "source": "memory/core/repository-live-snapshot.yaml+inheritance-registry.yaml",
+            "revision": None,
+            "degraded": True,
+            "reason_code": "catalog_sources_missing",
+            "source_states": {},
+            "invalid_keys_excluded": 0,
+            "observed_count": 0,
+            "declared_count": 0,
+        },
+    )
+
+    def valid_name(name) -> str | None:
         canonical = str(name).strip()
-        if canonical:
-            catalog[canonical] = _aliases_for_project(canonical)
+        if (
+            not canonical
+            or not _normalized(canonical)
+            or canonical in {".", ".."}
+            or any(char in canonical for char in "/\\\x00")
+        ):
+            return None
+        return canonical
+
+    digests: list[str] = []
+    invalid = 0
+    states: dict[str, str] = {}
+
+    snapshot = core / "repository-live-snapshot.yaml"
+    if snapshot.is_file():
+        try:
+            raw = snapshot.read_text(encoding="utf-8")
+            payload = yaml.safe_load(raw) or {}
+            repos = payload.get("repositories")
+            if payload.get("schema") != "repository-live-snapshot" or not isinstance(repos, list):
+                raise ValueError("snapshot schema/repositories invalid")
+            for item in repos:
+                if not isinstance(item, dict) or item.get("source_status") != "observed":
+                    invalid += 1
+                    continue
+                canonical = valid_name(item.get("repo_name"))
+                if canonical is None:
+                    invalid += 1
+                    continue
+                catalog[canonical] = _aliases_for_project(canonical)
+            catalog.diagnostics["observed_count"] = sum(
+                1 for item in repos
+                if isinstance(item, dict) and item.get("source_status") == "observed"
+                and valid_name(item.get("repo_name")) is not None
+            )
+            digests.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+            states["live_snapshot"] = "loaded"
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            logger.warning("live repository snapshot load failed: %s: %s", type(exc).__name__, exc)
+            states["live_snapshot"] = "corrupt_or_invalid"
+    else:
+        states["live_snapshot"] = "missing"
+
+    registry = core / "inheritance-registry.yaml"
+    if registry.is_file():
+        try:
+            raw = registry.read_text(encoding="utf-8")
+            payload = yaml.safe_load(raw) or {}
+            repos = payload.get("repos")
+            if not isinstance(repos, dict):
+                raise ValueError("registry repos invalid")
+            declared = 0
+            for name in repos:
+                canonical = valid_name(name)
+                if canonical is None:
+                    invalid += 1
+                    continue
+                catalog[canonical] = _aliases_for_project(canonical)
+                declared += 1
+            catalog.diagnostics["declared_count"] = declared
+            digests.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+            states["declarative_registry"] = "loaded"
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            logger.warning("project registry load failed: %s: %s", type(exc).__name__, exc)
+            states["declarative_registry"] = "corrupt_or_invalid"
+    else:
+        states["declarative_registry"] = "missing"
+
+    loaded_both = all(state == "loaded" for state in states.values())
+    catalog.diagnostics.update({
+        "revision": hashlib.sha256("\0".join(digests).encode("ascii")).hexdigest() if digests else None,
+        "degraded": not loaded_both,
+        "reason_code": "loaded" if loaded_both else "+".join(
+            f"{name}_{state}" for name, state in states.items() if state != "loaded"
+        ),
+        "source_states": states,
+        "invalid_keys_excluded": invalid,
+    })
     return catalog
 
 
@@ -484,7 +587,26 @@ def _truncate_value(value, remaining: int):
 
 def _compact_record(record: dict, remaining: int) -> tuple[dict, int]:
     clone = copy.deepcopy(record)
-    compact, used = _truncate_value(clone.get("data") or {}, remaining)
+    data = clone.get("data") or {}
+    locator = data.get("_path") or data.get("path")
+    if isinstance(locator, str) and len(locator) > remaining:
+        # A truncated path is not an evidence locator. Exclude the record
+        # rather than emitting a plausible-looking but unusable partial path.
+        return clone, 0
+    # Evidence locators must survive truncation. Parsed Markdown appends _path
+    # after the body, so generic insertion-order truncation used to return an
+    # empty locator exactly when a large body exhausted the budget.
+    identity_keys = (
+        "_path", "path", "id", "title", "name", "type", "status",
+        "_retrieval_tier",
+    )
+    ordered = {
+        key: data[key]
+        for key in identity_keys
+        if key in data
+    }
+    ordered.update({key: value for key, value in data.items() if key not in ordered})
+    compact, used = _truncate_value(ordered, remaining)
     clone["data"] = compact
     return clone, used
 
@@ -502,9 +624,28 @@ def _ranking_terms(entities: list[EntityMatch], edges: list[dict]) -> tuple[list
     return list(entity_terms), list(graph_terms)
 
 
-def _rank_records(records: list[dict], entities: list[EntityMatch], edges: list[dict]) -> list[dict]:
+def _query_rank_tokens(query: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for raw in re.findall(r"[0-9A-Za-z가-힣_-]+", query or ""):
+        token = unicodedata.normalize("NFKC", raw).casefold()
+        for suffix in _RANK_KOREAN_SUFFIXES:
+            if token.endswith(suffix) and len(token) > len(suffix) + 1:
+                token = token[:-len(suffix)]
+                break
+        if len(token) >= 2 and token not in _RANK_QUERY_STOPWORDS and token not in tokens:
+            tokens.append(token)
+    return tuple(tokens)
+
+
+def _rank_records(
+    query: str,
+    records: list[dict],
+    entities: list[EntityMatch],
+    edges: list[dict],
+) -> list[dict]:
     entity_terms, graph_terms = _ranking_terms(entities, edges)
-    ranked: list[tuple[int, int, dict]] = []
+    query_terms = _query_rank_tokens(query)
+    ranked: list[tuple[int, int, int, dict]] = []
     seen: set[tuple[str, str]] = set()
     for index, record in enumerate(records):
         key = _record_key(record)
@@ -512,13 +653,32 @@ def _rank_records(records: list[dict], entities: list[EntityMatch], edges: list[
             continue
         seen.add(key)
         haystack = _normalized(" ".join(_string_values(record.get("data") or {})))
-        score = sum(5 for term in entity_terms if _normalized(term) in haystack)
+        # Query evidence outranks a broad entity mention. Previously a generic
+        # "ecosystem" reference could push the Personal AGI evidence out of a
+        # five-item context even though the lexical backend ranked it highly.
+        query_matches = sum(1 for term in query_terms if _normalized(term) in haystack)
+        score = query_matches * 4
+        score += sum(3 for term in entity_terms if _normalized(term) in haystack)
         score += sum(2 for term in graph_terms if _normalized(term) in haystack)
         if _is_ontology_record(record):
             score -= 1  # 관계는 graph_edges로 이미 보존하므로 근거 문서를 먼저 표출한다.
-        ranked.append((-score, index, record))
-    ranked.sort(key=lambda item: (item[0], item[1]))
-    return [record for _, _, record in ranked]
+        data = record.get("data") or {}
+        sources = set(record.get("sources") or [])
+        protected_lexical = (
+            "memory" in sources
+            and str(record.get("type") or "").startswith("brain:")
+            and bool(data.get("_retrieval_tier"))
+        )
+        # Brain contract documents are the required first-stage evidence.
+        # Optional vector/notion candidates may expand the pool and graph, but
+        # cannot displace the lexical ordering inside a bounded final context.
+        # Preserve their upstream memory rank verbatim; rerank only expansion
+        # candidates by query/entity/graph evidence.
+        group = 0 if protected_lexical else 1
+        rank_score = 0 if protected_lexical else -score
+        ranked.append((group, rank_score, index, record))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [record for _, _, _, record in ranked]
 
 
 def _apply_budgets(records: list[dict], *, max_matches: int, char_budget: int) -> tuple[list[dict], int]:
@@ -526,16 +686,23 @@ def _apply_budgets(records: list[dict], *, max_matches: int, char_budget: int) -
         return [], 0
     selected: list[dict] = []
     used = 0
-    for record in records:
+    slot_count = min(max_matches, len(records))
+    per_record_floor = max(1, char_budget // max(1, slot_count))
+    for index, record in enumerate(records):
         if len(selected) >= max_matches or used >= char_budget:
             break
         cost = _payload_chars(record)
         remaining = char_budget - used
-        if cost <= remaining:
+        slots_after = max(0, slot_count - index - 1)
+        allocation = min(
+            remaining,
+            max(per_record_floor, remaining - per_record_floor * slots_after),
+        )
+        if cost <= allocation:
             selected.append(copy.deepcopy(record))
             used += cost
             continue
-        compact, compact_cost = _compact_record(record, remaining)
+        compact, compact_cost = _compact_record(record, allocation)
         if compact_cost > 0:
             selected.append(compact)
             used += compact_cost
@@ -622,7 +789,7 @@ class GraphAwareContextResolver:
             entities = _augment_entities_from_graph(query, all_records, entities, max_entities)
             edges = extract_one_hop_edges(all_records, entities, max_edges=max_edges)
 
-        ranked = _rank_records(all_records, entities, edges)
+        ranked = _rank_records(query, all_records, entities, edges)
         matches, context_chars = _apply_budgets(
             ranked,
             max_matches=max_matches,

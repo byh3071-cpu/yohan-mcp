@@ -32,7 +32,7 @@ from adapters.studio_adapter import StudioAdapter
 from core.router import PER_PAGE_CAP_DEFAULT, SmartRouter
 from core.context_resolver import (
     GraphAwareContextResolver,
-    RetrievalReceipt,
+    RetrievalDiagnostics,
     load_project_catalog,
     resolve_entities,
 )
@@ -304,6 +304,15 @@ class ToolContext:
         # 작은 inheritance-registry.yaml 한 파일에서 만든 런타임 카탈로그.
         # 전체 brain 문서를 순회하지 않으며 테스트는 dict 를 직접 주입한다.
         self.entity_catalog = entity_catalog if entity_catalog is not None else load_project_catalog()
+        self.entity_catalog_diagnostics = dict(
+            getattr(self.entity_catalog, "diagnostics", {
+                "source": "injected",
+                "revision": None,
+                "degraded": False,
+                "reason_code": "injected_catalog",
+                "invalid_keys_excluded": 0,
+            })
+        )
 
     @classmethod
     def from_env(cls) -> "ToolContext":
@@ -567,6 +576,7 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
     if patterns:
         sources.append("notion:pattern")
     diagnostics = dict(res["diagnostics"])
+    diagnostics["entity_catalog"] = dict(ctx.entity_catalog_diagnostics)
     diagnostics["context_resolver"] = {
         "supplemental_searches": resolved.supplemental_searches,
         "context_chars": resolved.context_chars,
@@ -578,7 +588,7 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         "primary_candidate_limit": search_opts["top_k"],
         "supplemental_diagnostics": supplemental.get("diagnostics", {}) if supplemental else {},
     }
-    retrieval_diagnostics = RetrievalReceipt.from_retrieval(
+    retrieval_diagnostics = RetrievalDiagnostics.from_retrieval(
         query=query,
         matches=matches,
         entities=resolved.entities,
