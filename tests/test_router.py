@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """Smart Router — 백엔드 선택 + RRF 융합 단위테스트."""
+import asyncio
+
 import pytest
 
 from adapters.base import BackendAdapter, health, make_record
-from core.router import SmartRouter
+from core.router import DEFAULT_BACKEND_TIMEOUT_S, SmartRouter
 
 
 class FakeAdapter(BackendAdapter):
@@ -64,6 +66,14 @@ def test_select_backends_default_and_opts():
     assert r.select_backends("q", {"backends": ["nope"]}) == []
 
 
+def test_backend_timeout_env_and_invalid_fallback(monkeypatch):
+    monkeypatch.setenv("SEARCH_BACKEND_TIMEOUT_SEC", "12.5")
+    assert SmartRouter({}).backend_timeout_s == 12.5
+
+    monkeypatch.setenv("SEARCH_BACKEND_TIMEOUT_SEC", "not-a-number")
+    assert SmartRouter({}).backend_timeout_s == DEFAULT_BACKEND_TIMEOUT_S
+
+
 async def test_search_three_source_rrf():
     a = FakeAdapter("notion", recs("notion", ["x1", "x2"]))
     b = FakeAdapter("memory", recs("memory", ["x2"]))
@@ -93,6 +103,44 @@ async def test_search_isolates_backend_exception():
     out = await r.search("q")
     assert out["sources_used"] == ["notion"]
     assert "memory" in out["errors"] and "boom" in out["errors"]["memory"]
+
+
+async def test_search_times_out_slow_backend_and_preserves_partial_results():
+    class SlowAdapter(FakeAdapter):
+        async def search(self, query, opts=None):
+            await asyncio.sleep(0.2)
+            return self._records
+
+    fast = FakeAdapter("memory", recs("memory", ["x1"]))
+    slow = SlowAdapter("qdrant", recs("qdrant", ["x2"]))
+    r = SmartRouter(
+        {"memory": fast, "qdrant": slow}, backend_timeout_s=0.02
+    )
+
+    out = await r.search("q")
+
+    assert [x["id"] for x in out["results"]] == ["x1"]
+    assert out["sources_used"] == ["memory"]
+    assert "timeout after 0.02s" in out["errors"]["qdrant"]
+    assert out["diagnostics"]["backend_timeout_s"] == 0.02
+    assert set(out["diagnostics"]["backend_timings_ms"]) == {"memory", "qdrant"}
+    assert out["diagnostics"]["backend_timings_ms"]["qdrant"] >= 15
+
+
+async def test_search_timeout_can_be_overridden_per_call():
+    class SlowAdapter(FakeAdapter):
+        async def search(self, query, opts=None):
+            await asyncio.sleep(0.02)
+            return self._records
+
+    slow = SlowAdapter("memory", recs("memory", ["x1"]))
+    r = SmartRouter({"memory": slow}, backend_timeout_s=0.005)
+
+    out = await r.search("q", {"backend_timeout_s": 0.2})
+
+    assert [x["id"] for x in out["results"]] == ["x1"]
+    assert out["errors"] == {}
+    assert out["diagnostics"]["backend_timeout_s"] == 0.2
 
 
 async def test_rrf_single_backend_multichunk_no_inflation():
