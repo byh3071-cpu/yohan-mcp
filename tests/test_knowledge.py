@@ -71,6 +71,15 @@ def test_cli_configures_utf8_for_windows_pipe_output() -> None:
 
 def valid_draft() -> dict[str, Any]:
     return {
+        "headline_conclusion": "핵심 문제와 결론을 한 문장으로 정리한다.",
+        "critical_judgment": {
+            "steelman": "이 주장이 성립하는 가장 강한 조건",
+            "attack": "반례와 분야별 차이",
+            "failure_cost": "틀렸을 때 놓치는 것",
+            "confidence": "중간",
+        },
+        "two_week_experiment": "2주 안에 검증할 구체 행동 하나",
+        "direction": "필요할 때 학습",
         "title": "테스트 영상",
         "summary": "원문에 충실한 충분히 긴 요약입니다. " * 12,
         "key_points": ["핵심 하나", "핵심 둘", "핵심 셋"],
@@ -2412,7 +2421,7 @@ def test_format_retry_prompt_over_cap_fails_before_second_query(
                 return json.dumps({"answer": "not valid json"})
             return super().__call__(args, timeout)
 
-    monkeypatch.setattr(knowledge_module, "build_candidate_query_prompt", lambda job, candidates: first_prompt)
+    monkeypatch.setattr(knowledge_module, "build_candidate_query_prompt", lambda job, candidates, relation_palette=(): first_prompt)
     runner = BoundaryRunner()
     queue = FakeQueue()
     report = KnowledgeService(
