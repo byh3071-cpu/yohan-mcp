@@ -11,6 +11,7 @@ import copy
 import hashlib
 import logging
 import re
+import subprocess
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,8 @@ from typing import Awaitable, Callable
 import yaml
 
 from core.paths import resolve_memory_dir
+from core.paths import resolve_brain_root
+from core.task_context import load_manifest_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,7 @@ _RUNTIME_BUNDLE_PATHS = (
     "adapters/base.py",
     "adapters/memory_adapter.py",
     "core/context_resolver.py",
+    "core/task_context.py",
     "core/paths.py",
     "core/router.py",
     "core/tools.py",
@@ -56,6 +60,32 @@ def _runtime_bundle_digest() -> str:
 
 
 RETRIEVAL_RUNTIME_BUNDLE_DIGEST = _runtime_bundle_digest()
+
+
+def _runtime_source_revision() -> tuple[str | None, str]:
+    """Read the executing checkout's revision without exposing its local path."""
+    repository_root = Path(__file__).resolve().parents[1]
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, "git_metadata_unavailable"
+    revision = completed.stdout.strip()
+    if completed.returncode != 0:
+        return None, "git_metadata_unavailable"
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", revision):
+        return None, "git_revision_invalid"
+    return revision.lower(), "available"
+
+
+# The checkout cannot change for a running server. Capture once to keep request
+# latency deterministic and avoid repeatedly invoking a subprocess.
+RETRIEVAL_RUNTIME_SOURCE_REVISION, RETRIEVAL_RUNTIME_SOURCE_REVISION_REASON = _runtime_source_revision()
 
 _RANK_QUERY_STOPWORDS = {
     "그", "무엇", "무엇이고", "무엇인가", "어떤", "어디", "어디에",
@@ -111,6 +141,7 @@ class RetrievalDiagnostics:
 
     index_revision: str | None
     index_generation_id: str | None
+    index_observed_at: str | None
     corpus_contract_version: str | None
     index_fresh: bool | None
     freshness_reason_code: str | None
@@ -188,6 +219,7 @@ class RetrievalDiagnostics:
         return cls(
             index_revision=memory.get("index_revision"),
             index_generation_id=memory.get("index_generation_id"),
+            index_observed_at=memory.get("index_observed_at"),
             corpus_contract_version=memory.get("corpus_contract_version"),
             index_fresh=memory.get("fresh"),
             freshness_reason_code=memory.get("freshness_reason_code"),
@@ -219,6 +251,8 @@ class RetrievalDiagnostics:
             "runtime": {
                 "repository": "yohan-mcp",
                 "implementation_digest": RETRIEVAL_RUNTIME_BUNDLE_DIGEST,
+                "source_revision": RETRIEVAL_RUNTIME_SOURCE_REVISION,
+                "source_revision_reason_code": RETRIEVAL_RUNTIME_SOURCE_REVISION_REASON,
             },
             "query_binding": {
                 "scheme": "sha256-utf8-v1",
@@ -227,6 +261,7 @@ class RetrievalDiagnostics:
             "index": {
                 "revision": self.index_revision,
                 "generation_id": self.index_generation_id,
+                "observed_at": self.index_observed_at,
                 "corpus_contract_version": self.corpus_contract_version,
                 "fresh": self.index_fresh,
                 "reason_code": self.freshness_reason_code,
@@ -375,11 +410,41 @@ def load_project_catalog(memory_dir: Path | None = None) -> dict[str, tuple[str,
     else:
         states["declarative_registry"] = "missing"
 
-    loaded_both = all(state == "loaded" for state in states.values())
+    # The versioned Public/dev mirror owns repository aliases such as
+    # ``yohan-log`` → ``muse``.  It augments the strict catalog; an absent or
+    # invalid mirror never removes snapshot/registry identities.
+    brain_root = resolve_brain_root(base)
+    if brain_root is not None:
+        catalog.diagnostics["source"] += "+ops/public-dev-bootstrap/repos.json"
+        manifest_aliases, manifest_diagnostics = load_manifest_aliases(brain_root)
+        manifest_state = str(manifest_diagnostics.get("status") or "invalid")
+        states["repository_manifest"] = manifest_state
+        catalog.diagnostics["manifest_reason_code"] = manifest_diagnostics.get("reason_code")
+        if manifest_state == "loaded":
+            manifest_tokens: list[str] = []
+            for name, aliases in sorted(manifest_aliases.items(), key=lambda item: item[0].casefold()):
+                manifest_tokens.extend((name, *aliases, ""))
+            manifest_material = "\0".join(manifest_tokens)
+            digests.append(hashlib.sha256(manifest_material.encode("utf-8")).hexdigest())
+            merged = 0
+            for name, aliases in manifest_aliases.items():
+                canonical = valid_name(name)
+                if canonical is None:
+                    invalid += 1
+                    continue
+                catalog[canonical] = _unique((*catalog.get(canonical, ()), canonical, *aliases))
+                merged += 1
+            catalog.diagnostics["manifest_alias_count"] = merged
+
+    required_states = ("live_snapshot", "declarative_registry")
+    loaded_both = all(states.get(name) == "loaded" for name in required_states)
+    manifest_degraded = (
+        "repository_manifest" in states and states["repository_manifest"] != "loaded"
+    )
     catalog.diagnostics.update({
         "revision": hashlib.sha256("\0".join(digests).encode("ascii")).hexdigest() if digests else None,
-        "degraded": not loaded_both,
-        "reason_code": "loaded" if loaded_both else "+".join(
+        "degraded": not loaded_both or manifest_degraded,
+        "reason_code": "loaded" if loaded_both and not manifest_degraded else "+".join(
             f"{name}_{state}" for name, state in states.items() if state != "loaded"
         ),
         "source_states": states,
