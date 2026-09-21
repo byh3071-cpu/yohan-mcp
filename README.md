@@ -304,6 +304,14 @@ python scripts/validate_schemas.py
 
 **코어룰셋 주입(옵트인, ADR-008 P0):** `get_context(query, {"inject_rules": true})` 또는 env `YOHAN_INJECT_CORE_RULES=1` 이면 봉투에 `core_rules_digest`(brain `core-ruleset.yaml` 의 정체성·절대규칙·안전·패턴참조 다이제스트, 미연결 시 인레포 스냅샷 폴백)와 `available_tools`(도구 카탈로그 + capability gating — 미승인 쓰기 도구는 `locked:true`)가 추가된다. 기본 off라 미옵트인 호출은 봉투 불변. 독트린만 필요하면 별도 도구 `get_core_ruleset()` 로 직접 pull.
 
+**작업 범위 projection (P1):** `get_context(query, {"task_scope": true})` 는 기존 `matches`·그래프·진단을 유지한 채 `data.task_context`에 `task-context/v1` 패킷을 추가한다. 프로젝트명이 인식된 단일 프로젝트 이어하기 문장(예: `Muse 이어서 해`)도 자동으로 이 모드를 켠다. 패킷은 Brain 버전 미러 `ops/public-dev-bootstrap/repos.json`에서 읽은 `repository`(정식 id·상대 canonical path), 현재 목표, 해당 프로젝트 ADR·결정, bounded evidence refs, blocker·next action, freshness/source refs와 `reason_codes`만 담는다. 문자열·목록·전체 패킷에 상한이 있고 문서 전문은 담지 않는다. mirror alias도 strict catalog에 병합하므로 `yohan-log` 같은 정식 alias는 query와 `opts.project`에서 같은 canonical repository로 해석한다.
+
+바인딩은 구조화 metadata의 canonical/alias exact match를 우선하고, 없을 때만 path, 다시 없을 때만 title/name을 쓴다. 본문에 저장소 이름이 나오는 것만으로는 묶지 않는다. 공동 path/title 근거는 shared evidence로 포함될 수 있다. `conflict`는 질의의 복수 프로젝트, 모순된 구조화 repository identity, 또는 복수 ACTIVE/IN_PROGRESS goal에만 발생한다.
+
+`status=complete`는 선택된 단일 active goal과 그 goal의 명시된 다음 작업이 있는 경우다. `partial`은 목표·다음 작업 누락, stale index, 또는 다른 프로젝트 근거 제외를 `reason_codes`로 드러내며, `unresolved`는 프로젝트/manifest를 확인하지 못한 경우다. blocker·next action은 선택 goal에서만 읽고, 결정에서 가져올 때는 해당 goal id의 명시 연결이 필요하다.
+
+P2 소비자는 이 패킷의 `status`와 `reason_codes`를 먼저 확인해야 하며, `partial`·`unresolved`·`conflict`를 실행 지시나 빈 성공 컨텍스트로 취급하면 안 된다. 일반 `get_context` 호출은 `task_scope`를 켜지 않는 한 기존 봉투를 그대로 받는다.
+
 ---
 
 ## 트리거 (자동화)

@@ -36,6 +36,7 @@ from core.context_resolver import (
     load_project_catalog,
     resolve_entities,
 )
+from core.task_context import build_task_context, is_resume_query
 from core.schema_validator import SchemaValidator
 from core.links import LinkStore
 from core.approval import ApprovalQueue
@@ -500,6 +501,10 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         project=opts.get("project"),
         max_entities=3,
     )
+    task_scope = bool(opts.get("task_scope")) or (
+        is_resume_query(query)
+        and sum(entity.kind == "project" for entity in pre_entities) == 1
+    )
     if not opts.get("project"):
         detected_project = next(
             (entity.canonical for entity in pre_entities if entity.kind == "project"),
@@ -611,6 +616,15 @@ async def tool_get_context(ctx: ToolContext, query: str, opts: dict | None = Non
         sources,
         errors=errors,
     )
+    if task_scope:
+        env["data"]["task_context"] = build_task_context(
+            query=query,
+            opts=opts,
+            matches=matches,
+            entities=resolved.entities,
+            catalog=ctx.entity_catalog,
+            retrieval_diagnostics=retrieval_diagnostics,
+        )
     # ADR-008 P0 — brain 코어룰셋 주입(옵트인·멱등). 기본 off라 미옵트인 호출자는 봉투 불변.
     # 주입 실패가 정상 회수 봉투를 죽이지 않게 방어(devlog/pattern 회수와 동일 격리).
     if CR.is_truthy(opts.get("inject_rules")) or CR.is_truthy(os.getenv("YOHAN_INJECT_CORE_RULES")):
