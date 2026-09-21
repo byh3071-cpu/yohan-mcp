@@ -229,6 +229,7 @@ async def test_index_build_is_deterministic_and_query_does_not_open_or_rglob(
     assert diagnostics["source_open_count"] == 0
     assert diagnostics["stat_checks"] > 0
     assert diagnostics["freshness_reason_code"] == "fresh"
+    assert diagnostics["index_observed_at"].endswith("Z")
     assert diagnostics["index_build_ms"] >= 0
     assert diagnostics["query_latency_ms"] >= 0
 

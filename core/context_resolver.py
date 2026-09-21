@@ -141,6 +141,7 @@ class RetrievalDiagnostics:
 
     index_revision: str | None
     index_generation_id: str | None
+    index_observed_at: str | None
     corpus_contract_version: str | None
     index_fresh: bool | None
     freshness_reason_code: str | None
@@ -218,6 +219,7 @@ class RetrievalDiagnostics:
         return cls(
             index_revision=memory.get("index_revision"),
             index_generation_id=memory.get("index_generation_id"),
+            index_observed_at=memory.get("index_observed_at"),
             corpus_contract_version=memory.get("corpus_contract_version"),
             index_fresh=memory.get("fresh"),
             freshness_reason_code=memory.get("freshness_reason_code"),
@@ -259,6 +261,7 @@ class RetrievalDiagnostics:
             "index": {
                 "revision": self.index_revision,
                 "generation_id": self.index_generation_id,
+                "observed_at": self.index_observed_at,
                 "corpus_contract_version": self.corpus_contract_version,
                 "fresh": self.index_fresh,
                 "reason_code": self.freshness_reason_code,

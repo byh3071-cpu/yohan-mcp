@@ -273,6 +273,7 @@ def _index_ref(index: object) -> dict:
     return {
         "revision": _bounded(value.get("revision"), _ID_LIMIT),
         "generation_id": _bounded(value.get("generation_id"), _ID_LIMIT),
+        "observed_at": _bounded(value.get("observed_at"), _ID_LIMIT),
         "fresh": value.get("fresh") if isinstance(value.get("fresh"), bool) else None,
         "reason_code": _bounded(value.get("reason_code"), _ID_LIMIT),
     }

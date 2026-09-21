@@ -28,6 +28,7 @@ class _Router:
                 "backend_details": {"memory": {
                     "index_revision": "index-rev",
                     "index_generation_id": "generation",
+                    "index_observed_at": "2026-09-22T00:00:00Z",
                     "corpus_contract_version": "r1",
                     "fresh": self.fresh,
                     "freshness_reason_code": self.reason,
@@ -130,6 +131,7 @@ async def test_stale_index_freshness_is_propagated(brain: Path):
     ], fresh=False, reason="source_edited"), "Muse", {"task_scope": True, "context_supplemental": False})
     packet = env["data"]["task_context"]
     assert packet["freshness"]["index"]["fresh"] is False
+    assert packet["freshness"]["index"]["observed_at"] == "2026-09-22T00:00:00Z"
     assert "stale_index:source_edited" in packet["reason_codes"]
 
 
