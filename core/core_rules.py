@@ -44,6 +44,16 @@ _TOOL_REGISTRY: list[dict] = [
     {"name": "run_trigger", "purpose": "트리거 실행", "gated": True},
     {"name": "fire_due_triggers", "purpose": "due 트리거 발화", "gated": True},
     {"name": "webhook", "purpose": "웹훅 수신 발화", "gated": True},
+    {"name": "seloa_today", "purpose": "SELOA 하루 흐름 조회", "gated": False},
+    {"name": "seloa_between", "purpose": "SELOA 기간 일정 조회", "gated": False},
+    {"name": "seloa_tasks", "purpose": "SELOA 할 일 목록", "gated": False},
+    {"name": "seloa_search", "purpose": "SELOA 제목·메모·장소 검색", "gated": False},
+    {"name": "seloa_overview", "purpose": "SELOA 영역·프로젝트 개요", "gated": False},
+    {"name": "seloa_create", "purpose": "SELOA 할 일·일정 생성", "gated": True},
+    {"name": "seloa_update", "purpose": "SELOA 할 일·일정 수정", "gated": True},
+    {"name": "seloa_delete", "purpose": "SELOA 할 일·일정 삭제", "gated": True},
+    {"name": "seloa_changes", "purpose": "SELOA 최근 AI 변경 조회", "gated": False},
+    {"name": "seloa_undo", "purpose": "SELOA AI 변경 되돌리기", "gated": True},
 ]
 
 

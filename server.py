@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sys
 from contextlib import asynccontextmanager
+from typing import Literal
 
 # 콘솔/진단(stderr) 한글 표시용 UTF-8 (P1 교훈).
 # stdout 은 MCP stdio 의 JSON-RPC 스트림이며 SDK 가 자체 UTF-8 래퍼를 쓰므로 건드리지 않는다.
@@ -18,7 +19,10 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult
+from pydantic import BaseModel, ConfigDict
 
+from adapters.seloa_adapter import SeloaAdapter, _local_error
 from core import tools as T
 from core.tools import ToolContext
 
@@ -37,6 +41,7 @@ async def _lifespan(_server):
 
 
 mcp = FastMCP("yohan-mcp", lifespan=_lifespan)
+seloa = SeloaAdapter()
 
 
 @mcp.tool()
@@ -177,6 +182,126 @@ async def plan(goal: str, opts: dict | None = None) -> dict:
 async def check(type: str, data: dict | None = None) -> dict:
     """데이터를 P1 스키마로 검증 + 6항목 품질점수(P3 Verifiability). data 없으면 알려진 타입 목록."""
     return await T.tool_check(ctx, type, data)
+
+
+# SELOA stays a direct MCP proxy: its task/event schema does not fit the five
+# existing backend record types. The authorization flags are conversation
+# attestations by the calling agent; no tool can inspect the user's chat itself.
+SeloaAgent = Literal["Claude", "ChatGPT", "Codex", "Cursor", "Gemini", "기타"]
+
+
+@mcp.tool()
+async def seloa_today(date: str | None = None) -> CallToolResult:
+    """그날의 일정·빈 시간·후보 할 일. date는 YYYY-MM-DD, 생략 시 오늘."""
+    return await seloa.call("seloa_today", {} if date is None else {"date": date})
+
+
+@mcp.tool()
+async def seloa_between(from_date: str, to_date: str) -> CallToolResult:
+    """양 끝을 포함한 최대 62일의 일정·예정 할 일. 날짜는 YYYY-MM-DD."""
+    return await seloa.call("seloa_between", {"from": from_date, "to": to_date})
+
+
+@mcp.tool()
+async def seloa_tasks(
+    status: Literal["open", "completed"] | None = None,
+    area: str | None = None,
+    project: str | None = None,
+    limit: int | None = None,
+) -> CallToolResult:
+    """할 일 목록. 기본은 열린 할 일이며 영역·프로젝트 이름 또는 ID로 거른다."""
+    args = {"status": status, "area": area, "project": project, "limit": limit}
+    return await seloa.call("seloa_tasks", {k: v for k, v in args.items() if v is not None})
+
+
+@mcp.tool()
+async def seloa_search(query: str) -> CallToolResult:
+    """제목·메모·장소에서 할 일, 일정, 프로젝트를 찾는다."""
+    return await seloa.call("seloa_search", {"query": query})
+
+
+@mcp.tool()
+async def seloa_overview() -> CallToolResult:
+    """영역과 프로젝트의 상태·단계·열린 할 일 수를 본다."""
+    return await seloa.call("seloa_overview", {})
+
+
+@mcp.tool()
+async def seloa_create(
+    agent: SeloaAgent,
+    kind: Literal["task", "event"],
+    title: str,
+    date: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    minutes: int | None = None,
+    area: str | None = None,
+    project: str | None = None,
+    notes: str | None = None,
+    deadline: str | None = None,
+    tool: Literal["laptop", "phone", "any"] | None = None,
+    location: str | None = None,
+    user_directed: bool = False,
+    user_confirmed: bool = False,
+) -> CallToolResult:
+    """할 일·일정 생성. 사용자가 직접 요청했다면 user_directed=True. 에이전트가 먼저 제안했다면 내용을 설명하고 사용자가 확인한 뒤 user_confirmed=True. agent는 자신의 이름."""
+    if not (user_directed or user_confirmed):
+        return _local_error("confirmation_required", "Direct user request or conversation confirmation is required for SELOA create.")
+    args = {"agent": agent, "kind": kind, "title": title, "date": date, "start": start,
+            "end": end, "minutes": minutes, "area": area, "project": project,
+            "notes": notes, "deadline": deadline, "tool": tool, "location": location}
+    return await seloa.call("seloa_create", {k: v for k, v in args.items() if v is not None})
+
+
+class SeloaUpdateFields(BaseModel):
+    """SELOA update fields; explicitly supplied null clears nullable fields."""
+
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = None
+    date: str | None = None
+    start: str | None = None
+    end: str | None = None
+    minutes: int | None = None
+    area: str | None = None
+    project: str | None = None
+    notes: str | None = None
+    deadline: str | None = None
+    tool: Literal["laptop", "phone", "any"] | None = None
+    location: str | None = None
+    status: Literal["open", "completed"] | None = None
+
+
+@mcp.tool()
+async def seloa_update(agent: SeloaAgent, id: str, changes: SeloaUpdateFields, user_confirmed: bool = False) -> CallToolResult:
+    """할 일·일정 수정. 변경 내용을 한 줄로 설명하고 사용자가 확인한 뒤 user_confirmed=True. 반복 일정은 읽기 결과의 날짜별 ID만 사용한다."""
+    if not user_confirmed:
+        return _local_error("confirmation_required", "Conversation confirmation is required for SELOA update.")
+    fields = changes.model_dump(exclude_unset=True)
+    if not fields:
+        return _local_error("empty_update", "At least one SELOA field must change.")
+    return await seloa.call("seloa_update", {"agent": agent, "id": id, **fields})
+
+
+@mcp.tool()
+async def seloa_delete(agent: SeloaAgent, id: str, user_confirmed: bool = False) -> CallToolResult:
+    """할 일·일정 삭제. 대상을 설명하고 사용자가 확인한 뒤 user_confirmed=True. 여러 대상은 목록 확인 뒤 하나씩 호출한다."""
+    if not user_confirmed:
+        return _local_error("confirmation_required", "Conversation confirmation is required for SELOA delete.")
+    return await seloa.call("seloa_delete", {"agent": agent, "id": id})
+
+
+@mcp.tool()
+async def seloa_changes(limit: int | None = None) -> CallToolResult:
+    """최근 AI 변경과 각 변경의 되돌리기 가능 여부를 본다."""
+    return await seloa.call("seloa_changes", {} if limit is None else {"limit": limit})
+
+
+@mcp.tool()
+async def seloa_undo(actionId: str, user_directed: bool = False) -> CallToolResult:
+    """AI 변경 하나를 되돌린다. 사용자가 명시적으로 요청했을 때만 user_directed=True. 먼저 seloa_changes로 actionId를 확인한다."""
+    if not user_directed:
+        return _local_error("explicit_request_required", "An explicit user request is required for SELOA undo.")
+    return await seloa.call("seloa_undo", {"actionId": actionId})
 
 
 # ── MCP Resources (에이전트가 읽는 타입/관계/상태) ─────────────────
