@@ -49,7 +49,7 @@ PC에서 실행되는 이 MCP 서버가 환경변수로 지정한 SELOA streamab
 
 ### Phase 30
 - [x] **Task 300** 전체 pytest·compileall 검증 (577 passed, 8 skipped) / evidence: local gate output
-- [ ] **Task 310** 목적별 커밋·Draft PR / evidence: PR URL
+- [x] **Task 310** 목적별 커밋·Draft PR / evidence: Draft PR #85
 
 ### Phase 40
 - [ ] **Task 400** 사람 승인 아래 운영 읽기 인증 확인 / evidence: separate live test
