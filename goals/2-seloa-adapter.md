@@ -30,7 +30,7 @@ PC에서 실행되는 이 MCP 서버가 환경변수로 지정한 SELOA streamab
 
 - 운영 SELOA에 쓰기 호출, 실제 토큰 조회, 실행 중인 서버 중단
 - SELOA 객체의 5백엔드 스키마 편입, 다른 저장소 수정
-- master 수정·push·merge·배포
+- 승인 없는 master 직접 수정·push·merge·배포
 
 ## 완료 조건
 
