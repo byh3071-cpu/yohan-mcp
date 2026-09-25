@@ -95,6 +95,8 @@ SELOA의 `seloa_today`, `seloa_between`, `seloa_tasks`, `seloa_search`, `seloa_o
 `seloa_create`, `seloa_update`, `seloa_delete`, `seloa_changes`, `seloa_undo`를 노출한다.
 토큰이 없으면 도구는 네트워크에 접속하지 않고 사용 불가 응답을 준다. URL과 토큰은 도구
 인자가 아니며 환경변수에서만 읽는다. 원격 MCP의 결과와 오류는 그대로 전달한다.
+Bearer 토큰은 만료될 수 있으며 이 어댑터는 자동 갱신하지 않는다. 만료 시 PC의 인증값을
+갱신해야 하고, 실제 인증 연결은 운영 토큰을 가진 PC에서 별도로 확인해야 한다.
 
 SELOA의 일정·할 일은 기존 5백엔드 검색 스키마와 별개다. 사용자 직접 생성 요청은
 `user_directed=True`, 에이전트가 제안한 생성은 대화에서 확인한 뒤 `user_confirmed=True`로
