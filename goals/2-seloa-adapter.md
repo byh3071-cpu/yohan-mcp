@@ -3,9 +3,10 @@ vhk_format: 1
 type: goal
 id: 2
 title: PC-local SELOA MCP adapter
-status: IN_PROGRESS
+status: DONE
 priority: P1
 depends_on: 1
+completed: 2026-09-25
 ---
 
 # Goal 2: PC-local SELOA MCP adapter
@@ -48,10 +49,10 @@ PC에서 실행되는 이 MCP 서버가 환경변수로 지정한 SELOA streamab
 - [x] **Task 210** 확인 규칙·오류·결과 보존 모의 테스트 / evidence: tests/test_seloa_adapter.py
 
 ### Phase 30
-- [x] **Task 300** 전체 pytest·compileall 검증 (577 passed, 8 skipped) / evidence: local gate output
-- [x] **Task 310** 목적별 커밋·Draft PR / evidence: Draft PR #85
+- [x] **Task 300** 전체 pytest·compileall 검증 (581 passed, 8 skipped) / evidence: local gate output
+- [x] **Task 310** 목적별 커밋·PR 머지 / evidence: PR #85
 
 ### Phase 40
 - [x] **Task 400** 로컬 OAuth 자동 갱신 구현과 모의 검증 / evidence: adapters/seloa_oauth.py, tests/test_seloa_oauth.py
 - [x] **Task 410** 사람 승인 아래 OAuth 로그인과 실제 읽기 확인 / evidence: 2026-09-25 PC OAuth 승인, seloa_overview·seloa_today 실계정 읽기 및 만료 후 자동 갱신 확인
-- [ ] **Task 420** Draft PR #85 최종 검토와 별도 사람 게이트의 Ready·merge·배포 / evidence: PR 상태와 실행 기록
+- [x] **Task 420** PR #85 검토·머지와 사람 승인 아래 PC 실행 환경 반영 / evidence: 2026-09-25 운영 master 반영, 새 stdio 연결에서 도구 10개와 seloa_overview 실계정 읽기 확인
