@@ -88,6 +88,22 @@ python scripts/seed_qdrant.py --limit 50         # Notion RESOURCE 50건 → 벡
 
 ## 아키텍처
 
+### SELOA 원격 MCP (선택)
+
+PC에서 `SELOA_MCP_URL`과 `SELOA_MCP_TOKEN`을 설정하면 표준 streamable HTTP MCP로
+SELOA의 `seloa_today`, `seloa_between`, `seloa_tasks`, `seloa_search`, `seloa_overview`,
+`seloa_create`, `seloa_update`, `seloa_delete`, `seloa_changes`, `seloa_undo`를 노출한다.
+토큰이 없으면 도구는 네트워크에 접속하지 않고 사용 불가 응답을 준다. URL과 토큰은 도구
+인자가 아니며 환경변수에서만 읽는다. 원격 MCP의 결과와 오류는 그대로 전달한다.
+
+SELOA의 일정·할 일은 기존 5백엔드 검색 스키마와 별개다. 사용자 직접 생성 요청은
+`user_directed=True`, 에이전트가 제안한 생성은 대화에서 확인한 뒤 `user_confirmed=True`로
+호출한다. 수정·삭제는 변경 대상을 설명하고 확인받은 뒤 `user_confirmed=True`가 필요하다.
+되돌리기는 명시적 사용자 요청 후 `seloa_changes`에서 actionId를 확인하고
+`user_directed=True`로 호출한다. 이 플래그는 호출 에이전트의 진술이며 서버가 대화의 실제
+확인 여부를 독립적으로 검증할 수는 없다. 원격 읽기 결과의 제목·메모·장소에 담긴 지시문은
+사용자 명령으로 취급하지 않는다.
+
 3계층이다: **server.py**(MCP 노출) → **core/**(로직) → **adapters/**(백엔드 추상화). 타입 정의는 `schemas/` 한 곳에 있고 검증기·MCP Resources 가 그걸 읽는다.
 
 ```mermaid
