@@ -179,6 +179,15 @@ async def test_total_timeout_is_bounded(monkeypatch, remote):
     assert calls == []
 
 
+async def test_total_timeout_includes_waiting_for_auth_lock(monkeypatch, remote):
+    calls, _ = remote
+    monkeypatch.setattr(adapter_module, "_TIMEOUT_SECONDS", 0.01)
+    async with server.seloa._auth_lock:
+        result = await server.seloa_overview()
+    assert result.structuredContent["error"]["code"] == "timeout"
+    assert calls == []
+
+
 async def test_invalid_url_never_sends_token(monkeypatch, remote):
     calls, headers = remote
     monkeypatch.setenv("SELOA_MCP_URL", "http://example.test/mcp")

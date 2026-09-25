@@ -61,8 +61,8 @@ class SeloaAdapter:
             storage = None if token else WindowsTokenStorage(url)
             if storage is not None and not storage.has_tokens():
                 return _local_error("not_connected", "SELOA OAuth is not connected. Run scripts/connect_seloa.py locally.")
-            async with self._auth_lock:
-                async with asyncio.timeout(_TIMEOUT_SECONDS):
+            async with asyncio.timeout(_TIMEOUT_SECONDS):
+                async with self._auth_lock:
                     client_options = {"timeout": httpx.Timeout(20.0, connect=10.0)}
                     if token:
                         client_options["headers"] = {"Authorization": f"Bearer {token}"}
