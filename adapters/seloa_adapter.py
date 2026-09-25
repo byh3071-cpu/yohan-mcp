@@ -13,8 +13,11 @@ from urllib.parse import urlsplit
 
 import httpx
 from mcp import ClientSession
+from mcp.client.auth import OAuthFlowError
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolResult, TextContent
+
+from adapters.seloa_oauth import WindowsTokenStorage, make_oauth_provider
 
 
 TOOL_NAMES = frozenset(
@@ -36,15 +39,16 @@ def _local_error(code: str, message: str) -> CallToolResult:
 
 
 class SeloaAdapter:
-    """One bounded MCP session per call; configuration is read only from env."""
+    """One bounded MCP session per call; OAuth refresh is serialized."""
+
+    def __init__(self) -> None:
+        self._auth_lock = asyncio.Lock()
 
     async def call(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
         if name not in TOOL_NAMES:
             return _local_error("unknown_tool", "Unknown SELOA tool.")
 
         token = os.getenv("SELOA_MCP_TOKEN", "").strip()
-        if not token:
-            return _local_error("not_configured", "SELOA is disabled: SELOA_MCP_TOKEN is missing.")
         url = os.getenv("SELOA_MCP_URL", "").strip()
         try:
             parsed = urlsplit(url)
@@ -54,19 +58,27 @@ class SeloaAdapter:
             return _local_error("invalid_config", "SELOA_MCP_URL must be an HTTPS endpoint without credentials or query parameters.")
 
         try:
-            async with asyncio.timeout(_TIMEOUT_SECONDS):
-                async with httpx.AsyncClient(
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=httpx.Timeout(20.0, connect=10.0),
-                ) as client:
-                    async with streamable_http_client(url, http_client=client) as (read, write, _):
-                        async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=20)) as session:
-                            await session.initialize()
-                            return await session.call_tool(
-                                name, arguments=arguments, read_timeout_seconds=timedelta(seconds=20)
-                            )
+            storage = None if token else WindowsTokenStorage(url)
+            if storage is not None and not storage.has_tokens():
+                return _local_error("not_connected", "SELOA OAuth is not connected. Run scripts/connect_seloa.py locally.")
+            async with self._auth_lock:
+                async with asyncio.timeout(_TIMEOUT_SECONDS):
+                    client_options = {"timeout": httpx.Timeout(20.0, connect=10.0)}
+                    if token:
+                        client_options["headers"] = {"Authorization": f"Bearer {token}"}
+                    else:
+                        client_options["auth"] = make_oauth_provider(url, storage)
+                    async with httpx.AsyncClient(**client_options) as client:
+                        async with streamable_http_client(url, http_client=client) as (read, write, _):
+                            async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=20)) as session:
+                                await session.initialize()
+                                return await session.call_tool(
+                                    name, arguments=arguments, read_timeout_seconds=timedelta(seconds=20)
+                                )
         except (TimeoutError, httpx.TimeoutException):
             return _local_error("timeout", "SELOA request timed out.")
+        except OAuthFlowError:
+            return _local_error("reconnect_required", "SELOA OAuth needs a new local sign-in. Run scripts/connect_seloa.py.")
         except Exception:
             # SDK/httpx exceptions can include Authorization headers or URL details.
             return _local_error("remote_unavailable", "SELOA request failed; check local configuration and connectivity.")

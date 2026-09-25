@@ -143,8 +143,9 @@ async def test_fastmcp_parses_typed_update_and_preserves_null(remote):
 async def test_missing_credential_disables_without_network(monkeypatch, remote):
     calls, _ = remote
     monkeypatch.delenv("SELOA_MCP_TOKEN")
+    monkeypatch.setattr(adapter_module, "WindowsTokenStorage", lambda url: type("MissingStore", (), {"has_tokens": lambda self: False})())
     result = await server.seloa_overview()
-    assert result.structuredContent["error"]["code"] == "not_configured"
+    assert result.structuredContent["error"]["code"] == "not_connected"
     assert calls == []
 
 

@@ -90,13 +90,19 @@ python scripts/seed_qdrant.py --limit 50         # Notion RESOURCE 50건 → 벡
 
 ### SELOA 원격 MCP (선택)
 
-PC에서 `SELOA_MCP_URL`과 `SELOA_MCP_TOKEN`을 설정하면 표준 streamable HTTP MCP로
+PC에서 `SELOA_MCP_URL`을 설정하고 `python scripts/connect_seloa.py`를 실행하면 브라우저에서
+한 번 SELOA OAuth 로그인을 진행한다. 연결 후 토큰과 클라이언트 등록 정보는 현재 Windows
+사용자 계정의 DPAPI로 암호화하여 Windows `%LOCALAPPDATA%/yohan-mcp/seloa-oauth.bin`에
+저장한다. 다른 경로를 쓰려면 `SELOA_OAUTH_STATE_FILE`을 지정한다. 토큰이 만료되면
+도구 호출이 저장된 갱신 토큰으로 자동 갱신한다. 갱신할 수 없으면 다시 연결하라는 오류를
+반환하며 도구 호출 중에 로그인 창을 자동으로 열지 않는다.
+
+연결되면 표준 streamable HTTP MCP로
 SELOA의 `seloa_today`, `seloa_between`, `seloa_tasks`, `seloa_search`, `seloa_overview`,
 `seloa_create`, `seloa_update`, `seloa_delete`, `seloa_changes`, `seloa_undo`를 노출한다.
-토큰이 없으면 도구는 네트워크에 접속하지 않고 사용 불가 응답을 준다. URL과 토큰은 도구
-인자가 아니며 환경변수에서만 읽는다. 원격 MCP의 결과와 오류는 그대로 전달한다.
-Bearer 토큰은 만료될 수 있으며 이 어댑터는 자동 갱신하지 않는다. 만료 시 PC의 인증값을
-갱신해야 하고, 실제 인증 연결은 운영 토큰을 가진 PC에서 별도로 확인해야 한다.
+연결 전에는 네트워크에 접속하지 않고 사용 불가 응답을 준다. URL과 인증 정보는 도구
+인자가 아니다. 원격 MCP의 결과와 오류는 그대로 전달한다. 기존 `SELOA_MCP_TOKEN` 환경변수에
+넣은 Bearer 토큰도 사용 가능하지만 이 방식의 토큰은 자동 갱신되지 않는다.
 
 SELOA의 일정·할 일은 기존 5백엔드 검색 스키마와 별개다. 사용자 직접 생성 요청은
 `user_directed=True`, 에이전트가 제안한 생성은 대화에서 확인한 뒤 `user_confirmed=True`로
